@@ -200,10 +200,6 @@ def test_get_each_type(world, account):
     assert get(world, "LOGIN-ITEM", "-i") == "login-pw\n"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the agent sends Bitwarden-Client-Version 0.1.0 and Vaultwarden hides SSH key items from clients older than 2024.12",
-)
 def test_ssh_key_item(world, account):
     ensure_unlocked(world, account)
     assert world("search", "ssh").stdout.splitlines() == ["ssh-item"]
@@ -219,7 +215,6 @@ def test_get_fields(world, account):
     assert get(world, "card-item", "-f", "cvv") == "737\n"
 
 
-@pytest.mark.xfail(strict=True, reason="the first --full entry is the username, not the password (agent read.rs full())")
 def test_get_full(world, account):
     ensure_unlocked(world, account)
     lines = get(world, "login-item", "--full").splitlines()
