@@ -14,7 +14,7 @@ pub const PINENTRY_SEARCH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bi
 
 /// The trust of this process: refuses root and an untrustworthy `HOME`.
 pub fn trust() -> anyhow::Result<Trust> {
-    let user = User::current().context("cannot tell which user this is")?;
+    let user = crate::current_user().context("cannot tell which user this is")?;
     let exe = std::env::current_exe().and_then(std::fs::canonicalize).context("cannot find this executable")?;
     trust_for(std::env::var_os("HOME"), user, exe)
 }
@@ -46,7 +46,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
 
     fn me() -> User {
-        User::current().unwrap()
+        crate::current_user().unwrap()
     }
 
     fn try_home(home: Option<&std::path::Path>) -> anyhow::Result<Trust> {

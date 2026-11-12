@@ -23,6 +23,16 @@ use std::sync::Arc;
 
 use dybw_proto::PROTOCOL_VERSION;
 
+/// `User::current()`. On macOS dybw-native probes with a temp file named by pid and nanoseconds, which collides when
+/// tests call it in parallel; tests take this lock so they never do.
+pub(crate) fn current_user() -> std::io::Result<dybw_native::fsutil::User> {
+    #[cfg(test)]
+    static PROBE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(test)]
+    let _serial = PROBE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    dybw_native::fsutil::User::current()
+}
+
 /// The line `dybw-agent` prints at start.
 pub fn banner() -> String {
     format!("dybw-agent {} (protocol {PROTOCOL_VERSION})", env!("CARGO_PKG_VERSION"))

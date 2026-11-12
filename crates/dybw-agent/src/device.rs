@@ -5,12 +5,12 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
-use dybw_native::fsutil::{User, write_private};
+use dybw_native::fsutil::write_private;
 
 use crate::paths::ProfilePaths;
 
 pub fn device_id(paths: &ProfilePaths) -> anyhow::Result<String> {
-    device_id_for(paths, User::current().context("cannot tell which user this is")?.uid)
+    device_id_for(paths, crate::current_user().context("cannot tell which user this is")?.uid)
 }
 
 pub(crate) fn device_id_for(paths: &ProfilePaths, uid: u32) -> anyhow::Result<String> {
