@@ -142,6 +142,13 @@ pub struct Entry {
     pub value: Secret,
 }
 
+/// One previous password of an item (rbw prints `last_used: password`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub last_used: String,
+    pub password: Secret,
+}
+
 /// One of several items a `get` needle matched: identity only, never a value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
@@ -160,6 +167,9 @@ pub enum AgentError {
     NotLoggedIn,
     #[error("no item matches")]
     NotFound,
+    /// The item matched but has no field of this name (a field name is not secret).
+    #[error("the item has no field named {0:?}")]
+    NoSuchField(String),
     #[error("several items match")]
     Ambiguous { candidates: Vec<Candidate> },
     #[error("the request was denied")]
@@ -178,7 +188,7 @@ pub enum AgentError {
 
 /// What the agent answers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Reply {
     Status {
@@ -208,7 +218,7 @@ pub enum Reply {
     },
     /// `History`: previous passwords, newest first.
     History {
-        passwords: Vec<Secret>,
+        entries: Vec<HistoryEntry>,
     },
     Error {
         error: AgentError,
@@ -222,11 +232,12 @@ pub struct Request {
     pub op: Op,
 }
 
+/// Not flattened: serde would buffer a flattened or internally tagged reply, copying item values
+/// into unzeroed memory on decode. An externally tagged `reply` is read straight into its `Secret`s.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {
     pub version: u32,
-    #[serde(flatten)]
-    pub op: Reply,
+    pub reply: Reply,
 }
 
 impl Request {
@@ -236,8 +247,8 @@ impl Request {
 }
 
 impl Response {
-    pub fn new(op: Reply) -> Self {
-        Self { version: PROTOCOL_VERSION, op }
+    pub fn new(reply: Reply) -> Self {
+        Self { version: PROTOCOL_VERSION, reply }
     }
 }
 
@@ -245,41 +256,51 @@ impl Response {
 pub enum FrameError {
     #[error("frame of {0} bytes exceeds the {MAX_FRAME} byte limit")]
     TooLarge(usize),
-    #[error("frame is not valid JSON for this type")]
-    Json(#[from] serde_json::Error),
+    /// Position only: serde_json's own text can quote a fragment of the frame, which may be a value.
+    #[error("frame is not valid JSON for this type (line {line}, column {column})")]
+    Json { line: usize, column: usize },
     #[error("protocol version {0} is not supported (this build speaks {PROTOCOL_VERSION})")]
     UnsupportedVersion(u64),
     #[error("unknown operation")]
     UnknownOp,
 }
 
-/// Serialise `value` into one frame: 4-byte big-endian length, then the JSON body.
-pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, FrameError> {
-    // Replies carry item values: wipe the scratch buffer.
-    let body = Zeroizing::new(serde_json::to_vec(value)?);
-    if body.len() > MAX_FRAME {
-        return Err(FrameError::TooLarge(body.len()));
+impl From<serde_json::Error> for FrameError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Json { line: e.line(), column: e.column() }
     }
-    let mut frame = Vec::with_capacity(4 + body.len());
+}
+
+/// Serialise `value` into one frame: 4-byte big-endian length, then the JSON body.
+///
+/// The frame is zeroed on drop. Growing the `Vec` while serde_json writes can still leave freed,
+/// unzeroed copies of the early part of a large body; only the final buffer is wiped.
+pub fn encode<T: Serialize>(value: &T) -> Result<Zeroizing<Vec<u8>>, FrameError> {
+    let mut frame = Zeroizing::new(vec![0; 4]);
+    serde_json::to_writer(&mut *frame, value)?;
+    let len = frame.len() - 4;
+    if len > MAX_FRAME {
+        return Err(FrameError::TooLarge(len));
+    }
     // The length fits: it is at most MAX_FRAME.
-    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&body);
+    if let Some(header) = frame.first_chunk_mut::<4>() {
+        *header = (len as u32).to_be_bytes();
+    }
     Ok(frame)
 }
 
-/// Parse the first frame of `buf`: `Ok(None)` while it is incomplete, else the value and the bytes consumed.
+/// The body of the first frame of `buf`: `Ok(None)` while it is incomplete.
 /// An oversize length is refused as soon as the header is in, before any body arrives.
-pub fn decode<T: DeserializeOwned>(buf: &[u8]) -> Result<Option<(T, usize)>, FrameError> {
+fn frame_body(buf: &[u8]) -> Result<Option<&[u8]>, FrameError> {
     let Some(header) = buf.first_chunk::<4>() else { return Ok(None) };
     let len = u32::from_be_bytes(*header) as usize;
     if len > MAX_FRAME {
         return Err(FrameError::TooLarge(len));
     }
-    let Some(body) = buf.get(4..4 + len) else { return Ok(None) };
-    Ok(Some((serde_json::from_slice(body)?, 4 + len)))
+    Ok(buf.get(4..4 + len))
 }
 
-/// Like [`decode`] for a [`Request`], but a frame of another version or with an unknown op is a
+/// Parse the first request frame of `buf`: `Ok(None)` while incomplete, else the request and the bytes consumed. A frame of another version or with an unknown op is a
 /// clear error, whatever else it holds.
 pub fn decode_request(buf: &[u8]) -> Result<Option<(Request, usize)>, FrameError> {
     let Some((req, used)) = decode_versioned::<Request>(buf)? else { return Ok(None) };
@@ -289,7 +310,7 @@ pub fn decode_request(buf: &[u8]) -> Result<Option<(Request, usize)>, FrameError
     Ok(Some((req, used)))
 }
 
-/// Like [`decode`] for a [`Response`], with the version check.
+/// Parse the first response frame of `buf`, with the same version check as [`decode_request`].
 pub fn decode_response(buf: &[u8]) -> Result<Option<(Response, usize)>, FrameError> {
     decode_versioned(buf)
 }
@@ -299,19 +320,14 @@ fn decode_versioned<T: DeserializeOwned>(buf: &[u8]) -> Result<Option<(T, usize)
     struct Peek {
         version: Option<u64>,
     }
-    let Some(header) = buf.first_chunk::<4>() else { return Ok(None) };
-    let len = u32::from_be_bytes(*header) as usize;
-    if len > MAX_FRAME {
-        return Err(FrameError::TooLarge(len));
-    }
-    let Some(body) = buf.get(4..4 + len) else { return Ok(None) };
-    // Read the version alone first: a newer peer may reshape the rest. No `Value`, so no unzeroed copies.
+    let Some(body) = frame_body(buf)? else { return Ok(None) };
+    // Read the version alone first: a newer peer may reshape the rest. Unknown fields are skipped, not buffered.
     if let Some(v) = serde_json::from_slice::<Peek>(body)?.version
         && v != u64::from(PROTOCOL_VERSION)
     {
         return Err(FrameError::UnsupportedVersion(v));
     }
-    Ok(Some((serde_json::from_slice(body)?, 4 + len)))
+    Ok(Some((serde_json::from_slice(body)?, 4 + body.len())))
 }
 
 #[cfg(test)]
@@ -324,31 +340,31 @@ mod tests {
         let frame = encode(&Request::new(Op::StopAgent)).unwrap();
         assert_eq!(&frame[..4], &(frame.len() as u32 - 4).to_be_bytes());
         assert_eq!(&frame[4..], br#"{"version":1,"op":"stop_agent"}"#);
-        let (req, used): (Request, _) = decode(&frame).unwrap().unwrap();
+        let (req, used): (Request, _) = decode_request(&frame).unwrap().unwrap();
         assert_eq!((req, used), (Request::new(Op::StopAgent), frame.len()));
     }
 
     #[test]
     fn response_round_trips() {
         let res = Response::new(Reply::Status { agent_version: "0.1.0".into(), profiles: vec![] });
-        let (back, _): (Response, _) = decode(&encode(&res).unwrap()).unwrap().unwrap();
+        let (back, _): (Response, _) = decode_response(&encode(&res).unwrap()).unwrap().unwrap();
         assert_eq!(back, res);
     }
 
     #[test]
     fn incomplete_input_waits_and_extra_bytes_are_left() {
         let mut frame = encode(&Request::new(Op::StopAgent)).unwrap();
-        assert!(decode::<Request>(&frame[..2]).unwrap().is_none());
-        assert!(decode::<Request>(&frame[..frame.len() - 1]).unwrap().is_none());
+        assert!(decode_request(&frame[..2]).unwrap().is_none());
+        assert!(decode_request(&frame[..frame.len() - 1]).unwrap().is_none());
         let n = frame.len();
         frame.extend_from_slice(b"next");
-        assert_eq!(decode::<Request>(&frame).unwrap().unwrap().1, n);
+        assert_eq!(decode_request(&frame).unwrap().unwrap().1, n);
     }
 
     #[test]
     fn oversize_header_is_refused_without_the_body() {
         let header = (MAX_FRAME as u32 + 1).to_be_bytes();
-        assert!(matches!(decode::<Request>(&header), Err(FrameError::TooLarge(n)) if n == MAX_FRAME + 1));
+        assert!(matches!(decode_request(&header), Err(FrameError::TooLarge(n)) if n == MAX_FRAME + 1));
     }
 
     #[test]
@@ -364,14 +380,30 @@ mod tests {
         let res = Response::new(Reply::Value { value: Secret::new("x".repeat(pad)) });
         let frame = encode(&res).unwrap();
         assert_eq!(frame.len(), 4 + MAX_FRAME);
-        assert!(decode::<Response>(&frame).unwrap().is_some());
+        assert!(decode_response(&frame).unwrap().is_some());
     }
 
     #[test]
     fn bad_json_is_an_error() {
         let mut frame = 8u32.to_be_bytes().to_vec();
         frame.extend_from_slice(b"not json");
-        assert!(matches!(decode::<Request>(&frame), Err(FrameError::Json(_))));
+        assert!(matches!(decode_request(&frame), Err(FrameError::Json { .. })));
+    }
+
+    #[test]
+    fn json_errors_carry_no_frame_text() {
+        // serde_json would quote the offending text ("unknown variant `hunter2`") in its own message.
+        let f = frame(br#"{"version":1,"reply":{"hunter2":1}}"#);
+        let err = decode_response(&f).unwrap_err();
+        assert!(matches!(err, FrameError::Json { .. }));
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+    }
+
+    #[test]
+    fn response_envelope_is_externally_tagged() {
+        let f = encode(&Response::new(Reply::Value { value: Secret::new(s("v")) })).unwrap();
+        assert_eq!(&f[4..], br#"{"version":1,"reply":{"value":{"value":"v"}}}"#);
     }
 
     #[test]
@@ -468,7 +500,7 @@ mod tests {
             Reply::Full { entries: vec![Entry { name: s("password"), value: Secret::new(s("v")) }] },
             Reply::Raw { json: Secret::new(s("{}")) },
             Reply::FieldNames { names: vec![s("totp")] },
-            Reply::History { passwords: vec![Secret::new(s("old"))] },
+            Reply::History { entries: vec![HistoryEntry { last_used: s("d"), password: Secret::new(s("old")) }] },
             Reply::Error {
                 error: AgentError::Ambiguous { candidates: vec![Candidate { id: s("i"), name: s("n"), user: None }] },
             },
@@ -487,6 +519,7 @@ mod tests {
             (Locked, "the vault is locked"),
             (NotLoggedIn, "the profile is not logged in"),
             (NotFound, "no item matches"),
+            (NoSuchField(s("totp")), "the item has no field named \"totp\""),
             (Ambiguous { candidates: vec![] }, "several items match"),
             (Denied, "the request was denied"),
             (Prompt, "the password prompt failed"),
@@ -505,7 +538,10 @@ mod tests {
     #[test]
     fn debug_never_prints_a_value() {
         let r = Reply::Full { entries: vec![Entry { name: s("n"), value: Secret::new(s("hunter2")) }] };
-        let out = format!("{r:?} {:?}", Reply::History { passwords: vec![Secret::new(s("hunter2"))] });
+        let out = format!(
+            "{r:?} {:?}",
+            Reply::History { entries: vec![HistoryEntry { last_used: s("d"), password: Secret::new(s("hunter2")) }] }
+        );
         assert!(!out.contains("hunter2"), "{out}");
         assert_eq!(Secret::new(s("a")).expose(), "a");
     }
@@ -538,7 +574,7 @@ mod tests {
         assert!(decode_request(&frame(br#"{"version":1,"op":"stop_agent"}"#)[..6]).unwrap().is_none());
         let header = (MAX_FRAME as u32 + 1).to_be_bytes();
         assert!(matches!(decode_request(&header), Err(FrameError::TooLarge(_))));
-        assert!(matches!(decode_request(&frame(b"nope")), Err(FrameError::Json(_))));
-        assert!(matches!(decode_request(&frame(br#"{"op":"stop_agent"}"#)), Err(FrameError::Json(_))));
+        assert!(matches!(decode_request(&frame(b"nope")), Err(FrameError::Json { .. })));
+        assert!(matches!(decode_request(&frame(br#"{"op":"stop_agent"}"#)), Err(FrameError::Json { .. })));
     }
 }
