@@ -1,13 +1,14 @@
 //! The agent socket (D6): where it lives, who may reach it, and when an old one may be replaced.
 
 use std::ffi::OsString;
-use std::fs::DirBuilder;
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::ErrorKind;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
+use rustix::fs::{FlockOperation, flock};
 
 /// `$XDG_RUNTIME_DIR/dybw`, else `$TMPDIR/dybw-<uid>` (`/tmp` when `TMPDIR` is unset): a directory only this user
 /// may use, so the socket inside needs no path-based trust.
@@ -35,21 +36,38 @@ fn ensure_dir(dir: &Path, uid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bind `dir/agent.sock`. A live agent on it is refused and left alone; a socket nobody answers on is
-/// replaced; anything else at that path is refused.
-pub fn bind(dir: &Path, uid: u32) -> anyhow::Result<UnixListener> {
+/// Bind `dir/agent.sock`. The returned file holds `dir/agent.lock` and must be kept for the life of the process:
+/// while one agent holds it, a second refuses to start, whatever state the socket is in. With the lock taken, a
+/// socket nobody refuses or misses is stale and replaced; a live one, a stranger, or an unclear connect error
+/// is refused and left alone.
+pub fn bind(dir: &Path, uid: u32) -> anyhow::Result<(UnixListener, File)> {
     ensure_dir(dir, uid)?;
+    let lock_path = dir.join("agent.lock");
+    let lock = OpenOptions::new().create(true).append(true).mode(0o600).open(&lock_path);
+    let lock = lock.context(format!("open {}", lock_path.display()))?;
+    ensure!(
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).is_ok(),
+        "dybw-agent is already running (the lock {} is held)",
+        lock_path.display()
+    );
     let path = dir.join("agent.sock");
     // A stat error other than "missing" falls through to the bind, which then fails on its own.
     if let Ok(meta) = std::fs::symlink_metadata(&path) {
         ensure!(meta.file_type().is_socket() && meta.uid() == uid, "{} is not this user's socket", path.display());
-        ensure!(UnixStream::connect(&path).is_err(), "dybw-agent is already running on {}", path.display());
+        match UnixStream::connect(&path) {
+            Ok(_) => bail!("dybw-agent is already running on {}", path.display()),
+            Err(e) => ensure!(
+                matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound),
+                "cannot tell whether {} is stale ({e}); not removing it",
+                path.display()
+            ),
+        }
         std::fs::remove_file(&path).context(format!("remove stale {}", path.display()))?;
     }
     let listener = UnixListener::bind(&path).context(format!("bind {}", path.display()))?;
     std::fs::set_permissions(&path, PermissionsExt::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    Ok(listener)
+    Ok((listener, lock))
 }
 
 #[cfg(test)]
@@ -61,7 +79,7 @@ mod tests {
         rustix::process::geteuid().as_raw()
     }
 
-    fn err(r: anyhow::Result<UnixListener>) -> String {
+    fn err(r: anyhow::Result<(UnixListener, File)>) -> String {
         format!("{:#}", r.unwrap_err())
     }
 
@@ -111,7 +129,7 @@ mod tests {
     fn a_live_agent_is_refused_and_keeps_its_socket() {
         let base = base();
         let dir = base.path().join("dybw");
-        let live = bind(&dir, me()).unwrap();
+        let (live, _lock) = bind(&dir, me()).unwrap();
         assert!(err(bind(&dir, me())).contains("already running"));
         // The first agent still owns the path and still accepts.
         let client = UnixStream::connect(dir.join("agent.sock")).unwrap();
@@ -137,5 +155,38 @@ mod tests {
         std::fs::create_dir_all(dir_as_sock.join("agent.sock/x")).unwrap();
         std::fs::set_permissions(&dir_as_sock, PermissionsExt::from_mode(0o700)).unwrap();
         assert!(err(bind(&dir_as_sock, me())).contains("not this user's socket"));
+    }
+
+    #[test]
+    fn the_lock_alone_keeps_a_second_agent_out_even_without_a_socket_file() {
+        let base = base();
+        let dir = base.path().join("dybw");
+        let _first = bind(&dir, me()).unwrap();
+        std::fs::remove_file(dir.join("agent.sock")).unwrap();
+        assert!(err(bind(&dir, me())).contains("lock"));
+        assert!(!dir.join("agent.sock").exists(), "the refused agent created nothing");
+    }
+
+    #[test]
+    fn a_live_socket_of_an_agent_without_the_lock_is_still_refused() {
+        let base = base();
+        let dir = base.path().join("dybw");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o700)).unwrap();
+        let _foreign = UnixListener::bind(dir.join("agent.sock")).unwrap();
+        assert!(err(bind(&dir, me())).contains("already running on"));
+        assert!(dir.join("agent.sock").exists());
+    }
+
+    #[test]
+    fn only_refused_or_missing_counts_as_stale() {
+        let base = base();
+        let dir = base.path().join("dybw");
+        drop(bind(&dir, me()).unwrap());
+        let sock = dir.join("agent.sock");
+        // Connecting to it now fails with "permission denied": not a sign that nobody is there.
+        std::fs::set_permissions(&sock, PermissionsExt::from_mode(0o000)).unwrap();
+        assert!(err(bind(&dir, me())).contains("cannot tell"));
+        assert!(sock.exists(), "an unclear socket is not unlinked");
     }
 }

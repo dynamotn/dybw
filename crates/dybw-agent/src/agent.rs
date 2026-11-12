@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -25,6 +26,23 @@ pub trait Clock: Send + Sync {
     fn wall(&self) -> SystemTime;
     /// Does not advance while the machine sleeps (macOS and Linux).
     fn mono(&self) -> Instant;
+}
+
+/// The kind of an op for the log: never its contents.
+fn kind(op: &Op) -> &'static str {
+    match op {
+        Op::Status { .. } => "status",
+        Op::Login { .. } => "login",
+        Op::Unlock { .. } => "unlock",
+        Op::Lock { .. } => "lock",
+        Op::Sync { .. } => "sync",
+        Op::List { .. } => "list",
+        Op::Search { .. } => "search",
+        Op::Get { .. } => "get",
+        Op::History { .. } => "history",
+        Op::StopAgent => "stop_agent",
+        _ => "other",
+    }
 }
 
 pub struct SystemClock;
@@ -52,6 +70,8 @@ pub struct Agent {
     workers: Mutex<HashMap<String, Arc<Worker>>>,
     last_tick: Mutex<(SystemTime, Instant)>,
     pub(crate) stop: Notify,
+    /// Set by `shutdown`: no worker starts after it.
+    closed: AtomicBool,
 }
 
 impl Agent {
@@ -68,6 +88,7 @@ impl Agent {
             workers: Mutex::default(),
             last_tick,
             stop: Notify::new(),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -78,15 +99,19 @@ impl Agent {
     }
 
     /// The worker of a profile, started on first use and again after it died (its keys died with it).
-    fn worker(&self, profile: &crate::config::Profile) -> Arc<Worker> {
+    /// `None` once `shutdown` has begun.
+    fn worker(&self, profile: &crate::config::Profile) -> Option<Arc<Worker>> {
         let mut workers = self.workers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::SeqCst) {
+            return None;
+        }
         if let Some(w) = workers.get(&profile.name).filter(|w| w.is_alive()) {
-            return w.clone();
+            return Some(w.clone());
         }
         let paths = ProfilePaths::with(&*self.var, &self.home, profile);
         let w = Arc::new(Worker::spawn(profile, paths.credentials));
         workers.insert(profile.name.clone(), w.clone());
-        w
+        Some(w)
     }
 
     #[cfg(test)]
@@ -94,13 +119,14 @@ impl Agent {
         self.workers.lock().map(|w| w.len()).unwrap_or_default()
     }
 
-    /// Answer one request. Anything not yet served answers `Internal`.
+    /// Answer one request. Anything not yet served answers `Internal`. `StopAgent` only answers `Done`: the
+    /// connection handler notifies the stop once that reply is written.
     pub async fn dispatch(&self, op: Op) -> Reply {
+        // Do not wait for the tick: a request right after a wake or past the idle timeout finds the profile locked.
+        self.guard().await;
+        tracing::info!(op = kind(&op), "request");
         match op {
-            Op::StopAgent => {
-                self.stop.notify_one();
-                Reply::Done
-            }
+            Op::StopAgent => Reply::Done,
             Op::Status { profile } => self.on_profile(profile.as_deref(), Cmd::Status).await,
             Op::Lock { target: Target::Profile(name) } => self.on_profile(Some(&name), Cmd::Lock).await,
             Op::Lock { target: Target::All } => {
@@ -113,7 +139,10 @@ impl Agent {
 
     async fn on_profile(&self, name: Option<&str>, cmd: Cmd) -> Reply {
         match self.config.profile(name) {
-            Ok(profile) => self.worker(&profile).call(cmd, self.clock.mono()).await,
+            Ok(profile) => match self.worker(&profile) {
+                Some(worker) => worker.call(cmd, self.clock.mono()).await,
+                None => Reply::Error { error: AgentError::Internal },
+            },
             Err(_) => Reply::Error { error: AgentError::Config },
         }
     }
@@ -124,9 +153,14 @@ impl Agent {
         }
     }
 
-    /// The 30 s tick: lock everything after a suspend (wall time ran ahead of monotonic time), else lock the
-    /// profiles that have been idle past their timeout.
+    /// The 30 s tick; see [`Agent::guard`].
     pub async fn tick(&self) {
+        self.guard().await;
+    }
+
+    /// Lock everything after a suspend (wall time ran ahead of monotonic time since the last check), else lock
+    /// the profiles that have been idle past their timeout. Runs on every tick and before every request.
+    async fn guard(&self) {
         let (wall, mono) = (self.clock.wall(), self.clock.mono());
         let (last_wall, last_mono) = {
             let mut last = self.last_tick.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -144,7 +178,11 @@ impl Agent {
 
     /// Lock every profile and end its thread, so the keys are gone when this returns.
     pub async fn shutdown(&self) {
-        let workers = std::mem::take(&mut *self.workers.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let workers = {
+            let mut map = self.workers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.closed.store(true, Ordering::SeqCst);
+            std::mem::take(&mut *map)
+        };
         for w in workers.values() {
             w.stop(self.clock.mono()).await;
         }
@@ -218,7 +256,7 @@ mod tests {
 
     async fn install(agent: &Agent, profile: &str) {
         let p = agent.config.profile(Some(profile)).unwrap();
-        agent.worker(&p).call(Cmd::Install, agent.clock.mono()).await;
+        agent.worker(&p).unwrap().call(Cmd::Install, agent.clock.mono()).await;
         assert!(unlocked(agent, profile).await);
     }
 
@@ -252,7 +290,38 @@ mod tests {
         let list = Op::List { profile: None, fields: vec![], folder: None };
         assert_eq!(agent.dispatch(list).await, Reply::Error { error: AgentError::Internal });
         assert_eq!(agent.dispatch(Op::StopAgent).await, Reply::Done);
-        tokio::time::timeout(Duration::from_secs(5), agent.stop.notified()).await.unwrap();
+        // Only the connection handler stops the agent, after the reply is written.
+        let stopped = tokio::time::timeout(Duration::from_millis(50), agent.stop.notified()).await;
+        assert!(stopped.is_err(), "dispatch must not notify the stop itself");
+    }
+
+    #[test]
+    fn the_log_names_the_kind_of_an_op_and_never_its_contents() {
+        let ops = [
+            Op::Status { profile: None },
+            Op::Login { profile: None },
+            Op::Unlock { profile: None },
+            Op::Lock { target: Target::All },
+            Op::Sync { target: Target::All },
+            Op::List { profile: None, fields: vec![], folder: None },
+            Op::Search { profile: None, term: "t".into(), folder: None, fields: vec![] },
+            Op::Get {
+                profile: None,
+                needle: "n".into(),
+                user: None,
+                folder: None,
+                ignorecase: false,
+                select: dybw_proto::Select::Password,
+            },
+            Op::History { profile: None, needle: "n".into(), user: None, folder: None },
+            Op::StopAgent,
+            Op::Unknown,
+        ];
+        let kinds: Vec<_> = ops.iter().map(kind).collect();
+        assert_eq!(
+            kinds,
+            ["status", "login", "unlock", "lock", "sync", "list", "search", "get", "history", "stop_agent", "other"]
+        );
     }
 
     #[tokio::test]
@@ -290,14 +359,32 @@ mod tests {
         install(&agent, "work").await;
         clock.advance(4 * MIN, 4 * MIN);
         let work = agent.config.profile(Some("work")).unwrap();
-        agent.worker(&work).call(Cmd::Install, clock.mono()).await; // a use of work at minute 4
+        agent.worker(&work).unwrap().call(Cmd::Install, clock.mono()).await; // a use of work at minute 4
         clock.advance(2 * MIN, 2 * MIN);
-        agent.tick().await;
         assert!(unlocked(&agent, "work").await, "used 2 minutes ago");
         clock.advance(4 * MIN, 4 * MIN);
-        assert!(unlocked(&agent, "work").await, "status calls are not a use");
-        agent.tick().await;
+        assert!(!unlocked(&agent, "work").await, "10 minutes in, 6 since the use: the status at minute 6 was no use");
+    }
+
+    #[tokio::test]
+    async fn a_request_past_the_idle_timeout_finds_the_profile_locked_without_a_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, clock) = agent(dir.path());
+        install(&agent, "work").await;
+        clock.advance(6 * MIN, 6 * MIN);
+        // No tick ran: the request itself triggers the check, before the worker command.
         assert!(!unlocked(&agent, "work").await);
+    }
+
+    #[tokio::test]
+    async fn a_request_right_after_a_wake_finds_every_profile_locked_without_a_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, clock) = agent(dir.path());
+        install(&agent, "work").await;
+        install(&agent, "home").await;
+        clock.advance(60 * MIN, Duration::from_secs(30));
+        assert!(!unlocked(&agent, "work").await);
+        assert!(!unlocked(&agent, "home").await, "a profile that never idles locks on a suspend too");
     }
 
     #[tokio::test]
@@ -325,7 +412,7 @@ mod tests {
         install(&agent, "work").await;
         install(&agent, "home").await;
         let work = agent.config.profile(Some("work")).unwrap();
-        let reply = agent.worker(&work).call(Cmd::Panic, clock.mono()).await;
+        let reply = agent.worker(&work).unwrap().call(Cmd::Panic, clock.mono()).await;
         assert_eq!(reply, Reply::Error { error: AgentError::Internal });
         assert!(!unlocked(&agent, "work").await, "half-dropped state is wiped");
         assert!(unlocked(&agent, "home").await, "other profiles keep working");
@@ -338,7 +425,7 @@ mod tests {
         install(&agent, "work").await;
         install(&agent, "home").await;
         let work = agent.config.profile(Some("work")).unwrap();
-        let worker = agent.worker(&work);
+        let worker = agent.worker(&work).unwrap();
         assert_eq!(worker.call(Cmd::Crash, clock.mono()).await, Reply::Error { error: AgentError::Internal });
         // Wait for the thread to be gone, then every further call fails fast.
         while worker.is_alive() {
@@ -357,6 +444,9 @@ mod tests {
         install(&agent, "home").await;
         agent.shutdown().await;
         assert_eq!(agent.worker_count(), 0);
-        assert!(!unlocked(&agent, "work").await, "a new worker starts locked");
+        // A request that arrives after shutdown must not start a new worker.
+        let status = agent.dispatch(Op::Status { profile: Some("work".into()) }).await;
+        assert_eq!(status, Reply::Error { error: AgentError::Internal });
+        assert_eq!(agent.worker_count(), 0);
     }
 }

@@ -148,6 +148,7 @@ async fn handle(
             let idle = now.saturating_duration_since(st.last_used.unwrap_or(now));
             if !timeout.is_zero() && idle >= timeout {
                 st.slot = None;
+                tracing::info!(profile = %name, "locked after idle");
             }
             Reply::Done
         }

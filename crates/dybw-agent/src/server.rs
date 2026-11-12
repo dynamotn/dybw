@@ -4,28 +4,32 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dybw_proto::{AgentError, MAX_FRAME, Reply, Request, Response, decode_request, encode};
+use dybw_proto::{AgentError, MAX_FRAME, Op, Reply, Request, Response, decode_request, encode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::task::JoinSet;
 use zeroize::Zeroizing;
 
 use crate::agent::{Agent, TICK};
 
-/// Serve until `shutdown` resolves or `StopAgent` arrives, ticking the idle and sleep checks. Every worker is
-/// stopped, and its keys wiped, before this returns.
+/// Serve until `shutdown` resolves (or fails) or a `StopAgent` reply has been delivered, ticking the idle and sleep
+/// checks. Connections in flight are finished first; then every worker is stopped and its keys wiped before this
+/// returns.
 pub async fn serve(
     agent: Arc<Agent>,
     listener: std::os::unix::net::UnixListener,
-    shutdown: impl Future<Output = ()>,
+    shutdown: impl Future<Output = std::io::Result<()>>,
 ) -> std::io::Result<()> {
     let listener = UnixListener::from_std(listener)?;
     let ticker = tokio::spawn(ticker(agent.clone()));
+    let mut handlers = JoinSet::new();
     let out = tokio::select! {
-        () = shutdown => Ok(()),
+        out = shutdown => out,
         () = agent.stop.notified() => Ok(()),
-        out = accept_loop(&agent, &listener) => out,
+        out = accept_loop(&agent, &listener, &mut handlers) => out,
     };
     ticker.abort();
+    while handlers.join_next().await.is_some() {}
     agent.shutdown().await;
     out
 }
@@ -39,23 +43,39 @@ async fn ticker(agent: Arc<Agent>) {
 }
 
 /// Ends only on an accept error (out of descriptors, a dead socket): better to stop than to spin.
-// The closing brace of a loop that never ends is a line no test can reach, so the loop's own closes it.
+// rustfmt::skip: coverage counts the closing brace of an endless loop as a line no test reaches, so it shares a line.
 #[rustfmt::skip]
-async fn accept_loop(agent: &Arc<Agent>, listener: &UnixListener) -> std::io::Result<()> {
+async fn accept_loop(agent: &Arc<Agent>, listener: &UnixListener, handlers: &mut JoinSet<()>) -> std::io::Result<()> {
     loop {
+        while handlers.try_join_next().is_some() {}
         let (stream, _) = listener.accept().await?;
-        tokio::spawn(handle(agent.clone(), stream)); } }
+        let agent = agent.clone();
+        handlers.spawn(async move { if handle(agent.clone(), stream).await { agent.stop.notify_one(); } }); } }
 
 /// One connection. A peer of another uid, a slow or oversize or malformed or wrong-version request is dropped
-/// without a reply and before any worker is touched.
-pub async fn handle(agent: Arc<Agent>, mut stream: UnixStream) {
+/// without a reply and before any worker is touched. Returns true when the request was `StopAgent`, whose `Done`
+/// has by then been written and the connection closed: only then may the agent stop.
+pub async fn handle(agent: Arc<Agent>, mut stream: UnixStream) -> bool {
     if !matches!(stream.peer_cred(), Ok(cred) if cred.uid() == agent.uid) {
-        return;
+        tracing::warn!("refused a connection from another user");
+        return false;
     }
-    let Some(request) = read_request(&mut stream, agent.read_timeout).await else { return };
+    let Some(request) = read_request(&mut stream, agent.read_timeout).await else { return false };
+    let stop = request.op == Op::StopAgent;
     let reply = agent.dispatch(request.op).await;
-    let _ = stream.write_all(&reply_frame(reply)).await;
-    let _ = stream.shutdown().await;
+    respond(&mut stream, reply, agent.read_timeout).await;
+    stop
+}
+
+/// Write the reply and close, within `limit`: a client that never reads cannot hold the connection open.
+async fn respond(stream: &mut UnixStream, reply: Reply, limit: Duration) {
+    let write = async {
+        let _ = stream.write_all(&reply_frame(reply)).await;
+        let _ = stream.shutdown().await;
+    };
+    if tokio::time::timeout(limit, write).await.is_err() {
+        tracing::warn!("a client did not take its reply in time");
+    }
 }
 
 /// A reply too large for a frame is an agent fault, answered as `Internal`, never dropped silently.
@@ -73,8 +93,14 @@ async fn read_request(stream: &mut UnixStream, limit: Duration) -> Option<Reques
     let read = async {
         let mut buf = Zeroizing::new(Vec::with_capacity(4 + MAX_FRAME));
         loop {
-            if let Some((request, _)) = decode_request(&buf).ok()? {
-                return Some(request);
+            match decode_request(&buf) {
+                Ok(Some((request, _))) => return Some(request),
+                Ok(None) => {}
+                Err(e) => {
+                    // The error names a position or a version, never frame text.
+                    tracing::warn!(%e, "refused a request frame");
+                    return None;
+                }
             }
             if stream.read_buf(&mut *buf).await.ok()? == 0 {
                 return None;
@@ -89,7 +115,7 @@ async fn read_request(stream: &mut UnixStream, limit: Duration) -> Option<Reques
 mod tests {
     use super::*;
     use crate::agent::testing::{agent, me};
-    use dybw_proto::{Op, Secret, decode_response};
+    use dybw_proto::{Secret, decode_response};
     use tokio::net::UnixStream as Tokio;
 
     fn frame(json: &str) -> Vec<u8> {
@@ -185,8 +211,8 @@ mod tests {
         let dir = tempfile::Builder::new().prefix("d").tempdir_in("/tmp").unwrap();
         let (agent, _) = agent(dir.path());
         let sock_dir = dir.path().join("run");
-        let listener = crate::socket::bind(&sock_dir, me()).unwrap();
-        let served = tokio::spawn(serve(agent.clone(), listener, std::future::pending()));
+        let (listener, _lock) = crate::socket::bind(&sock_dir, me()).unwrap();
+        let served = tokio::spawn(serve(agent.clone(), listener, std::future::pending::<std::io::Result<()>>()));
         let path = sock_dir.join("agent.sock");
 
         assert!(crate::socket::bind(&sock_dir, me()).is_err(), "the live socket is not replaced");
@@ -206,7 +232,71 @@ mod tests {
     async fn serve_also_ends_on_its_shutdown_signal() {
         let dir = tempfile::Builder::new().prefix("d").tempdir_in("/tmp").unwrap();
         let (agent, _) = agent(dir.path());
-        let listener = crate::socket::bind(&dir.path().join("run"), me()).unwrap();
-        serve(agent, listener, async {}).await.unwrap();
+        let (listener, _lock) = crate::socket::bind(&dir.path().join("run"), me()).unwrap();
+        serve(agent, listener, async { Ok(()) }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_a_delivered_stop_agent_asks_the_agent_to_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _) = agent(dir.path());
+        for (op, stops) in [("status", false), ("stop_agent", true)] {
+            let (mut client, server) = Tokio::pair().unwrap();
+            let task = tokio::spawn(handle(agent.clone(), server));
+            let json = if op == "status" {
+                r#"{"version":1,"op":"status","profile":null}"#
+            } else {
+                r#"{"version":1,"op":"stop_agent"}"#
+            };
+            client.write_all(&frame(json)).await.unwrap();
+            let mut out = Vec::new();
+            client.read_to_end(&mut out).await.unwrap();
+            // The reply and the close come first; the flag is what tells `serve` to stop afterwards.
+            assert_eq!(task.await.unwrap(), stops, "{op}");
+            assert!(!out.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_reads_cannot_hold_the_reply_open() {
+        let (_client, mut server) = Tokio::pair().unwrap();
+        let big = Reply::Value { value: Secret::new("x".repeat(MAX_FRAME - 100)) };
+        // Far more than a socket buffer holds, and nobody reads it.
+        let done = tokio::time::timeout(Duration::from_secs(10), respond(&mut server, big, Duration::from_millis(50)));
+        assert!(done.await.is_ok(), "the write must give up at the timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serve_answers_connections_in_flight_before_it_stops_the_workers() {
+        let dir = tempfile::Builder::new().prefix("d").tempdir_in("/tmp").unwrap();
+        let (mut agent, _) = agent(dir.path());
+        Arc::get_mut(&mut agent).unwrap().read_timeout = Duration::from_secs(5);
+        let (listener, _lock) = crate::socket::bind(&dir.path().join("run"), me()).unwrap();
+        let path = dir.path().join("run/agent.sock");
+        let served = tokio::spawn(serve(agent.clone(), listener, std::future::pending::<std::io::Result<()>>()));
+        // A connects first and is slow; B stops the agent meanwhile.
+        let slow = {
+            let (path, ready) = (path.clone(), tokio::sync::oneshot::channel::<()>());
+            let (tx, rx) = ready;
+            let reply = tokio::task::spawn_blocking(move || {
+                use std::io::{Read, Write};
+                let mut s = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(400));
+                s.write_all(&encode(&dybw_proto::Request::new(Op::Status { profile: None })).unwrap()).unwrap();
+                let mut buf = Vec::new();
+                s.read_to_end(&mut buf).unwrap();
+                decode_response(&buf).unwrap().unwrap().0.reply
+            });
+            rx.await.unwrap();
+            reply
+        };
+        let stopped = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || ask(&path, Op::StopAgent)).await.unwrap()
+        };
+        assert_eq!(stopped, Reply::Done);
+        assert!(matches!(slow.await.unwrap(), Reply::Status { .. }), "the connection in flight was served, not cut");
+        served.await.unwrap().unwrap();
     }
 }
