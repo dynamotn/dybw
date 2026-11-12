@@ -1,6 +1,7 @@
 //! The dybw agent. P4.1 builds it up: the config layer first, then the socket server and the vault session.
 
 pub mod agent;
+pub mod caller;
 pub mod config;
 pub mod credentials;
 pub mod device;
