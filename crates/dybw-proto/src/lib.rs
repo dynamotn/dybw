@@ -123,6 +123,9 @@ pub struct ProfileStatus {
     pub profile: String,
     pub logged_in: bool,
     pub unlocked: bool,
+    /// Unix seconds of the last sync (or the offline copy the profile last wrote); `None` before the first.
+    #[serde(default)]
+    pub last_sync: Option<u64>,
 }
 
 /// One `list`/`search` row: only the fields asked for are `Some`; `id` is always set.
@@ -484,7 +487,12 @@ mod tests {
         let replies = vec![
             Reply::Status {
                 agent_version: s("1"),
-                profiles: vec![ProfileStatus { profile: s("work"), logged_in: true, unlocked: false }],
+                profiles: vec![ProfileStatus {
+                    profile: s("work"),
+                    logged_in: true,
+                    unlocked: false,
+                    last_sync: Some(1_700_000_000),
+                }],
             },
             Reply::Done,
             Reply::Items {
