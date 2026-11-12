@@ -53,9 +53,11 @@ pub fn harnesses_path(var: &dyn Fn(&str) -> Option<OsString>, home: &Path) -> Pa
     xdg_dir(var, home, "XDG_STATE_HOME", ".local/state").join("dybw/harnesses.toml")
 }
 
-/// `$XDG_STATE_HOME/dybw/audit.log`: every value request and policy change, for every profile.
-pub fn audit_path(var: &dyn Fn(&str) -> Option<OsString>, home: &Path) -> PathBuf {
-    xdg_dir(var, home, "XDG_STATE_HOME", ".local/state").join("dybw/audit.log")
+/// `<home>/.local/state/dybw/audit.log`: every value request and policy change, for every profile. Under the
+/// trusted home only, never `XDG_STATE_HOME`: the agent inherits the environment of whoever started it, and that
+/// caller must not choose where the evidence about it is kept.
+pub fn audit_path(home: &Path) -> PathBuf {
+    home.join(".local/state/dybw/audit.log")
 }
 
 /// `$XDG_CONFIG_HOME/dybw/config.toml`: the one file every profile shares, known before any profile is.
@@ -94,7 +96,8 @@ mod tests {
         assert_eq!(p.credentials, Path::new("/s/dybw/profiles/w/credentials"));
         assert_eq!(p.policy, Path::new("/s/dybw/profiles/w/policy.json"));
         assert_eq!(harnesses_path(&env(&vars), Path::new("/h")), Path::new("/s/dybw/harnesses.toml"));
-        assert_eq!(audit_path(&env(&vars), Path::new("/h")), Path::new("/s/dybw/audit.log"));
+        // Not under XDG_STATE_HOME, which a caller can set.
+        assert_eq!(audit_path(Path::new("/h")), Path::new("/h/.local/state/dybw/audit.log"));
         assert_eq!(p.device, Path::new("/s/dybw/profiles/w/devices/dybw"));
         assert_eq!(p.cache, Path::new("/k/dybw/profiles/w"));
     }

@@ -56,8 +56,11 @@ pub enum Verdict {
     /// The policy refused without asking (an AI-class caller, a deny entry, an item that needs a reprompt, a peer
     /// that changed).
     Denied,
-    /// A policy change the user approved could not be written.
+    /// A request that failed before any decision (no such item, ambiguous, locked, no profile).
+    /// Also a policy change the user approved that could not be written.
     Failed,
+    /// A names-only request (`list`, `search`) answered.
+    Listed,
 }
 
 /// One decision on a value or a policy change, with no value in it.

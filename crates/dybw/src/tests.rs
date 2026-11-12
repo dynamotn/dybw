@@ -785,6 +785,7 @@ fn audit_event(
 }
 
 fn audit_log(base: &Path) -> PathBuf {
+    // Under HOME whatever XDG_STATE_HOME says (see `audit_log_ignores_xdg_state_home`).
     base.join(".local/state/dybw/audit.log")
 }
 
@@ -1003,4 +1004,20 @@ fn the_doctor_command_runs_the_real_checks() {
     let (code, out, _) = run_in(&env_in(base.path(), None, None), &["doctor"]);
     // The pinentry and the harness depend on the machine; the checks themselves always run.
     assert!(code <= 1 && out.contains("[ok] socket directory") && out.contains("] pinentry: "), "{out}");
+}
+
+#[test]
+fn the_audit_log_is_under_home_whatever_xdg_state_home_says() {
+    let base = base();
+    write_audit(base.path());
+    let mut env = env_in(base.path(), None, None);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let (home, xdg) = (base.path().to_owned(), elsewhere.path().to_owned());
+    env.var = Box::new(move |name| match name {
+        "XDG_RUNTIME_DIR" | "HOME" => Some(home.clone().into()),
+        "XDG_STATE_HOME" => Some(xdg.clone().into()),
+        _ => None,
+    });
+    let (code, out, _) = run_in(&env, &["audit"]);
+    assert_eq!((code, out.lines().count()), (0, 3));
 }

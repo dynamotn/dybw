@@ -68,6 +68,7 @@ mod tests {
 
     #[test]
     fn hardening_lowers_the_core_limit() {
+        // Note: `harden()` calls PT_DENY_ATTACH on macOS, so this test process dies when run under lldb.
         // Lowering the limit of the test process is harmless and idempotent.
         assert!(harden().is_empty());
         let limit = rustix::process::getrlimit(Resource::Core);

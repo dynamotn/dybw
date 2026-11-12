@@ -12,7 +12,7 @@ use dybw_proto::{AgentError, Op, Reply, Target};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-use crate::caller::{Resolved, Resolver};
+use crate::caller::{Caller, Resolved, Resolver};
 use crate::config::{Config, Profile};
 use crate::paths::ProfilePaths;
 use crate::policy::{Audit, AuditEvent, Verdict};
@@ -178,6 +178,13 @@ impl Agent {
             Op::History { profile, .. } | Op::Policy { profile, .. } => Some((kind(&op), None, profile.clone())),
             _ => None,
         };
+        let logged = match &op {
+            Op::Get { profile, select, .. } => Some((kind(&op), op_of(Some(select)).1, profile.clone())),
+            Op::History { profile, .. } | Op::List { profile, .. } | Op::Search { profile, .. } => {
+                Some((kind(&op), None, profile.clone()))
+            }
+            _ => None,
+        };
         let changed = |(op, what, profile): (&'static str, Option<&'static str>, Option<String>)| {
             tracing::warn!(op, "the caller changed while it was being served: denied");
             let profile = self.config.profile(profile.as_deref()).map(|p| p.name).unwrap_or_default();
@@ -215,7 +222,38 @@ impl Agent {
         {
             return changed(s);
         }
+        self.log_unvetted(who, logged, &reply);
         reply
+    }
+
+    /// Every read request of an AI-class or unknown caller leaves a line, also the ones that never reach a decision
+    /// (a lookup that failed, a list): `listed`, or `failed` with no needle and no candidates. Decisions on a value
+    /// are already recorded by the worker; invoker-class requests are recorded only as decisions.
+    fn log_unvetted(
+        &self,
+        who: &Resolved,
+        request: Option<(&'static str, Option<&'static str>, Option<String>)>,
+        reply: &Reply,
+    ) {
+        let Some((op, kind, profile)) = request else { return };
+        if !matches!(who.caller, Caller::Ai { .. } | Caller::Unknown { .. }) {
+            return;
+        }
+        let verdict = match reply {
+            Reply::Items { .. } => Verdict::Listed,
+            Reply::Error { error } if !matches!(error, AgentError::Denied | AgentError::Prompt) => Verdict::Failed,
+            _ => return,
+        };
+        let profile = self.config.profile(profile.as_deref()).map(|p| p.name).unwrap_or_default();
+        self.audit.record(AuditEvent {
+            time: SystemTime::now(),
+            profile,
+            caller: who.caller.clone(),
+            op,
+            kind,
+            item: None,
+            verdict,
+        });
     }
 
     async fn serve(&self, op: Op, who: &Resolved) -> Reply {

@@ -51,18 +51,18 @@ fn a_decision_is_one_json_line_without_a_value_or_a_name() {
     audit.record(event(tool(), Verdict::Remembered));
     audit.record(event(Caller::Ai { harness: "claude".into(), via: Via::Ancestry }, Verdict::Denied));
     audit.record(event(Caller::Unknown { why: "orphan".into() }, Verdict::Declined));
-    for verdict in [Verdict::Granted, Verdict::Confirmed, Verdict::Failed] {
+    for verdict in [Verdict::Granted, Verdict::Confirmed, Verdict::Failed, Verdict::Listed] {
         audit.record(event(tool(), verdict));
     }
     let path = dir.path().join("state/dybw/audit.log");
     let text = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(text.lines().count(), 6);
+    assert_eq!(text.lines().count(), 7);
     assert!(!text.contains("secret-hash") && !text.contains("orphan"), "no hash, no reason: {text}");
     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     let log = read(&path, me()).unwrap();
     assert_eq!(log.skipped, 0);
     let verdicts: Vec<_> = log.entries.iter().map(|e| e.verdict.as_str()).collect();
-    assert_eq!(verdicts, ["remembered", "denied", "declined", "granted", "confirmed", "failed"]);
+    assert_eq!(verdicts, ["remembered", "denied", "declined", "granted", "confirmed", "failed", "listed"]);
     assert_eq!(
         log.entries[0],
         Entry {
@@ -186,4 +186,22 @@ fn edited_lines_are_counted_and_an_oversized_log_is_refused() {
     assert_eq!((log.entries.len(), log.skipped), (2, 2));
     std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(MAX_READ + 1).unwrap();
     assert!(read(&path, me()).unwrap_err().to_string().contains("too large"));
+}
+
+#[test]
+fn a_failed_rotation_keeps_appending_to_the_live_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let audit = log_in(dir.path());
+    audit.record(event(tool(), Verdict::Granted));
+    let path = dir.path().join("state/dybw/audit.log");
+    std::fs::OpenOptions::new().append(true).open(&path).unwrap().set_len(ROTATE_AT).unwrap();
+    // A directory where the older generation goes: the rename fails.
+    std::fs::create_dir(dir.path().join("state/dybw/audit.log.1")).unwrap();
+    audit.record(event(tool(), Verdict::Confirmed));
+    audit.record(event(tool(), Verdict::Denied));
+    // The padding that made the file "full" glues itself to the first new line; the later one is whole.
+    let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+    assert!(text.contains("\"verdict\":\"confirmed\"") && text.contains("\"verdict\":\"denied\""));
+    assert_eq!(read(&path, me()).unwrap().entries.len(), 2);
+    assert!(std::fs::metadata(&path).unwrap().len() > ROTATE_AT, "nothing was truncated");
 }

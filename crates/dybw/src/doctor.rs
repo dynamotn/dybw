@@ -67,7 +67,7 @@ pub fn run(
             profile_checks(env, &config, profile, &home, pinentry, &mut r)?;
         }
     }
-    let path = audit_path(&env.var, &home);
+    let path = audit_path(&home);
     let shown = path.display();
     match audit::read(&path, env.uid) {
         Ok(log) if log.skipped == 0 => r.ok("audit log", &format!("{shown}, {} lines", log.entries.len()))?,

@@ -502,3 +502,29 @@ async fn a_peer_that_goes_after_the_worker_opened_the_item_still_gets_no_value()
     assert_eq!(rig.agent.opens("work").await, 1, "it was opened, and the reply was withheld");
     assert_eq!(verdicts(&rig), [Verdict::Confirmed, Verdict::Denied]);
 }
+
+#[tokio::test]
+async fn every_read_of_an_ai_or_unknown_caller_is_logged_also_when_it_never_reaches_a_decision() {
+    let (_dir, rig) = setup(|_| {}).await;
+    let agent = &rig.agent;
+    let list = || Op::List { profile: Some("work".into()), fields: vec![Field::Name], folder: None };
+    let search =
+        || Op::Search { profile: Some("work".into()), term: "mail".into(), folder: None, fields: vec![Field::Name] };
+    for caller in [ai(), unknown()] {
+        items(agent.dispatch_as(list(), caller.clone()).await);
+        items(agent.dispatch_as(search(), caller.clone()).await);
+        // No such item: failed before any decision, and the needle is nowhere in the line.
+        let missing = agent.dispatch_as(get_op("no-such-item", Select::Full), caller.clone()).await;
+        assert!(matches!(missing, Reply::Error { .. }));
+        let missing = agent.dispatch_as(history_op("no-such-item"), caller).await;
+        assert!(matches!(missing, Reply::Error { .. }));
+    }
+    let events = rig.audit.events();
+    assert_eq!(verdicts(&rig), [Verdict::Listed, Verdict::Listed, Verdict::Failed, Verdict::Failed].repeat(2));
+    let ops: Vec<_> = events.iter().take(4).map(|e| (e.op, e.kind)).collect();
+    assert_eq!(ops, [("list", None), ("search", None), ("get", Some("full")), ("history", None)]);
+    assert!(events.iter().all(|e| e.item.is_none() && e.profile == "work"));
+    // An invoker's names-only requests are not logged; a decision on its value is, as before.
+    items(agent.dispatch_as(list(), tool("/opt/a.sh", "h1")).await);
+    assert_eq!(events.len(), rig.audit.events().len());
+}

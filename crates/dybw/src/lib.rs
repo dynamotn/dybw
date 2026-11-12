@@ -341,7 +341,7 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
 /// The last `n` lines of the audit log (the file is read directly: same user, no agent needed).
 fn audit(env: &Env, ai: bool, n: usize, out: &mut dyn Write) -> Result<u8, Fail> {
     let home = doctor::home_of(env).ok_or_else(|| Fail::Log("HOME is not set to an absolute path".into()))?;
-    let path = dybw_agent::paths::audit_path(&env.var, &home);
+    let path = dybw_agent::paths::audit_path(&home);
     let log = match dybw_agent::audit::read(&path, env.uid) {
         Ok(log) => log,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),

@@ -49,6 +49,7 @@ fn verdict_name(v: Verdict) -> &'static str {
         Verdict::Declined => "declined",
         Verdict::Denied => "denied",
         Verdict::Failed => "failed",
+        Verdict::Listed => "listed",
     }
 }
 
@@ -135,8 +136,11 @@ impl FileAudit {
         if file.metadata()?.len() >= ROTATE_AT {
             let mut older = self.path.clone().into_os_string();
             older.push(".1");
-            std::fs::rename(&self.path, older)?;
-            file = open_checked(&self.path, self.uid, true)?;
+            // A failed rotation must not stop the log: keep appending to the live file (it just grows).
+            match std::fs::rename(&self.path, older) {
+                Ok(()) => file = open_checked(&self.path, self.uid, true)?,
+                Err(e) => tracing::warn!(file = %self.path.display(), "the audit log was not rotated: {e}"),
+            }
         }
         file.write_all(&line)
     }
