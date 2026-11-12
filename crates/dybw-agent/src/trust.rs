@@ -92,9 +92,15 @@ mod tests {
 
     #[test]
     fn trust_reads_this_process() {
-        // The test run's own HOME and uid decide: root or an odd HOME is refused, anything else accepted.
-        let t = trust();
-        assert_eq!(t.is_err(), me().uid == 0 || std::env::var_os("HOME").is_none_or(|h| !PathBuf::from(h).is_dir()));
+        let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let expected = trust_for(std::env::var_os("HOME"), me(), exe.clone());
+        match trust() {
+            Ok(t) => {
+                assert_eq!((t.exe, t.user, t.search), (Some(exe), me(), Some(OsString::from(PINENTRY_SEARCH))));
+                assert!(t.home.is_some_and(|h| h.is_absolute()));
+            }
+            Err(_) => assert!(expected.is_err()),
+        }
     }
 
     #[test]

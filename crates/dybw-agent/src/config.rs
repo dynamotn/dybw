@@ -36,14 +36,26 @@ pub struct Config {
 }
 
 impl Config {
-    /// Reads the file; a missing file is an empty config (no profile is then defined).
+    /// Reads the file; a missing file is an empty config (no profile is then defined). Every
+    /// `[profiles.*]` section is validated here, used or not.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
-        Ok(Config { doc: read_doc(path)?.unwrap_or_default(), shown: path.display().to_string() })
+        let doc = read_doc(path)?.unwrap_or_default();
+        let config = Config { doc, shown: path.display().to_string() };
+        // profiles §1: a misspelt key is always an error, in an unused profile too.
+        let names: Vec<String> =
+            config.doc.get("profiles").and_then(Value::as_table).into_iter().flat_map(Table::keys).cloned().collect();
+        for name in names {
+            config.profile(Some(&name))?;
+        }
+        Ok(config)
     }
 
     /// The profile `name`, else the file's `default`. The file is validated as a whole, and the profile strictly;
     /// other tools' tables, `[bwss]` included, are not read.
     pub fn profile(&self, name: Option<&str>) -> anyhow::Result<Profile> {
+        if self.doc.get("bwss").is_some_and(|v| !v.is_table()) {
+            bail!("unknown key `bwss` at the top level in {}", self.shown);
+        }
         let mut doc = self.doc.clone();
         // `memory` skips bwss's own `auth` limit; the account is all `resolve` is used for here.
         let mut own = Table::new();
@@ -125,6 +137,30 @@ mod tests {
     fn other_tool_tables_are_ignored_even_the_bwss_one() {
         let c = config(&format!("{TWO}[bwss]\nbackend = \"nonsense\"\nprofile = \"home\"\n[other]\nx = 1\n"));
         assert_eq!(c.profile(None).unwrap().name, "work");
+    }
+
+    #[test]
+    fn a_non_table_bwss_is_an_unknown_key_not_overwritten() {
+        let e = err(&format!("bwss = 5\n{TWO}"), None);
+        assert!(e.contains("unknown key `bwss`"), "{e}");
+    }
+
+    #[test]
+    fn garbage_bwss_with_password_auth_still_resolves() {
+        let c = config(&format!("{TWO}[bwss]\nauth = \"password\"\nbogus = [1]\nprofile = 7\n"));
+        let p = c.profile(None).unwrap();
+        assert_eq!((p.name.as_str(), p.auth), ("work", Auth::Password));
+    }
+
+    #[test]
+    fn load_validates_every_profile_even_unused_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("{TWO}[profiles.spare]\nserver_url = \"u\"\nemial = \"e\"\n")).unwrap();
+        let e = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(e.contains("unknown key `emial`") && e.contains("spare"), "{e}");
+        std::fs::write(&path, format!("{TWO}[profiles.bad]\nx = 1\n")).unwrap();
+        assert!(Config::load(&path).is_err());
     }
 
     #[test]

@@ -1,9 +1,7 @@
 //! Where a profile keeps its files (profiles §1): XDG locations, with the XDG defaults on macOS too.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
-
-use anyhow::bail;
+use std::path::{Path, PathBuf};
 
 use crate::config::Profile;
 
@@ -22,30 +20,25 @@ pub struct ProfilePaths {
 }
 
 impl ProfilePaths {
-    pub fn from_env(profile: &Profile) -> anyhow::Result<Self> {
-        Self::with(&|var| std::env::var_os(var), profile)
+    /// `home` is the validated one from `trust()`, never the raw `HOME`.
+    pub fn from_env(profile: &Profile, home: &Path) -> Self {
+        Self::with(&|var| std::env::var_os(var), home, profile)
     }
 
-    /// The locations for an environment read through `var`. An XDG variable counts only when absolute; without
-    /// it, `HOME` must be absolute.
-    pub fn with(var: &dyn Fn(&str) -> Option<OsString>, profile: &Profile) -> anyhow::Result<Self> {
-        let xdg = |name: &str, fallback: &str| -> anyhow::Result<PathBuf> {
-            if let Some(p) = var(name).map(PathBuf::from).filter(|p| p.is_absolute()) {
-                return Ok(p);
-            }
-            match var("HOME").map(PathBuf::from).filter(|h| h.is_absolute()) {
-                Some(home) => Ok(home.join(fallback)),
-                None => bail!("neither {name} nor an absolute HOME is set"),
-            }
+    /// The locations for an environment read through `var`. An XDG variable counts only when absolute; the
+    /// default is under `home`.
+    pub fn with(var: &dyn Fn(&str) -> Option<OsString>, home: &Path, profile: &Profile) -> Self {
+        let xdg = |name: &str, fallback: &str| {
+            var(name).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(fallback))
         };
-        let state = xdg("XDG_STATE_HOME", ".local/state")?.join("dybw/profiles").join(&profile.name);
-        Ok(ProfilePaths {
-            config: xdg("XDG_CONFIG_HOME", ".config")?.join("dybw/config.toml"),
+        let state = xdg("XDG_STATE_HOME", ".local/state").join("dybw/profiles").join(&profile.name);
+        ProfilePaths {
+            config: xdg("XDG_CONFIG_HOME", ".config").join("dybw/config.toml"),
             credentials: state.join("credentials"),
             device: state.join("devices/dybw"),
-            cache: xdg("XDG_CACHE_HOME", ".cache")?.join("dybw/profiles").join(&profile.name),
+            cache: xdg("XDG_CACHE_HOME", ".cache").join("dybw/profiles").join(&profile.name),
             state,
-        })
+        }
     }
 }
 
@@ -63,7 +56,6 @@ pub(crate) fn test_profile(name: &str) -> Profile {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
     use std::path::Path;
@@ -74,8 +66,8 @@ mod tests {
 
     #[test]
     fn xdg_variables_win() {
-        let vars = [("XDG_CONFIG_HOME", "/c"), ("XDG_STATE_HOME", "/s"), ("XDG_CACHE_HOME", "/k"), ("HOME", "/h")];
-        let p = ProfilePaths::with(&env(&vars), &test_profile("w")).unwrap();
+        let vars = [("XDG_CONFIG_HOME", "/c"), ("XDG_STATE_HOME", "/s"), ("XDG_CACHE_HOME", "/k"), ("HOME", "/raw")];
+        let p = ProfilePaths::with(&env(&vars), Path::new("/h"), &test_profile("w"));
         assert_eq!(p.config, Path::new("/c/dybw/config.toml"));
         assert_eq!(p.state, Path::new("/s/dybw/profiles/w"));
         assert_eq!(p.credentials, Path::new("/s/dybw/profiles/w/credentials"));
@@ -84,26 +76,18 @@ mod tests {
     }
 
     #[test]
-    fn home_gives_the_xdg_defaults_and_a_relative_variable_is_ignored() {
-        let vars = [("XDG_CONFIG_HOME", "relative"), ("HOME", "/h")];
-        let p = ProfilePaths::with(&env(&vars), &test_profile("w")).unwrap();
+    fn defaults_use_the_trusted_home_never_the_raw_one() {
+        let vars = [("XDG_CONFIG_HOME", "relative"), ("HOME", "/raw")];
+        let p = ProfilePaths::with(&env(&vars), Path::new("/h"), &test_profile("w"));
         assert_eq!(p.config, Path::new("/h/.config/dybw/config.toml"));
         assert_eq!(p.state, Path::new("/h/.local/state/dybw/profiles/w"));
         assert_eq!(p.cache, Path::new("/h/.cache/dybw/profiles/w"));
     }
 
     #[test]
-    fn no_absolute_home_and_no_variable_is_an_error() {
-        let e = ProfilePaths::with(&env(&[("HOME", "rel")]), &test_profile("w")).unwrap_err();
-        assert!(e.to_string().contains("HOME"), "{e}");
-        assert!(ProfilePaths::with(&env(&[]), &test_profile("w")).is_err());
-    }
-
-    #[test]
     fn from_env_reads_the_process_environment() {
         // Only the shape: the environment of the test run is not ours to set.
-        if let Ok(p) = ProfilePaths::from_env(&test_profile("w")) {
-            assert!(p.credentials.ends_with("dybw/profiles/w/credentials"));
-        }
+        let p = ProfilePaths::from_env(&test_profile("w"), Path::new("/h"));
+        assert!(p.credentials.ends_with("dybw/profiles/w/credentials"));
     }
 }
