@@ -238,11 +238,11 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
                         match (i, e.name.as_str()) {
                             (0, _) => writeln!(out, "{}", e.value.expose())?,
                             (_, "notes") => writeln!(out, "\n{}", e.value.expose())?,
-                            (_, name) => writeln!(out, "{name}: {}", e.value.expose())?,
+                            (_, name) => writeln!(out, "{}: {}", escape(name), e.value.expose())?,
                         }
                     }
                 }
-                Reply::FieldNames { names } => names.iter().try_for_each(|n| writeln!(out, "{n}"))?,
+                Reply::FieldNames { names } => names.iter().try_for_each(|n| writeln!(out, "{}", escape(n)))?,
                 _ => return Err(Fail::Unexpected),
             }
             Ok(0)

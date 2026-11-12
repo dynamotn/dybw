@@ -708,3 +708,15 @@ fn an_existing_directory_without_a_socket_is_no_agent() {
     assert_eq!(run_in(&env, &["unlocked"]), (1, s(""), s("")));
     assert_eq!(run_in(&env, &["agent", "stop"]), (0, s(""), s("")));
 }
+
+#[test]
+fn field_names_are_escaped_but_their_values_are_not() {
+    let (r, _) = one(&["get", "n", "-l"], Reply::FieldNames { names: vec![s("a\x1b[2Jb")] });
+    assert_eq!(r.1, "a\\x1b[2Jb\n");
+    let entries = vec![
+        Entry { name: s("password"), value: secret("pw") },
+        Entry { name: s("f\nake: x"), value: secret("v\tal") },
+    ];
+    let (r, _) = one(&["get", "n", "--full"], Reply::Full { entries });
+    assert_eq!(r.1, "pw\nf\\x0ake: x: v\tal\n");
+}
