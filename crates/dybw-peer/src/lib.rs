@@ -128,6 +128,8 @@ pub struct Process {
     pub argv: Option<Vec<OsString>>,
     /// At most [`MAX_ENTRIES`] entries; `None` when not visible.
     pub env: Option<Vec<(OsString, OsString)>>,
+    /// `start` as a wall-clock time, to compare with file times; `None` when the boot time is unknown (Linux).
+    pub started: Option<std::time::SystemTime>,
     /// Working directory; `None` when not visible. Read in the same window as the rest.
     pub cwd: Option<PathBuf>,
 }
@@ -168,7 +170,16 @@ impl Process {
         let (argv, env) = sys::args(pid)?;
         let cwd = sys::cwd(pid)?;
         unchanged(&before, &read_id(pid)?)?;
-        Ok(Self { exe, ppid: before.0, start: before.1, image: before.2, argv, env, cwd })
+        Ok(Self {
+            exe,
+            ppid: before.0,
+            start: before.1,
+            image: before.2,
+            argv,
+            env,
+            cwd,
+            started: sys::started(before.1),
+        })
     }
 }
 
@@ -283,6 +294,7 @@ mod tests {
         assert!(p.env.unwrap().iter().any(|(k, v)| k == MARKER && v == "x=y"));
         let here = std::env::current_dir().unwrap().canonicalize().unwrap();
         assert_eq!(p.cwd.unwrap().canonicalize().unwrap(), here);
+        assert!(p.started.unwrap() <= std::time::SystemTime::now());
         child.kill().unwrap();
         child.wait().unwrap();
     }

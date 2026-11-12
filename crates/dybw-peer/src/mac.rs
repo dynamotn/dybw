@@ -120,11 +120,16 @@ pub(crate) fn ppid_start(pid: u32) -> Result<(u32, u64), Error> {
     Ok((info.pbi_ppid, info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec))
 }
 
+/// The start time as a wall-clock time (the unit is already microseconds since the epoch).
+pub(crate) fn started(start: u64) -> Option<std::time::SystemTime> {
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_micros(start))
+}
+
 /// The working directory (`PROC_PIDVNODEPATHINFO`); `None` when the kernel refuses it or it has no path.
 pub(crate) fn cwd(pid: u32) -> Result<Option<PathBuf>, Error> {
     let info: libc::proc_vnodepathinfo = match pidinfo(pid, libc::PROC_PIDVNODEPATHINFO) {
         Ok(info) => info,
-        Err(Error::Os(e)) if e == libc::EPERM || e == libc::EACCES => return Ok(None),
+        Err(Error::Os(libc::EPERM | libc::EACCES)) => return Ok(None),
         Err(e) => return Err(e),
     };
     let bytes: Vec<u8> = info.pvi_cdir.vip_path.iter().flatten().map(|&c| c as u8).take_while(|&b| b != 0).collect();
@@ -223,6 +228,14 @@ mod tests {
         let own = cwd(std::process::id()).unwrap().unwrap();
         assert_eq!(own.canonicalize().unwrap(), std::env::current_dir().unwrap().canonicalize().unwrap());
         assert_eq!(cwd(u32::MAX - 1), Err(Error::Gone));
+        assert_eq!(cwd(1), Ok(None)); // root's: refused, not an error
+    }
+
+    #[test]
+    fn start_is_wall_clock_time() {
+        let t = started(ppid_start(std::process::id()).unwrap().1).unwrap();
+        assert!(t <= std::time::SystemTime::now());
+        assert!(t > std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 365));
     }
 
     #[test]

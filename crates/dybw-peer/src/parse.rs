@@ -74,6 +74,13 @@ pub(crate) fn proc_stat(buf: &[u8]) -> Option<(u32, u64)> {
     Some((ppid, start))
 }
 
+/// `/proc/stat` → the `btime` line: boot time in seconds since the epoch.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn btime(buf: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(buf).ok()?;
+    text.lines().find_map(|l| l.strip_prefix("btime ")).and_then(|v| v.trim().parse().ok())
+}
+
 /// `/proc/self/fdinfo/<pidfd>` → the `Pid:` line (-1 once the process is gone).
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub(crate) fn pidfd_pid(buf: &[u8]) -> Option<i64> {
@@ -189,6 +196,14 @@ mod tests {
         assert!(cmdline(b"\0").is_empty());
         assert_eq!(environ(b"A=1\0B=x=y\0junk\0\0"), vec![(s("A"), s("1")), (s("B"), s("x=y"))]);
         assert!(environ(b"").is_empty());
+    }
+
+    #[test]
+    fn btime_line() {
+        assert_eq!(btime(b"cpu 1 2\nbtime 1700000000\nprocesses 5\n"), Some(1_700_000_000));
+        assert_eq!(btime(b"cpu 1\n"), None);
+        assert_eq!(btime(b"btime x\n"), None);
+        assert_eq!(btime(b"\xff"), None);
     }
 
     #[test]
