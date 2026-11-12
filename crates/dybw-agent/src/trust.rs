@@ -30,7 +30,7 @@ fn trust_for(home: Option<OsString>, user: User, exe: PathBuf) -> anyhow::Result
     ensure!(!meta.file_type().is_symlink(), "HOME {shown} is a symbolic link");
     ensure!(meta.is_dir(), "HOME {shown} is not a directory");
     ensure!(meta.uid() == user.uid, "HOME {shown} is not owned by this user");
-    let home = std::fs::canonicalize(&home).with_context(|| format!("HOME {shown}"))?;
+    let home = std::fs::canonicalize(&home).context(format!("HOME {shown}"))?;
     Ok(Trust { search: Some(PINENTRY_SEARCH.into()), user, exe: Some(exe), home: Some(home) })
 }
 
@@ -94,13 +94,12 @@ mod tests {
     fn trust_reads_this_process() {
         let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
         let expected = trust_for(std::env::var_os("HOME"), me(), exe.clone());
-        match trust() {
-            Ok(t) => {
-                assert_eq!((t.exe, t.user, t.search), (Some(exe), me(), Some(OsString::from(PINENTRY_SEARCH))));
-                assert!(t.home.is_some_and(|h| h.is_absolute()));
-            }
-            Err(_) => assert!(expected.is_err()),
-        }
+        let got = trust();
+        assert_eq!(got.is_ok(), expected.is_ok());
+        let seen: Vec<_> =
+            got.into_iter().map(|t| (t.exe, t.user, t.search, t.home.is_some_and(|h| h.is_absolute()))).collect();
+        let want = (Some(exe), me(), Some(OsString::from(PINENTRY_SEARCH)), true);
+        assert!(seen.iter().all(|s| *s == want));
     }
 
     #[test]

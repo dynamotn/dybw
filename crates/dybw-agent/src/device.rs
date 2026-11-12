@@ -21,17 +21,21 @@ fn device_id_for(paths: &ProfilePaths, uid: u32) -> anyhow::Result<String> {
     // The private-write helper makes a whole file under a name of its own; the link is the create-if-absent
     // step, so two first starts cannot replace each other's id.
     let tmp = paths.device.with_extension(format!("new{}", std::process::id()));
-    let shown = || paths.device.display().to_string();
-    write_private(&tmp, id.as_bytes()).with_context(shown)?;
-    let linked = std::fs::hard_link(&tmp, &paths.device);
+    let shown = paths.device.display().to_string();
+    write_private(&tmp, id.as_bytes()).context(shown.clone())?;
+    let linked = adopt(&tmp, &paths.device);
     let _ = std::fs::remove_file(&tmp);
-    match linked {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e).with_context(shown),
-    }
+    linked.context(shown)?;
     // Whoever linked first won: read back what the file holds.
-    read(&paths.device, uid)?.with_context(|| format!("{} vanished", paths.device.display()))
+    read(&paths.device, uid)?.context(format!("{} vanished", paths.device.display()))
+}
+
+/// Link `tmp` in as `dest` unless `dest` already exists: the first writer wins and that is not an error.
+fn adopt(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(tmp, dest) {
+        Err(e) if e.kind() != ErrorKind::AlreadyExists => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// The stored id: `None` when there is no file; an error for a link, a file that is not ours or not a UUID.
@@ -49,7 +53,7 @@ fn read(path: &Path, uid: u32) -> anyhow::Result<Option<String>> {
     ensure!((meta.dev(), meta.ino()) == (link.dev(), link.ino()), "{shown} changed while it was read");
     ensure!(meta.uid() == uid, "{shown} is not owned by this user");
     let mut text = String::new();
-    file.read_to_string(&mut text).with_context(|| shown.to_string())?;
+    file.read_to_string(&mut text).context(shown.to_string())?;
     let id = text.trim();
     if uuid::Uuid::parse_str(id).is_err() {
         bail!("{shown} does not hold a device id (a UUID); remove it to get a new one");
@@ -72,6 +76,20 @@ mod tests {
 
     fn err(p: &ProfilePaths) -> String {
         format!("{:#}", device_id(p).unwrap_err())
+    }
+
+    #[test]
+    fn the_first_writer_wins_and_other_link_errors_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tmp, dest) = (dir.path().join("tmp"), dir.path().join("dest"));
+        std::fs::write(&tmp, "new").unwrap();
+        std::fs::write(&dest, "first").unwrap();
+        adopt(&tmp, &dest).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "first");
+        std::fs::remove_file(&dest).unwrap();
+        adopt(&tmp, &dest).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new");
+        assert_eq!(adopt(&dir.path().join("none"), &dir.path().join("x")).unwrap_err().kind(), ErrorKind::NotFound);
     }
 
     #[test]
