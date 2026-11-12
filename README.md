@@ -58,13 +58,18 @@ only says "see the agent log" is explained there.
   state directories. `dybw policy show` is open to every class; `allow`, `deny` and `forget` are confirmed in
   pinentry and refused for AI-class and unknown callers. `allow` refuses a bare interpreter or shell and relative
   scripts (they cannot be remembered); `deny` accepts them.
-- The audit log (`$XDG_STATE_HOME/dybw/audit.log`, 0600, append-only, never through a symlink) gets one JSON line per
-  value request and policy change: time (UTC), profile, caller (program and script, or the harness), class, op, what
-  `get` selected (`password`, `field`, `full`, `raw`, `list-fields`; never a field name), the item id (never its name
-  or a value) and the verdict. It rotates once to `audit.log.1` at 10 MiB (`dybw audit` reads only the current file).
-  A line that cannot be written is logged to the agent log and dropped: the request is still answered
-  (availability over completeness), so `dybw doctor` is where a broken log shows. Like `policy.json`, it is plain
-  same-user device state: a program running as you can edit or delete it.
+- The audit log (`~/.local/state/dybw/audit.log` under the agent's trusted home, never `XDG_STATE_HOME`, which the
+  first caller of an on-demand agent could set; 0600, append-only, never through a symlink) records every decision
+  on a value request from the AI class and every request, decision or not, from AI and unknown callers (`listed` for
+  names, `failed` for a lookup that went nowhere; no needle, no candidates), and every decision of other callers on
+  a value or a policy change. A line is JSON: time (UTC), profile, caller (program and script, or the harness),
+  class, op, what `get` selected (`password`, `field`, `full`, `raw`, `list-fields`; never a field name), the item
+  id (never its name or a value) and the verdict. It rotates once to `audit.log.1` at 10 MiB (`dybw audit` reads
+  only the current file); a rotation that fails is reported and the live file just keeps growing. A line that cannot
+  be written is reported in the agent log and dropped: the request is still answered, and `dybw doctor` shows an
+  unwritable log. The log is same-user device state: evidence, not a barrier; a program running as you can edit or
+  delete it. `dybw audit` and `dybw doctor` find it from the raw `HOME` of the command (the CLI has no trusted
+  home to check it against), so a `HOME` that differs from the agent's reads another file.
 - A `policy.json` that fails its checks (wrong mode, owner, not valid) is ignored for decisions, and `dybw policy
   allow|deny|forget` refuse to write over it, so a deny entry is never dropped by accident. Repair it by hand
   (`chmod 600`, or fix or remove the file; the grants are then asked again). `dybw doctor` names the problem.
