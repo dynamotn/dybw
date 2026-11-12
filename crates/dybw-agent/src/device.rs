@@ -13,7 +13,7 @@ pub fn device_id(paths: &ProfilePaths) -> anyhow::Result<String> {
     device_id_for(paths, User::current().context("cannot tell which user this is")?.uid)
 }
 
-fn device_id_for(paths: &ProfilePaths, uid: u32) -> anyhow::Result<String> {
+pub(crate) fn device_id_for(paths: &ProfilePaths, uid: u32) -> anyhow::Result<String> {
     if let Some(id) = read(&paths.device, uid)? {
         return Ok(id);
     }

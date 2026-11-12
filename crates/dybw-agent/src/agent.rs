@@ -7,11 +7,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use dybw_native::fsutil::User;
 use dybw_proto::{AgentError, Op, Reply, Target};
 use tokio::sync::Notify;
+use tokio::task::JoinSet;
 
-use crate::config::Config;
+use crate::config::{Config, Profile};
 use crate::paths::ProfilePaths;
+use crate::session::Ctx;
 use crate::worker::{Cmd, Worker};
 
 /// How often the idle and sleep checks run.
@@ -20,6 +23,12 @@ pub const TICK: Duration = Duration::from_secs(30);
 pub const SLEEP_SLACK: Duration = Duration::from_secs(60);
 /// How long a client has to send its request.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a shutdown lets connections in flight finish before it cancels them: a request may be waiting on a
+/// pinentry or the network.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Starts the worker of a profile: the real host in the agent, a fake in tests.
+pub type Spawn = Box<dyn Fn(Ctx) -> Worker + Send + Sync>;
 
 /// The two clocks; tests drive them by hand so nothing sleeps.
 pub trait Clock: Send + Sync {
@@ -62,29 +71,36 @@ pub type EnvFn = Box<dyn Fn(&str) -> Option<OsString> + Send + Sync>;
 pub struct Agent {
     pub(crate) config: Config,
     pub(crate) home: PathBuf,
+    pub(crate) user: User,
     /// The uid every peer must have.
     pub(crate) uid: u32,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) var: EnvFn,
     pub(crate) read_timeout: Duration,
+    pub(crate) drain_timeout: Duration,
+    spawn: Spawn,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
-    last_tick: Mutex<(SystemTime, Instant)>,
+    /// Held for a whole guard run, so a request that arrives while a suspend is being handled waits for the locks.
+    last_tick: tokio::sync::Mutex<(SystemTime, Instant)>,
     pub(crate) stop: Notify,
     /// Set by `shutdown`: no worker starts after it.
     closed: AtomicBool,
 }
 
 impl Agent {
-    pub fn new(config: Config, home: PathBuf, uid: u32, var: EnvFn) -> Agent {
+    pub fn new(config: Config, home: PathBuf, user: User, var: EnvFn, spawn: Spawn) -> Agent {
         let clock = Arc::new(SystemClock);
-        let last_tick = Mutex::new((clock.wall(), clock.mono()));
+        let last_tick = tokio::sync::Mutex::new((clock.wall(), clock.mono()));
         Agent {
             config,
             home,
-            uid,
+            uid: user.uid,
+            user,
             clock,
             var,
             read_timeout: READ_TIMEOUT,
+            drain_timeout: DRAIN_TIMEOUT,
+            spawn,
             workers: Mutex::default(),
             last_tick,
             stop: Notify::new(),
@@ -100,7 +116,7 @@ impl Agent {
 
     /// The worker of a profile, started on first use and again after it died (its keys died with it).
     /// `None` once `shutdown` has begun.
-    fn worker(&self, profile: &crate::config::Profile) -> Option<Arc<Worker>> {
+    fn worker(&self, profile: &Profile) -> Option<Arc<Worker>> {
         let mut workers = self.workers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.closed.load(Ordering::SeqCst) {
             return None;
@@ -109,7 +125,7 @@ impl Agent {
             return Some(w.clone());
         }
         let paths = ProfilePaths::with(&*self.var, &self.home, profile);
-        let w = Arc::new(Worker::spawn(profile, paths.credentials));
+        let w = Arc::new((self.spawn)(Ctx { profile: profile.clone(), paths, user: self.user.clone() }));
         workers.insert(profile.name.clone(), w.clone());
         Some(w)
     }
@@ -128,6 +144,10 @@ impl Agent {
         match op {
             Op::StopAgent => Reply::Done,
             Op::Status { profile } => self.on_profile(profile.as_deref(), Cmd::Status).await,
+            Op::Login { profile } => self.on_profile(profile.as_deref(), Cmd::Login).await,
+            Op::Unlock { profile } => self.on_profile(profile.as_deref(), Cmd::Unlock).await,
+            Op::Sync { target: Target::Profile(name) } => self.on_profile(Some(&name), Cmd::Sync).await,
+            Op::Sync { target: Target::All } => self.sync_all().await,
             Op::Lock { target: Target::Profile(name) } => self.on_profile(Some(&name), Cmd::Lock).await,
             Op::Lock { target: Target::All } => {
                 self.each(|| Cmd::Lock).await;
@@ -147,6 +167,19 @@ impl Agent {
         }
     }
 
+    /// Sync every profile that is unlocked; a locked one has nothing to sync. The first real failure is the answer.
+    async fn sync_all(&self) -> Reply {
+        let mut first = Reply::Done;
+        for w in self.live() {
+            match w.call(Cmd::Sync, self.clock.mono()).await {
+                Reply::Error { error: AgentError::Locked } | Reply::Done => {}
+                failed if first == Reply::Done => first = failed,
+                _ => {}
+            }
+        }
+        first
+    }
+
     async fn each(&self, cmd: impl Fn() -> Cmd) {
         for w in self.live() {
             w.call(cmd(), self.clock.mono()).await;
@@ -161,11 +194,9 @@ impl Agent {
     /// Lock everything after a suspend (wall time ran ahead of monotonic time since the last check), else lock
     /// the profiles that have been idle past their timeout. Runs on every tick and before every request.
     async fn guard(&self) {
+        let mut last = self.last_tick.lock().await;
         let (wall, mono) = (self.clock.wall(), self.clock.mono());
-        let (last_wall, last_mono) = {
-            let mut last = self.last_tick.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::replace(&mut *last, (wall, mono))
-        };
+        let (last_wall, last_mono) = std::mem::replace(&mut *last, (wall, mono));
         let wall_step = wall.duration_since(last_wall).unwrap_or_default();
         let mono_step = mono.saturating_duration_since(last_mono);
         if wall_step.saturating_sub(mono_step) > SLEEP_SLACK {
@@ -183,9 +214,13 @@ impl Agent {
             self.closed.store(true, Ordering::SeqCst);
             std::mem::take(&mut *map)
         };
-        for w in workers.values() {
-            w.stop(self.clock.mono()).await;
+        // Together, so the bound on each stop is the bound on all of them.
+        let mut stops = JoinSet::new();
+        for w in workers.into_values() {
+            let now = self.clock.mono();
+            stops.spawn(async move { w.stop(now).await });
         }
+        while stops.join_next().await.is_some() {}
     }
 }
 
@@ -193,6 +228,10 @@ impl Agent {
 #[expect(clippy::unwrap_used, reason = "tests")]
 pub(crate) mod testing {
     use super::*;
+    use crate::credentials::Credentials;
+    use crate::host::fake::{Answer, FakeHost, PASSWORD};
+    use crate::worker::Worker;
+    use zeroize::Zeroizing;
 
     /// Both clocks start at the real now and move only when told to.
     pub struct FakeClock(Mutex<(SystemTime, Instant)>);
@@ -219,24 +258,64 @@ pub(crate) mod testing {
         }
     }
 
+    /// Every profile has the vector's email, since it is the salt of the vector's master key.
     pub const CONFIG: &str = "default = \"work\"\n\
-        [profiles.work]\nserver_url = \"https://w.example.org\"\nemail = \"w@example.org\"\nlock_timeout_minutes = 5\n\
-        [profiles.home]\nserver_url = \"https://h.example.org\"\nemail = \"h@example.org\"\nlock_timeout_minutes = 0\n";
+        [profiles.work]\nserver_url = \"https://w.example.org\"\nemail = \"pbkdf2@vectors.invalid\"\nlock_timeout_minutes = 5\n\
+        [profiles.home]\nserver_url = \"https://h.example.org\"\nemail = \"pbkdf2@vectors.invalid\"\nlock_timeout_minutes = 0\n\
+        [profiles.fast]\nserver_url = \"https://f.example.org\"\nemail = \"pbkdf2@vectors.invalid\"\nlock_timeout_minutes = 0\nsync_interval_seconds = 1\n\
+        [profiles.pw]\nserver_url = \"https://p.example.org\"\nemail = \"pbkdf2@vectors.invalid\"\nauth = \"password\"\n\
+        [profiles.plain]\nserver_url = \"http://plain.example.org\"\nemail = \"pbkdf2@vectors.invalid\"\n";
 
     pub fn me() -> u32 {
         rustix::process::geteuid().as_raw()
     }
 
-    /// An agent over [`CONFIG`], with the fake clock and every path under `dir`.
-    pub fn agent(dir: &std::path::Path) -> (Arc<Agent>, Arc<FakeClock>) {
+    /// An agent over [`CONFIG`], with the fake clock, the scripted host, and every path under `dir`.
+    pub fn agent_world(dir: &std::path::Path) -> (Arc<Agent>, Arc<FakeClock>, FakeHost) {
         let file = dir.join("config.toml");
         std::fs::write(&file, CONFIG).unwrap();
         let state = dir.join("state");
-        let var = Box::new(move |name: &str| (name == "XDG_STATE_HOME").then(|| state.clone().into_os_string()));
-        let mut agent = Agent::new(Config::load(&file).unwrap(), dir.to_owned(), me(), var);
+        let cache = dir.join("cache");
+        let var = Box::new(move |name: &str| match name {
+            "XDG_STATE_HOME" => Some(state.clone().into_os_string()),
+            "XDG_CACHE_HOME" => Some(cache.clone().into_os_string()),
+            _ => None,
+        });
+        let host = FakeHost::new();
+        let spawn: Spawn = Box::new({
+            let host = host.clone();
+            move |ctx| Worker::spawn(host.clone(), ctx)
+        });
+        let user = User { uid: me(), groups: None };
+        let mut agent = Agent::new(Config::load(&file).unwrap(), dir.to_owned(), user, var, spawn);
         let clock = Arc::new(FakeClock(Mutex::new((SystemTime::now(), Instant::now()))));
         agent.clock = clock.clone();
-        (Arc::new(agent), clock)
+        (Arc::new(agent), clock, host)
+    }
+
+    pub fn agent(dir: &std::path::Path) -> (Arc<Agent>, Arc<FakeClock>) {
+        let (agent, clock, _) = agent_world(dir);
+        (agent, clock)
+    }
+
+    /// The stored API key of a profile, as `dybw login` leaves it.
+    pub fn seed_credentials(agent: &Agent, profile: &str) {
+        let p = agent.config.profile(Some(profile)).unwrap();
+        let paths = ProfilePaths::with(&*agent.var, &agent.home, &p);
+        let creds = Credentials {
+            identity_origin: dybw_core::api::origin_of(&p.server_url).unwrap(),
+            client_id: "user.0000".into(),
+            client_secret: Zeroizing::new("secret".into()),
+        };
+        creds.store(&paths.credentials).unwrap();
+    }
+
+    /// Log in (the key file), then unlock with the vector's master password.
+    pub async fn unlock(agent: &Agent, host: &FakeHost, profile: &str) {
+        seed_credentials(agent, profile);
+        host.answer(Answer::Text(PASSWORD));
+        let reply = agent.dispatch(Op::Unlock { profile: Some(profile.into()) }).await;
+        assert_eq!(reply, Reply::Done);
     }
 }
 
@@ -245,6 +324,7 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+    use crate::host::fake::FakeHost;
     use dybw_proto::ProfileStatus;
 
     const MIN: Duration = Duration::from_secs(60);
@@ -254,9 +334,8 @@ mod tests {
         format!("{status:?}").contains("unlocked: true")
     }
 
-    async fn install(agent: &Agent, profile: &str) {
-        let p = agent.config.profile(Some(profile)).unwrap();
-        agent.worker(&p).unwrap().call(Cmd::Install, agent.clock.mono()).await;
+    async fn install(agent: &Agent, host: &FakeHost, profile: &str) {
+        unlock(agent, host, profile).await;
         assert!(unlocked(agent, profile).await);
     }
 
@@ -270,13 +349,16 @@ mod tests {
             status,
             Reply::Status {
                 agent_version: env!("CARGO_PKG_VERSION").into(),
-                profiles: vec![ProfileStatus { profile: "work".into(), logged_in: false, unlocked: false }],
+                profiles: vec![ProfileStatus {
+                    profile: "work".into(),
+                    logged_in: false,
+                    unlocked: false,
+                    last_sync: None
+                }],
             }
         );
         assert_eq!(agent.worker_count(), 1);
-        let creds = dir.path().join("state/dybw/profiles/work/credentials");
-        std::fs::create_dir_all(creds.parent().unwrap()).unwrap();
-        std::fs::write(&creds, "").unwrap();
+        seed_credentials(&agent, "work");
         let status = agent.dispatch(Op::Status { profile: Some("work".into()) }).await;
         assert!(format!("{status:?}").contains("logged_in: true"));
     }
@@ -327,12 +409,12 @@ mod tests {
     #[tokio::test]
     async fn lock_wipes_one_profile_or_all() {
         let dir = tempfile::tempdir().unwrap();
-        let (agent, _) = agent(dir.path());
-        install(&agent, "work").await;
-        install(&agent, "home").await;
+        let (agent, _, host) = agent_world(dir.path());
+        install(&agent, &host, "work").await;
+        install(&agent, &host, "home").await;
         assert_eq!(agent.dispatch(Op::Lock { target: Target::Profile("work".into()) }).await, Reply::Done);
         assert!(!unlocked(&agent, "work").await && unlocked(&agent, "home").await);
-        install(&agent, "work").await;
+        install(&agent, &host, "work").await;
         assert_eq!(agent.dispatch(Op::Lock { target: Target::All }).await, Reply::Done);
         assert!(!unlocked(&agent, "work").await && !unlocked(&agent, "home").await);
     }
@@ -340,9 +422,9 @@ mod tests {
     #[tokio::test]
     async fn a_profile_idle_past_its_timeout_locks_and_a_never_profile_does_not() {
         let dir = tempfile::tempdir().unwrap();
-        let (agent, clock) = agent(dir.path());
-        install(&agent, "work").await; // 5 minutes
-        install(&agent, "home").await; // never
+        let (agent, clock, host) = agent_world(dir.path());
+        install(&agent, &host, "work").await; // 5 minutes
+        install(&agent, &host, "home").await; // never
         clock.advance(4 * MIN, 4 * MIN);
         agent.tick().await;
         assert!(unlocked(&agent, "work").await, "not idle long enough");
@@ -355,11 +437,11 @@ mod tests {
     #[tokio::test]
     async fn a_request_restarts_the_idle_clock_but_status_does_not() {
         let dir = tempfile::tempdir().unwrap();
-        let (agent, clock) = agent(dir.path());
-        install(&agent, "work").await;
+        let (agent, clock, host) = agent_world(dir.path());
+        install(&agent, &host, "work").await;
         clock.advance(4 * MIN, 4 * MIN);
-        let work = agent.config.profile(Some("work")).unwrap();
-        agent.worker(&work).unwrap().call(Cmd::Install, clock.mono()).await; // a use of work at minute 4
+        // An unlock of an unlocked profile asks nothing and is a use of it, at minute 4.
+        assert_eq!(agent.dispatch(Op::Unlock { profile: Some("work".into()) }).await, Reply::Done);
         clock.advance(2 * MIN, 2 * MIN);
         assert!(unlocked(&agent, "work").await, "used 2 minutes ago");
         clock.advance(4 * MIN, 4 * MIN);
@@ -369,8 +451,8 @@ mod tests {
     #[tokio::test]
     async fn a_request_past_the_idle_timeout_finds_the_profile_locked_without_a_tick() {
         let dir = tempfile::tempdir().unwrap();
-        let (agent, clock) = agent(dir.path());
-        install(&agent, "work").await;
+        let (agent, clock, host) = agent_world(dir.path());
+        install(&agent, &host, "work").await;
         clock.advance(6 * MIN, 6 * MIN);
         // No tick ran: the request itself triggers the check, before the worker command.
         assert!(!unlocked(&agent, "work").await);
@@ -379,20 +461,38 @@ mod tests {
     #[tokio::test]
     async fn a_request_right_after_a_wake_finds_every_profile_locked_without_a_tick() {
         let dir = tempfile::tempdir().unwrap();
-        let (agent, clock) = agent(dir.path());
-        install(&agent, "work").await;
-        install(&agent, "home").await;
+        let (agent, clock, host) = agent_world(dir.path());
+        install(&agent, &host, "work").await;
+        install(&agent, &host, "home").await;
         clock.advance(60 * MIN, Duration::from_secs(30));
         assert!(!unlocked(&agent, "work").await);
         assert!(!unlocked(&agent, "home").await, "a profile that never idles locks on a suspend too");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn requests_racing_a_wake_all_find_the_profile_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, clock, host) = agent_world(dir.path());
+        install(&agent, &host, "home").await;
+        clock.advance(60 * MIN, Duration::from_secs(30));
+        // The guard that sees the jump is the only one that locks; the others must wait for it, not slip past.
+        let asks: Vec<_> = (0..8)
+            .map(|_| {
+                let agent = agent.clone();
+                tokio::spawn(async move { unlocked(&agent, "home").await })
+            })
+            .collect();
+        for ask in asks {
+            assert!(!ask.await.unwrap());
+        }
+    }
+
     #[tokio::test]
     async fn a_wall_clock_jump_without_monotonic_time_locks_every_profile() {
         let dir = tempfile::tempdir().unwrap();
-        let (agent, clock) = agent(dir.path());
-        install(&agent, "work").await;
-        install(&agent, "home").await;
+        let (agent, clock, host) = agent_world(dir.path());
+        install(&agent, &host, "work").await;
+        install(&agent, &host, "home").await;
         // Drift under the slack, and a clock set back, change nothing.
         clock.advance(Duration::from_secs(80), Duration::from_secs(30));
         agent.tick().await;
@@ -408,9 +508,9 @@ mod tests {
     #[tokio::test]
     async fn a_panicking_command_answers_internal_wipes_that_profile_and_spares_the_others() {
         let dir = tempfile::tempdir().unwrap();
-        let (agent, clock) = agent(dir.path());
-        install(&agent, "work").await;
-        install(&agent, "home").await;
+        let (agent, clock, host) = agent_world(dir.path());
+        install(&agent, &host, "work").await;
+        install(&agent, &host, "home").await;
         let work = agent.config.profile(Some("work")).unwrap();
         let reply = agent.worker(&work).unwrap().call(Cmd::Panic, clock.mono()).await;
         assert_eq!(reply, Reply::Error { error: AgentError::Internal });
@@ -421,16 +521,16 @@ mod tests {
     #[tokio::test]
     async fn a_dead_worker_answers_internal_then_is_replaced_locked() {
         let dir = tempfile::tempdir().unwrap();
-        let (agent, clock) = agent(dir.path());
-        install(&agent, "work").await;
-        install(&agent, "home").await;
+        let (agent, clock, host) = agent_world(dir.path());
+        install(&agent, &host, "work").await;
+        install(&agent, &host, "home").await;
         let work = agent.config.profile(Some("work")).unwrap();
         let worker = agent.worker(&work).unwrap();
         assert_eq!(worker.call(Cmd::Crash, clock.mono()).await, Reply::Error { error: AgentError::Internal });
-        // Wait for the thread to be gone, then every further call fails fast.
-        while worker.is_alive() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        // Every call after the crash fails fast.
+        // Joining the crashed thread is what "gone" means; a stop on it is harmless.
+        worker.stop(clock.mono()).await;
+        assert!(!worker.is_alive());
         assert_eq!(worker.call(Cmd::Status, clock.mono()).await, Reply::Error { error: AgentError::Internal });
         assert!(unlocked(&agent, "home").await);
         assert!(!unlocked(&agent, "work").await, "a fresh worker starts locked");
@@ -439,9 +539,9 @@ mod tests {
     #[tokio::test]
     async fn shutdown_stops_every_worker() {
         let dir = tempfile::tempdir().unwrap();
-        let (agent, _) = agent(dir.path());
-        install(&agent, "work").await;
-        install(&agent, "home").await;
+        let (agent, _, host) = agent_world(dir.path());
+        install(&agent, &host, "work").await;
+        install(&agent, &host, "home").await;
         agent.shutdown().await;
         assert_eq!(agent.worker_count(), 0);
         // A request that arrives after shutdown must not start a new worker.

@@ -13,8 +13,8 @@ use zeroize::Zeroizing;
 use crate::agent::{Agent, TICK};
 
 /// Serve until `shutdown` resolves (or fails) or a `StopAgent` reply has been delivered, ticking the idle and sleep
-/// checks. Connections in flight are finished first; then every worker is stopped and its keys wiped before this
-/// returns.
+/// checks. Connections in flight are given `drain_timeout` to finish, then cancelled; then every worker is stopped
+/// and its keys wiped before this returns.
 pub async fn serve(
     agent: Arc<Agent>,
     listener: std::os::unix::net::UnixListener,
@@ -29,9 +29,22 @@ pub async fn serve(
         out = accept_loop(&agent, &listener, &mut handlers) => out,
     };
     ticker.abort();
-    while handlers.join_next().await.is_some() {}
-    agent.shutdown().await;
+    wind_down(&agent, handlers).await;
     out
+}
+
+/// A request may wait on a pinentry for minutes: finish what is quick, cancel the rest, then lock and end every
+/// worker. Not generic, so the agent's real `serve` and the tests' share one body.
+async fn wind_down(agent: &Agent, mut handlers: JoinSet<()>) {
+    if tokio::time::timeout(agent.drain_timeout, drain(&mut handlers)).await.is_err() {
+        tracing::warn!("cancelling requests still waiting at shutdown");
+        handlers.shutdown().await;
+    }
+    agent.shutdown().await;
+}
+
+async fn drain(handlers: &mut JoinSet<()>) {
+    while handlers.join_next().await.is_some() {}
 }
 
 async fn ticker(agent: Arc<Agent>) {
@@ -298,5 +311,38 @@ mod tests {
         assert_eq!(stopped, Reply::Done);
         assert!(matches!(slow.await.unwrap(), Reply::Status { .. }), "the connection in flight was served, not cut");
         served.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_waiting_on_the_user_does_not_hold_the_shutdown_for_ever() {
+        use crate::agent::testing::{agent_world, seed_credentials};
+        use crate::host::fake::Answer;
+        let dir = tempfile::Builder::new().prefix("d").tempdir_in("/tmp").unwrap();
+        let (mut agent, _, host) = agent_world(dir.path());
+        Arc::get_mut(&mut agent).unwrap().drain_timeout = Duration::from_millis(100);
+        seed_credentials(&agent, "work");
+        host.answer(Answer::Hang);
+        let (listener, _lock) = crate::socket::bind(&dir.path().join("run"), me()).unwrap();
+        let path = dir.path().join("run/agent.sock");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let served =
+            tokio::spawn(serve(agent.clone(), listener, async move { stopped.await.map_err(std::io::Error::other) }));
+        // An unlock that waits on a pinentry nobody answers.
+        let waiting = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut s = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            s.write_all(&encode(&dybw_proto::Request::new(Op::Unlock { profile: None })).unwrap()).unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).unwrap();
+            buf
+        });
+        while host.world().asked.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        stop.send(()).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(5), served).await;
+        assert!(ended.unwrap().unwrap().is_ok());
+        assert!(waiting.await.unwrap().is_empty(), "the cancelled request got no reply");
+        assert_eq!(agent.worker_count(), 0, "and the workers are stopped");
     }
 }

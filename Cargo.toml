@@ -32,8 +32,12 @@ zeroize = { version = "1.9.1", features = ["derive", "serde"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
 tracing = "0.1.44"
-rustix = { version = "1.1.5", default-features = false, features = ["std", "process", "fs"] }
+rustix = { version = "1.1.5", default-features = false, features = ["std", "process", "fs", "system"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+
+# PBKDF2 and Argon2 in the unlock tests run at the speed of a release build.
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 overflow-checks = true

@@ -501,6 +501,7 @@ dependencies = [
  "dybw-proto",
  "rustix",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml",
