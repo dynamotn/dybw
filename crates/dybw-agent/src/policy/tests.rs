@@ -145,6 +145,7 @@ fn the_audit_that_records_nothing_records_nothing() {
         profile: "p".into(),
         caller: ai(),
         op: "get",
+        kind: None,
         item: None,
         verdict: Verdict::Denied,
     });

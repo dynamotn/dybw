@@ -1,6 +1,7 @@
 //! The dybw agent. P4.1 builds it up: the config layer first, then the socket server and the vault session.
 
 pub mod agent;
+pub mod audit;
 pub mod caller;
 pub mod config;
 pub mod credentials;
@@ -45,8 +46,9 @@ pub fn banner() -> String {
 /// Start the agent and serve until `StopAgent`, SIGTERM or SIGINT.
 #[expect(clippy::expect_used, reason = "`trust()` always sets the home")]
 pub fn run() -> anyhow::Result<()> {
-    init_logging();
+    // First, before any other work: nothing may attach to the agent and read its memory.
     eprint!("{}", hardening::report(&hardening::harden()));
+    init_logging();
     let trust = trust::trust()?;
     let home = trust.home.clone().expect("trust() sets the home");
     let var = |name: &str| std::env::var_os(name);
@@ -56,8 +58,7 @@ pub fn run() -> anyhow::Result<()> {
     let (listener, _lock) = socket::bind(&socket::socket_dir(&var, user.uid), user.uid)?;
     let harnesses = caller::Harnesses::load(&paths::harnesses_path(&var, &home));
     let resolver = Arc::new(caller::Resolver::new(Arc::new(dybw_peer::Os), harnesses));
-    // TODO(P4.2 task 5): the audit log replaces `NoAudit`.
-    let audit = Arc::new(policy::NoAudit);
+    let audit = Arc::new(audit::FileAudit::new(&paths::audit_path(&var, &home), user.uid));
     let agent = Arc::new(agent::Agent::new(config, home, user, Box::new(var), real_spawn(trust), resolver, audit));
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(server::serve(agent, listener, stop_signal())).map_err(anyhow::Error::from)

@@ -35,9 +35,13 @@ fn trust_for(home: Option<OsString>, user: User, exe: PathBuf) -> anyhow::Result
 }
 
 /// The canonical path of a trusted pinentry, resolved once at start; hand it on as the program name afterwards.
-#[cfg(test)]
 pub fn resolve_pinentry(trust: &Trust, pinentry: &str) -> anyhow::Result<String> {
     Ok(trust.check(pinentry)?.0.to_string_lossy().into_owned())
+}
+
+/// `resolve_pinentry` for this process's own trust: what `dybw doctor` shows of a profile's pinentry.
+pub fn pinentry_of(pinentry: &str) -> anyhow::Result<String> {
+    resolve_pinentry(&trust()?, pinentry)
 }
 
 #[cfg(test)]
@@ -101,6 +105,11 @@ mod tests {
             got.into_iter().map(|t| (t.exe, t.user, t.search, t.home.is_some_and(|h| h.is_absolute()))).collect();
         let want = (Some(exe), me(), Some(OsString::from(PINENTRY_SEARCH)), true);
         assert!(seen.iter().all(|s| *s == want));
+    }
+
+    #[test]
+    fn the_pinentry_of_this_process_is_refused_when_missing() {
+        assert!(pinentry_of("dybw-no-such-pinentry").is_err());
     }
 
     #[test]

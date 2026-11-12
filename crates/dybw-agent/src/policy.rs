@@ -68,6 +68,8 @@ pub struct AuditEvent {
     pub caller: Caller,
     /// `get`, `history`, `policy-allow`, ...
     pub op: &'static str,
+    /// For `get`: what was selected (`password`, `field`, `full`, `raw`, `list-fields`); never a field name.
+    pub kind: Option<&'static str>,
     /// The cipher id, for a value request.
     pub item: Option<String>,
     pub verdict: Verdict,
@@ -160,7 +162,7 @@ struct File {
     entries: Vec<PolicyEntry>,
 }
 
-fn untrusted<T>(why: &str) -> std::io::Result<T> {
+pub(crate) fn untrusted<T>(why: &str) -> std::io::Result<T> {
     Err(std::io::Error::other(why.to_owned()))
 }
 
@@ -187,7 +189,8 @@ impl Store {
         }
     }
 
-    fn read(&self) -> std::io::Result<Vec<PolicyEntry>> {
+    /// The entries, or why the file cannot be trusted; a missing file is `NotFound`.
+    pub fn read(&self) -> std::io::Result<Vec<PolicyEntry>> {
         let link = std::fs::symlink_metadata(&self.path)?;
         // Not opened before it is known to be a plain file: opening a FIFO would wait for ever.
         if !link.is_file() {

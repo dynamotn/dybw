@@ -240,6 +240,7 @@ async fn a_peer_that_changes_before_or_while_the_user_is_asked_gets_nothing() {
     assert!(rig.host.world().confirmed.is_empty());
     let event = &rig.audit.events()[0];
     assert_eq!((event.op, event.verdict, event.profile.as_str()), ("get", Verdict::Denied, "work"));
+    assert_eq!(event.kind, Some("password"));
     // Names are not held to it.
     let list = Op::List { profile: Some("work".into()), fields: vec![Field::Name], folder: None };
     assert!(!items(rig.agent.dispatch_as(list, tool("/opt/a.sh", "h1")).await).is_empty());

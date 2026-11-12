@@ -53,6 +53,11 @@ pub fn harnesses_path(var: &dyn Fn(&str) -> Option<OsString>, home: &Path) -> Pa
     xdg_dir(var, home, "XDG_STATE_HOME", ".local/state").join("dybw/harnesses.toml")
 }
 
+/// `$XDG_STATE_HOME/dybw/audit.log`: every value request and policy change, for every profile.
+pub fn audit_path(var: &dyn Fn(&str) -> Option<OsString>, home: &Path) -> PathBuf {
+    xdg_dir(var, home, "XDG_STATE_HOME", ".local/state").join("dybw/audit.log")
+}
+
 /// `$XDG_CONFIG_HOME/dybw/config.toml`: the one file every profile shares, known before any profile is.
 pub fn config_path(var: &dyn Fn(&str) -> Option<OsString>, home: &Path) -> PathBuf {
     xdg_dir(var, home, "XDG_CONFIG_HOME", ".config").join("dybw/config.toml")
@@ -89,6 +94,7 @@ mod tests {
         assert_eq!(p.credentials, Path::new("/s/dybw/profiles/w/credentials"));
         assert_eq!(p.policy, Path::new("/s/dybw/profiles/w/policy.json"));
         assert_eq!(harnesses_path(&env(&vars), Path::new("/h")), Path::new("/s/dybw/harnesses.toml"));
+        assert_eq!(audit_path(&env(&vars), Path::new("/h")), Path::new("/s/dybw/audit.log"));
         assert_eq!(p.device, Path::new("/s/dybw/profiles/w/devices/dybw"));
         assert_eq!(p.cache, Path::new("/k/dybw/profiles/w"));
     }

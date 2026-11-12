@@ -203,6 +203,12 @@ impl Resolved {
     }
 }
 
+/// What this process would be taken for, with the real process table and the device's harness table (`dybw
+/// doctor`); `None` when it cannot be told.
+pub fn this_process(harnesses: &Path) -> Option<Caller> {
+    Resolver::new(Arc::new(dybw_peer::Os), Harnesses::load(harnesses)).caller_of_self()
+}
+
 pub struct Resolver {
     source: Arc<dyn ProcessSource>,
     harnesses: Harnesses,
@@ -219,6 +225,14 @@ impl Resolver {
         let (me, p) = (self.clone(), peer.clone());
         let joined = tokio::task::spawn_blocking(move || me.resolve(p)).await;
         joined.unwrap_or(Resolved::unknown(peer, "the resolver failed"))
+    }
+
+    /// What this very process would be taken for were it the agent's peer (`dybw doctor` asks whether it runs under
+    /// an AI harness); `None` when the process table cannot be read.
+    pub fn caller_of_self(&self) -> Option<Caller> {
+        use std::os::fd::AsFd;
+        let (end, _other) = std::os::unix::net::UnixStream::pair().ok()?;
+        Some(self.resolve(self.source.peer_of(end.as_fd()).ok()?).caller)
     }
 
     /// Resolve the peer on this thread.

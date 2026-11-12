@@ -601,3 +601,17 @@ fn a_file_the_user_names_is_hashed_and_a_missing_or_huge_one_is_refused() {
     std::fs::OpenOptions::new().write(true).open(&huge).unwrap().set_len(MAX_HASH_BYTES + 1).unwrap();
     assert!(hash_of(&huge).is_err());
 }
+
+#[test]
+fn the_doctor_can_ask_what_this_process_would_be_taken_for() {
+    let tree = Tree::new();
+    tree.dybw(1);
+    assert!(matches!(tree.resolver().caller_of_self(), Some(Caller::Invoker { .. } | Caller::Unknown { .. })));
+    tree.add(2, Path::new("/opt/claude"), 1, Some(&["claude"]), Some(&[]));
+    tree.dybw(2);
+    assert!(matches!(tree.resolver().caller_of_self(), Some(Caller::Ai { .. })));
+    // A process table that does not know the peer: nothing to say.
+    assert!(Resolver::new(Arc::new(Fake::default()), Harnesses::default()).caller_of_self().is_none());
+    // The real table, whatever this test runs under.
+    let _ = this_process(&tree.dir.path().join("no-harnesses.toml"));
+}

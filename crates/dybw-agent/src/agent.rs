@@ -18,6 +18,7 @@ use crate::paths::ProfilePaths;
 use crate::policy::{Audit, AuditEvent, Verdict};
 use crate::read::Lookup;
 use crate::session::Ctx;
+use crate::worker::op_of;
 use crate::worker::{Cmd, Recheck, Worker};
 
 /// How often the idle and sleep checks run.
@@ -173,12 +174,11 @@ impl Agent {
         self.guard().await;
         tracing::info!(op = kind(&op), "request");
         let sensitive = match &op {
-            Op::Get { profile, .. } | Op::History { profile, .. } | Op::Policy { profile, .. } => {
-                Some((kind(&op), profile.clone()))
-            }
+            Op::Get { profile, select, .. } => Some((kind(&op), op_of(Some(select)).1, profile.clone())),
+            Op::History { profile, .. } | Op::Policy { profile, .. } => Some((kind(&op), None, profile.clone())),
             _ => None,
         };
-        let changed = |(op, profile): (&'static str, Option<String>)| {
+        let changed = |(op, what, profile): (&'static str, Option<&'static str>, Option<String>)| {
             tracing::warn!(op, "the caller changed while it was being served: denied");
             let profile = self.config.profile(profile.as_deref()).map(|p| p.name).unwrap_or_default();
             let event = AuditEvent {
@@ -186,6 +186,7 @@ impl Agent {
                 profile,
                 caller: who.caller.clone(),
                 op,
+                kind: what,
                 item: None,
                 verdict: Verdict::Denied,
             };

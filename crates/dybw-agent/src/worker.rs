@@ -395,13 +395,32 @@ fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, select: Option<&Select>) 
     )
 }
 
-fn audit(ctx: &Ctx, caller: &Caller, op: &'static str, item: Option<&str>, verdict: Verdict) {
+/// The op, and for `get` what was selected: the kind only, never a field name.
+pub(crate) fn op_of(select: Option<&Select>) -> (&'static str, Option<&'static str>) {
+    match select {
+        None => ("history", None),
+        Some(Select::Field(_)) => ("get", Some("field")),
+        Some(Select::Full) => ("get", Some("full")),
+        Some(Select::Raw) => ("get", Some("raw")),
+        Some(Select::ListFields) => ("get", Some("list-fields")),
+        Some(_) => ("get", Some("password")),
+    }
+}
+
+fn audit(
+    ctx: &Ctx,
+    caller: &Caller,
+    (op, kind): (&'static str, Option<&'static str>),
+    item: Option<&str>,
+    verdict: Verdict,
+) {
     tracing::info!(profile = %ctx.profile.name, op, item, ?verdict, "caller policy");
     ctx.audit.record(AuditEvent {
         time: std::time::SystemTime::now(),
         profile: ctx.profile.name.clone(),
         caller: caller.clone(),
         op,
+        kind,
         item: item.map(str::to_owned),
         verdict,
     });
@@ -419,7 +438,7 @@ async fn gate<H: Host>(
     found: &Found,
     select: Option<&Select>,
 ) -> Result<(), AgentError> {
-    let op = if select.is_some() { "get" } else { "history" };
+    let op = op_of(select);
     let store = Store::new(&ctx.paths.policy, ctx.user.uid);
     let mut decision = policy::decide(caller, &store.load(), Access::Value);
     let _screen = if matches!(decision, Decision::Confirm { .. }) {
@@ -480,7 +499,7 @@ async fn get<H: Host>(
         // Until P4.3 can ask for the master password again, a reprompt item gives no value and no question, and
         // no grant satisfies it.
         tracing::warn!(profile = %ctx.profile.name, id = %found.id, "value request denied: the item needs a reprompt (P4.3)");
-        let op = if select.is_some() { "get" } else { "history" };
+        let op = op_of(select.as_ref());
         audit(ctx, caller, op, Some(&found.id), Verdict::Denied);
         return error(AgentError::Denied);
     }
@@ -490,7 +509,7 @@ async fn get<H: Host>(
     // The user may have taken a while: the peer must still be the one that asked, before anything is opened.
     if !still.holds() {
         tracing::warn!(profile = %ctx.profile.name, id = %found.id, "the caller changed while the user was asked");
-        let op = if select.is_some() { "get" } else { "history" };
+        let op = op_of(select.as_ref());
         audit(ctx, caller, op, Some(&found.id), Verdict::Denied);
         return error(AgentError::Denied);
     }
@@ -601,7 +620,7 @@ async fn change_policy<H: Host>(
         PolicyAction::Forget { invoker } => ("policy-forget", Asked::Forget(invoker)),
     };
     if !matches!(caller, Caller::Invoker { .. }) {
-        audit(ctx, caller, op, None, Verdict::Denied);
+        audit(ctx, caller, (op, None), None, Verdict::Denied);
         return error(AgentError::Denied);
     }
     let change = match plan(asked) {
@@ -616,18 +635,18 @@ async fn change_policy<H: Host>(
         change.sentence()
     );
     if let Err(e) = session::confirm(host, &text, false).await {
-        audit(ctx, caller, op, None, Verdict::Declined);
+        audit(ctx, caller, (op, None), None, Verdict::Declined);
         return error(e);
     }
     if !still.holds() {
-        audit(ctx, caller, op, None, Verdict::Denied);
+        audit(ctx, caller, (op, None), None, Verdict::Denied);
         return error(AgentError::Denied);
     }
     let done = match &change {
         Change::Set(entry) => store.set(entry.clone()),
         Change::Forget(invoker) => store.forget(invoker).map(|_| ()),
     };
-    audit(ctx, caller, op, None, if done.is_ok() { Verdict::Confirmed } else { Verdict::Failed });
+    audit(ctx, caller, (op, None), None, if done.is_ok() { Verdict::Confirmed } else { Verdict::Failed });
     done.map_or_else(
         |e| {
             tracing::warn!(profile = %ctx.profile.name, "the policy was not saved: {e}");
@@ -704,5 +723,29 @@ mod tests {
         let shared = Shared::default();
         assert!(!periodic_due(&shared, Duration::from_secs(300)), "locked");
         assert!(!periodic_due(&shared, Duration::ZERO), "no interval");
+    }
+
+    #[test]
+    fn the_audit_names_what_was_selected_but_never_a_field() {
+        let kinds: Vec<_> = [
+            None,
+            Some(Select::Password),
+            Some(Select::Field("secret field".into())),
+            Some(Select::Full),
+            Some(Select::Raw),
+            Some(Select::ListFields),
+        ]
+        .iter()
+        .map(|s| op_of(s.as_ref()))
+        .collect();
+        let want = [
+            ("history", None),
+            ("get", Some("password")),
+            ("get", Some("field")),
+            ("get", Some("full")),
+            ("get", Some("raw")),
+            ("get", Some("list-fields")),
+        ];
+        assert_eq!(kinds, want);
     }
 }
