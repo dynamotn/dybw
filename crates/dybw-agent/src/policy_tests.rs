@@ -252,7 +252,42 @@ async fn a_peer_that_changes_before_or_while_the_user_is_asked_gets_nothing() {
     rig.tree.add(100, process(102));
     rig.host.world().release.notify_one();
     assert_eq!(pending.await.unwrap(), err(AgentError::Denied));
+    assert_eq!(rig.agent.opens("work").await, 0, "nothing was opened for the changed peer");
     assert_eq!(verdicts(&rig), [Verdict::Denied, Verdict::Confirmed, Verdict::Denied]);
+}
+
+#[tokio::test]
+async fn a_policy_change_is_dropped_when_the_peer_changes_while_the_user_is_asked() {
+    let (dir, rig) = setup(|_| {}).await;
+    rig.host.world().confirms.push_back(Answer::Held);
+    let deny = PolicyAction::Deny { invoker: "/usr/bin/x".into(), script: None };
+    let agent = rig.agent.clone();
+    let pending = tokio::spawn(async move { agent.dispatch(policy_op(deny)).await });
+    until(|| rig.host.world().confirmed.len() == 1).await;
+    rig.tree.add(100, process(103));
+    rig.host.world().release.notify_one();
+    assert_eq!(pending.await.unwrap(), err(AgentError::Denied));
+    assert!(!policy_file(&dir).exists());
+    assert_eq!(verdicts(&rig), [Verdict::Denied]);
+}
+
+#[tokio::test]
+async fn an_allow_that_could_never_match_is_refused_and_a_deny_of_it_is_not() {
+    let (dir, rig) = setup(|_| {}).await;
+    let script = std::fs::canonicalize(dir.path().join("config.toml")).unwrap();
+    let bare = PolicyAction::Allow { invoker: "/bin/bash".into(), script: None };
+    assert_eq!(rig.agent.dispatch(policy_op(bare)).await, err(AgentError::Config));
+    assert!(rig.host.world().confirmed.is_empty(), "not even asked");
+    let named =
+        PolicyAction::Allow { invoker: "/bin/bash".into(), script: Some(script.to_string_lossy().into_owned()) };
+    assert_eq!(
+        rig.agent.dispatch(policy_op(named)).await,
+        err(AgentError::Denied),
+        "a script is fine: asked, no answer"
+    );
+    rig.host.allow();
+    let deny = PolicyAction::Deny { invoker: "/bin/bash".into(), script: None };
+    assert_eq!(rig.agent.dispatch(policy_op(deny)).await, Reply::Done);
 }
 
 #[tokio::test]
@@ -401,6 +436,7 @@ async fn a_policy_change_that_cannot_be_planned_or_saved_is_refused_after_no_que
     rig.host.allow();
     let deny = PolicyAction::Deny { invoker: "/usr/bin/x".into(), script: None };
     assert_eq!(not_a_path(deny).await, err(AgentError::Internal));
+    assert_eq!(rig.audit.events().last().unwrap().verdict, Verdict::Failed, "the real outcome is recorded");
 }
 
 #[tokio::test]

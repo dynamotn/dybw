@@ -29,6 +29,26 @@ use crate::policy::{self, Access, AuditEvent, Decision, Store, Verdict};
 use crate::read::{self, Found, Lookup};
 use crate::session::{self, Ctx, Session};
 
+/// Is the peer still the process that asked? Asked again once the user has answered.
+#[derive(Clone)]
+pub struct Recheck(std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl Recheck {
+    pub fn new(f: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+
+    fn holds(&self) -> bool {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for Recheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Recheck")
+    }
+}
+
 /// How long `stop` waits for the thread: a worker that cannot end is left behind, and the process exit ends it.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -63,16 +83,19 @@ pub enum Cmd {
         find: Lookup,
         select: Select,
         caller: Caller,
+        still: Recheck,
     },
     /// The previous passwords of one item, under the same rule.
     History {
         find: Lookup,
         caller: Caller,
+        still: Recheck,
     },
     /// Show the caller policy, or change it (the user confirms, and an AI-class caller cannot).
     Policy {
         action: PolicyAction,
         caller: Caller,
+        still: Recheck,
     },
     /// Lock and end the thread.
     Exit,
@@ -93,8 +116,8 @@ enum Long {
     Unlock,
     Sync,
     /// `Some` is a `get`, `None` the password history; whose request it is.
-    Read(Lookup, Option<Select>, Caller),
-    Policy(PolicyAction, Caller),
+    Read(Lookup, Option<Select>, Caller, Recheck),
+    Policy(PolicyAction, Caller, Recheck),
     #[cfg(test)]
     Panic,
 }
@@ -240,9 +263,9 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
             let search = |v: &UnlockedVault| Ok(read::list(v, &fields, folder.as_deref(), Some(&term)));
             return quick(reply, with_vault(shared, search).unwrap_or_else(error));
         }
-        Cmd::Get { find, select, caller } => Long::Read(find, Some(select), caller),
-        Cmd::History { find, caller } => Long::Read(find, None, caller),
-        Cmd::Policy { action, caller } => Long::Policy(action, caller),
+        Cmd::Get { find, select, caller, still } => Long::Read(find, Some(select), caller, still),
+        Cmd::History { find, caller, still } => Long::Read(find, None, caller, still),
+        Cmd::Policy { action, caller, still } => Long::Policy(action, caller, still),
         #[cfg(test)]
         Cmd::Opens => {
             return quick(reply, Reply::Value { value: dybw_proto::Secret::new(read::OPENS.get().to_string()) });
@@ -339,8 +362,8 @@ async fn run_long<H: Host>(shared: Rc<Shared>, host: Rc<H>, ctx: Rc<Ctx>, long: 
         }
         Long::Unlock => unlock(&shared, &*host, &ctx).await,
         Long::Sync => sync(&shared, &*host, &ctx, wait).await,
-        Long::Read(find, select, caller) => get(&shared, &*host, &ctx, &caller, find, select).await,
-        Long::Policy(action, caller) => change_policy(&shared, &*host, &ctx, &caller, action).await,
+        Long::Read(find, select, caller, still) => get(&shared, &*host, &ctx, &caller, &still, find, select).await,
+        Long::Policy(action, caller, still) => change_policy(&shared, &*host, &ctx, &caller, &still, action).await,
         #[cfg(test)]
         Long::Panic => panic!("task panic for a test"),
     }
@@ -443,6 +466,7 @@ async fn get<H: Host>(
     host: &H,
     ctx: &Ctx,
     caller: &Caller,
+    still: &Recheck,
     find: Lookup,
     select: Option<Select>,
 ) -> Reply {
@@ -462,6 +486,13 @@ async fn get<H: Host>(
     }
     if let Err(e) = gate(shared, host, ctx, caller, &found, select.as_ref()).await {
         return error(e);
+    }
+    // The user may have taken a while: the peer must still be the one that asked, before anything is opened.
+    if !still.holds() {
+        tracing::warn!(profile = %ctx.profile.name, id = %found.id, "the caller changed while the user was asked");
+        let op = if select.is_some() { "get" } else { "history" };
+        audit(ctx, caller, op, Some(&found.id), Verdict::Denied);
+        return error(AgentError::Denied);
     }
     let read = |v: &UnlockedVault| {
         // The user answered about this item: it must still be the same one (a sync may have run meanwhile).
@@ -495,7 +526,7 @@ enum Change {
 impl Change {
     /// What the question says is done, on one line.
     fn sentence(&self) -> String {
-        let tidy = |s: &str| one_line(s).chars().take(120).collect::<String>();
+        let tidy = |s: &str| policy::shown(s, 120);
         let target = |e: &PolicyEntry| match &e.script {
             Some(script) => format!("{} running {}", tidy(&e.exe), tidy(script)),
             None => tidy(&e.exe),
@@ -531,7 +562,18 @@ fn plan(asked: Asked) -> Result<Change, AgentError> {
                 }
                 PolicyRule::Deny => String::new(),
             };
-            Ok(Change::Set(PolicyEntry { exe, script, hash, rule }))
+            let entry = PolicyEntry { exe, script, hash, rule };
+            // An allow that could never match is refused, not stored (a deny of the same target is fine).
+            let target = Caller::Invoker {
+                exe: entry.exe.clone().into(),
+                script: entry.script.clone().map(Into::into),
+                hash: String::new(),
+                relative: false,
+            };
+            if rule == PolicyRule::Allow && !target.rememberable() {
+                return Err(bad("a bare interpreter or shell cannot be remembered: name its script with --script"));
+            }
+            Ok(Change::Set(entry))
         }
         Asked::Forget(invoker) => Ok(Change::Forget(policy_path(&invoker).unwrap_or(invoker))),
     }
@@ -539,7 +581,14 @@ fn plan(asked: Asked) -> Result<Change, AgentError> {
 
 /// `dybw policy`. `show` names no secret and is open to every class. A change is refused for an AI-class or an
 /// unknown caller, and needs the user's yes in the pinentry like any value.
-async fn change_policy<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, action: PolicyAction) -> Reply {
+async fn change_policy<H: Host>(
+    shared: &Shared,
+    host: &H,
+    ctx: &Ctx,
+    caller: &Caller,
+    still: &Recheck,
+    action: PolicyAction,
+) -> Reply {
     let store = Store::new(&ctx.paths.policy, ctx.user.uid);
     let (op, asked) = match action {
         PolicyAction::Show => return Reply::Policy { entries: store.load() },
@@ -570,11 +619,15 @@ async fn change_policy<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &C
         audit(ctx, caller, op, None, Verdict::Declined);
         return error(e);
     }
+    if !still.holds() {
+        audit(ctx, caller, op, None, Verdict::Denied);
+        return error(AgentError::Denied);
+    }
     let done = match &change {
         Change::Set(entry) => store.set(entry.clone()),
         Change::Forget(invoker) => store.forget(invoker).map(|_| ()),
     };
-    audit(ctx, caller, op, None, Verdict::Confirmed);
+    audit(ctx, caller, op, None, if done.is_ok() { Verdict::Confirmed } else { Verdict::Failed });
     done.map_or_else(
         |e| {
             tracing::warn!(profile = %ctx.profile.name, "the policy was not saved: {e}");
@@ -638,6 +691,13 @@ async fn sync<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, wait: bool) -> Repl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recheck_answers_and_prints_without_its_closure() {
+        let still = Recheck::new(|| true);
+        assert!(still.holds());
+        assert_eq!(format!("{still:?}"), "Recheck");
+    }
 
     #[test]
     fn a_locked_profile_or_one_without_an_interval_has_no_periodic_sync() {

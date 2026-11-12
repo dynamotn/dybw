@@ -56,6 +56,8 @@ pub enum Verdict {
     /// The policy refused without asking (an AI-class caller, a deny entry, an item that needs a reprompt, a peer
     /// that changed).
     Denied,
+    /// A policy change the user approved could not be written.
+    Failed,
 }
 
 /// One decision on a value or a policy change, with no value in it.
@@ -128,9 +130,21 @@ pub fn grant_for(caller: &Caller) -> Option<PolicyEntry> {
     Some(PolicyEntry { exe: exe.into(), script: script.map(Into::into), hash: hash.into(), rule: PolicyRule::Allow })
 }
 
+/// `text` on one line and at most `cap` characters: a longer one keeps its head and its last 40 characters (the
+/// file name) around "…", so a long path cannot pass for a shorter one that was granted. Cut first, then cleaned.
+pub fn shown(text: &str, cap: usize) -> String {
+    let n = text.chars().count();
+    if n <= cap {
+        return one_line(text);
+    }
+    let head: String = text.chars().take(cap - 41).collect();
+    let tail: String = text.chars().skip(n - 40).collect();
+    one_line(&format!("{head}…{tail}"))
+}
+
 /// Who is asking, on one line and cut, for a question or a log line.
 pub fn who(caller: &Caller) -> String {
-    let cut = |p: &Path| one_line(&p.to_string_lossy()).chars().take(SHOWN).collect::<String>();
+    let cut = |p: &Path| shown(&p.to_string_lossy(), SHOWN);
     match caller {
         Caller::Invoker { exe, script: Some(script), .. } => format!("{} running {}", cut(exe), cut(script)),
         Caller::Invoker { exe, script: None, .. } => cut(exe),
@@ -206,9 +220,18 @@ impl Store {
         dybw_native::fsutil::write_private(&self.path, &text)
     }
 
+    /// The entries to change: none when there is no file; an error when there is one that cannot be trusted, so a
+    /// write never replaces (and drops the deny entries of) a file that failed to load.
+    fn load_for_write(&self) -> std::io::Result<Vec<PolicyEntry>> {
+        match self.read() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            other => other,
+        }
+    }
+
     /// Set the rule of `entry`'s executable and script, replacing what was there.
     pub fn set(&self, entry: PolicyEntry) -> std::io::Result<()> {
-        let mut entries = self.load();
+        let mut entries = self.load_for_write()?;
         entries.retain(|e| !(e.exe == entry.exe && e.script == entry.script));
         entries.push(entry);
         self.save(entries)
@@ -216,7 +239,7 @@ impl Store {
 
     /// Drop every entry whose executable or script is `invoker`; how many were dropped.
     pub fn forget(&self, invoker: &str) -> std::io::Result<usize> {
-        let mut entries = self.load();
+        let mut entries = self.load_for_write()?;
         let before = entries.len();
         entries.retain(|e| e.exe != invoker && e.script.as_deref() != Some(invoker));
         let dropped = before - entries.len();

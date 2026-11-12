@@ -261,3 +261,31 @@ fn a_store_that_cannot_write_says_so() {
     let s = Store::new(&blocker.join("p/policy.json"), MINE);
     assert!(s.set(entry(PolicyRule::Allow, None, "h")).is_err());
 }
+
+#[test]
+fn a_long_path_keeps_its_head_and_its_file_name_and_is_cleaned_after_the_cut() {
+    // A path that starts like a granted one must not look like it.
+    let granted = "/opt/scripts/backup.sh";
+    let long = format!("{granted}{}/evil.sh", "x".repeat(300));
+    let text = shown(&long, 120);
+    assert_eq!(text.chars().count(), 120);
+    assert!(text.starts_with(granted) && text.contains('…') && text.ends_with("/evil.sh"), "{text}");
+    assert_ne!(text, granted);
+    // A newline in the cut-off tail still cannot break the line.
+    let forged = format!("/a{}\nAllow?/tail", "y".repeat(300));
+    assert!(!shown(&forged, 120).contains('\n'));
+    assert_eq!(shown("/short", 120), "/short");
+}
+
+#[test]
+fn a_file_that_failed_to_load_is_never_overwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = mine(dir.path());
+    s.set(entry(PolicyRule::Deny, Some("/opt/a.sh"), "")).unwrap();
+    let path = dir.path().join("profiles/p/policy.json");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(s.set(entry(PolicyRule::Allow, None, "h")).is_err());
+    assert!(s.forget("/opt/a.sh").is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before, "the deny entry is still there");
+}

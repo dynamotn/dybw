@@ -18,7 +18,7 @@ use crate::paths::ProfilePaths;
 use crate::policy::{Audit, AuditEvent, Verdict};
 use crate::read::Lookup;
 use crate::session::Ctx;
-use crate::worker::{Cmd, Worker};
+use crate::worker::{Cmd, Recheck, Worker};
 
 /// How often the idle and sleep checks run.
 pub const TICK: Duration = Duration::from_secs(30);
@@ -166,8 +166,8 @@ impl Agent {
     /// connection handler notifies the stop once that reply is written.
     ///
     /// A request that reads a value or touches the policy is checked twice against the peer's identity taken at
-    /// connect time: before anything is asked, and again once the reply exists (a pid reused while the user was
-    /// being asked must not receive what was granted to the first program).
+    /// connect time: here before anything is asked, and in the worker once the user has answered, before anything is
+    /// opened or written (a pid reused while the user was being asked must not receive what was granted).
     pub async fn dispatch_for(&self, op: Op, who: &Resolved) -> Reply {
         // Do not wait for the tick: a request right after a wake or past the idle timeout finds the profile locked.
         self.guard().await;
@@ -192,31 +192,24 @@ impl Agent {
             self.audit.record(event);
             Reply::Error { error: AgentError::Denied }
         };
-        if let Some(s) = sensitive.clone()
-            && !self.resolver.recheck(who)
-        {
-            return changed(s);
-        }
-        let reply = self.serve(op, who).await;
-        let holds_value = matches!(
-            reply,
-            Reply::Value { .. }
-                | Reply::Full { .. }
-                | Reply::Raw { .. }
-                | Reply::FieldNames { .. }
-                | Reply::History { .. }
-        );
         if let Some(s) = sensitive
-            && holds_value
             && !self.resolver.recheck(who)
         {
             return changed(s);
         }
-        reply
+        // The worker checks the peer again once the user has answered, right before it opens anything.
+        self.serve(op, who).await
     }
 
     async fn serve(&self, op: Op, who: &Resolved) -> Reply {
         let caller = || who.caller.clone();
+        let (resolver, resolved) = (self.resolver.clone(), who.clone());
+        let still = || {
+            Recheck::new({
+                let (resolver, resolved) = (resolver.clone(), resolved.clone());
+                move || resolver.recheck(&resolved)
+            })
+        };
         match op {
             Op::StopAgent => Reply::Done,
             Op::Status { profile } => self.on_profile(profile.as_deref(), Cmd::Status).await,
@@ -237,15 +230,15 @@ impl Agent {
             }
             Op::Get { profile, needle, user, folder, ignorecase, select } => {
                 let find = Lookup { needle, user, folder, ignorecase };
-                self.on_unlocked(profile.as_deref(), Cmd::Get { find, select, caller: caller() }).await
+                self.on_unlocked(profile.as_deref(), Cmd::Get { find, select, caller: caller(), still: still() }).await
             }
             Op::History { profile, needle, user, folder } => {
                 let find = Lookup { needle, user, folder, ignorecase: false };
-                self.on_unlocked(profile.as_deref(), Cmd::History { find, caller: caller() }).await
+                self.on_unlocked(profile.as_deref(), Cmd::History { find, caller: caller(), still: still() }).await
             }
             // The policy needs no unlocked vault.
             Op::Policy { profile, action } => {
-                self.on_profile(profile.as_deref(), Cmd::Policy { action, caller: caller() }).await
+                self.on_profile(profile.as_deref(), Cmd::Policy { action, caller: caller(), still: still() }).await
             }
             _ => Reply::Error { error: AgentError::Internal },
         }
