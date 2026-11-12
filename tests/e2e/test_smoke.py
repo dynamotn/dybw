@@ -11,5 +11,5 @@ def test_vaultwarden_account_and_seeded_login(account):
 def test_binaries_run(dybw_bin, dybw_agent_bin):
     out = subprocess.run([dybw_bin, "--version"], capture_output=True, text=True, check=True).stdout
     assert out.startswith("dybw ")
-    out = subprocess.run([dybw_agent_bin], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run([dybw_agent_bin, "--version"], capture_output=True, text=True, check=True).stdout
     assert out.startswith("dybw-agent ")

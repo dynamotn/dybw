@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Scripted pinentry for the end-to-end tests.
 
-Behaviour comes from the JSON file named by $FAKE_PINENTRY_CTL, re-read on
+Behaviour comes from the JSON file named by $FAKE_PINENTRY_CTL (default /tmp/fake-pinentry.json), re-read on
 every run so tests can change it between prompts:
 
     {"pins": ["wrong", "right"], "confirm": "once" | "always" | "deny" | "notok", "release": "/path",
@@ -25,8 +25,9 @@ import sys
 import time
 import urllib.parse
 
-ctl_path = os.environ["FAKE_PINENTRY_CTL"]
-log_path = os.environ.get("FAKE_PINENTRY_LOG")
+# The agent starts a pinentry with a cleared environment (HOME and the session only), so the defaults matter.
+ctl_path = os.environ.get("FAKE_PINENTRY_CTL", "/tmp/fake-pinentry.json")
+log_path = os.environ.get("FAKE_PINENTRY_LOG", "/tmp/fake-pinentry.log")
 
 
 def load():

@@ -133,7 +133,8 @@ class Account:
         self.token = res["access_token"]
 
     def _auth(self):
-        return {"Authorization": f"Bearer {self.token}"}
+        # Vaultwarden hides SSH key items from clients older than 2024.12.
+        return {"Authorization": f"Bearer {self.token}", "Bitwarden-Client-Version": "2025.1.0"}
 
     def sync(self):
         return http("GET", f"{self.server}/api/sync?excludeDomains=true", headers=self._auth())
@@ -206,7 +207,7 @@ class Account:
         body["encryptedFor"] = self.user_id
         return http("PUT", f"{self.server}/api/ciphers/{cipher_id}", body, self._auth())
 
-    def _new(self, folder, type_, name, notes, login, fields):
+    def _new(self, folder, type_, name, notes, login, fields, extra=None, reprompt=0, history=None):
         k = self.user_key
         body = {
             "type": type_,
@@ -215,17 +216,22 @@ class Account:
             "name": encrypt(name.encode(), k),
             "notes": encrypt(notes.encode(), k) if notes else None,
             "favorite": False,
-            "reprompt": 0,
+            "reprompt": reprompt,
             "fields": [{"type": 0, "name": encrypt(n.encode(), k), "value": encrypt(v.encode(), k)} for n, v in (fields or {}).items()],
+            "passwordHistory": [
+                {"password": encrypt(p.encode(), k), "lastUsedDate": d} for p, d in (history or [])
+            ],
             "encryptedFor": self.user_id,
         }
         if type_ == 1:
             body["login"] = login
-        else:
+        elif type_ == 2:
             body["secureNote"] = {"type": 0}
+        else:
+            body.update(extra)
         return http("POST", f"{self.server}/api/ciphers", body, self._auth())
 
-    def add_login(self, folder, name, password, fields=None, username=None, uri=None, notes=None):
+    def add_login(self, folder, name, password, fields=None, username=None, uri=None, notes=None, reprompt=0, history=None):
         """Add a login; `folder` may be None for no folder."""
         k = self.user_key
         login = {
@@ -234,7 +240,12 @@ class Account:
             "uris": [{"uri": encrypt(uri.encode(), k), "match": None}] if uri else None,
             "totp": None,
         }
-        return self._new(folder, 1, name, notes, login, fields)
+        return self._new(folder, 1, name, notes, login, fields, reprompt=reprompt, history=history)
+
+    def add_typed(self, folder, type_, name, key, payload, notes=None, fields=None):
+        """Add a card (3, key "card"), identity (4, "identity") or SSH key (5, "sshKey") with string `payload`."""
+        enc = {n: encrypt(v.encode(), self.user_key) for n, v in payload.items()}
+        return self._new(folder, type_, name, notes, None, fields, extra={key: enc})
 
     def add_note(self, folder, name, notes, fields=None):
         return self._new(folder, 2, name, notes, None, fields)
