@@ -48,8 +48,23 @@ pub enum Caller {
     Ai { harness: String, via: Via },
     /// Cannot be named: orphan, replaced, unreadable. Asked every time, never remembered.
     Unknown { why: String },
-    /// A named invoker; `hash` is the SHA-256 (hex) of the script if any, else of the executable.
-    Invoker { exe: PathBuf, script: Option<PathBuf>, hash: String },
+    /// A named invoker; `hash` is the SHA-256 (hex) of the script if any, else of the executable. `relative`: the
+    /// script was given as a relative path, resolved against the cwd at resolve time (a script that `cd`s could
+    /// stand for another file), so it is shown but never remembered.
+    Invoker { exe: PathBuf, script: Option<PathBuf>, hash: String, relative: bool },
+}
+
+impl Caller {
+    /// May a grant for this caller be remembered? Not for an unknown or AI caller, a relative script, or a bare
+    /// interpreter (every script it runs would share the grant).
+    pub fn rememberable(&self) -> bool {
+        match self {
+            Caller::Invoker { exe, script, relative, .. } => {
+                !relative && (script.is_some() || flag_letters(exe).is_none())
+            }
+            Caller::Ai { .. } | Caller::Unknown { .. } => false,
+        }
+    }
 }
 
 /// One harness of the table. A process matches on any of: executable basename, a path fragment of the executable,
@@ -113,7 +128,13 @@ struct HarnessFile {
 impl Default for Harnesses {
     fn default() -> Self {
         Self(vec![
-            Harness::new("claude", &["claude"], &["/claude/versions/", "/installs/claude/"], &[], &["claude"]),
+            Harness::new(
+                "claude",
+                &["claude"],
+                &["/claude/versions/", "/installs/claude/"],
+                &["@anthropic-ai/claude-code"],
+                &["claude"],
+            ),
             Harness::new("codex", &["codex"], &[], &["@openai/codex"], &[]),
             Harness::new("gemini", &[], &[], &["@google/gemini-cli"], &[]),
             Harness::new("antigravity", &["agy", "antigravity"], &[], &[], &[]),
@@ -312,7 +333,7 @@ fn flag_letters(exe: &Path) -> Option<&'static [char]> {
 /// canonical (a relative path is resolved against the process's cwd). `Ok(None)`: no argument at all (an interactive
 /// interpreter). `Err`: cannot be named (inline code, any other option, hidden argv or cwd, a script that does not
 /// resolve to a file).
-fn script_of(p: &Process, letters: &[char]) -> Result<Option<PathBuf>, String> {
+fn script_of(p: &Process, letters: &[char]) -> Result<Option<(PathBuf, bool)>, String> {
     let argv = p.argv.as_deref().ok_or("the interpreter's arguments are not visible")?;
     let mut dashes = false;
     let mut script = None;
@@ -337,16 +358,22 @@ fn script_of(p: &Process, letters: &[char]) -> Result<Option<PathBuf>, String> {
         (false, None) => return Err("the script path is relative and the working directory is not visible".into()),
     };
     let path = std::fs::canonicalize(path).map_err(|_| "the script cannot be found".to_owned())?;
-    if path.is_file() { Ok(Some(path)) } else { Err("the script is not a file".into()) }
+    if path.is_file() {
+        Ok(Some((path, !Path::new(&script).is_absolute())))
+    } else {
+        Err("the script is not a file".into())
+    }
 }
 
 fn identify(p: &Process) -> Result<Caller, String> {
-    let script = match flag_letters(&p.exe) {
+    let found = match flag_letters(&p.exe) {
         Some(letters) => script_of(p, letters)?,
         None => None,
     };
+    let relative = found.as_ref().is_some_and(|(_, relative)| *relative);
+    let script = found.map(|(path, _)| path);
     let hash = hash_file(script.as_deref().unwrap_or(&p.exe), p.started)?;
-    Ok(Caller::Invoker { exe: p.exe.clone(), script, hash })
+    Ok(Caller::Invoker { exe: p.exe.clone(), script, hash, relative })
 }
 
 fn read_capped(file: std::fs::File, cap: u64) -> std::io::Result<Vec<u8>> {
@@ -358,8 +385,8 @@ fn read_capped(file: std::fs::File, cap: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Slack for a start time kept in clock ticks (10 ms on Linux).
-const TICK: Duration = Duration::from_millis(20);
+/// Slack for a start time kept in clock ticks (10 ms on Linux); macOS keeps microseconds.
+const TICK: Duration = Duration::from_millis(if cfg!(target_os = "linux") { 20 } else { 0 });
 
 /// The last time the file was written or its inode changed.
 fn changed(md: &std::fs::Metadata) -> Option<SystemTime> {

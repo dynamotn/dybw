@@ -84,7 +84,7 @@ fn the_invoker_is_the_parent_of_dybw_hashed_by_its_executable() {
     t.dybw(50);
     t.add(50, &app, 10, Some(&["app"]), Some(&[]));
     t.add(10, Path::new("/usr/bin/login"), 1, Some(&["login"]), Some(&[]));
-    assert_eq!(t.caller(), Caller::Invoker { exe: app, script: None, hash: sha("binary") });
+    assert_eq!(t.caller(), Caller::Invoker { exe: app, script: None, hash: sha("binary"), relative: false });
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn an_interpreter_is_looked_through_to_its_script() {
     t.dybw(50);
     t.add(50, &bash, 1, Some(&["bash", "-e", &script.to_string_lossy()]), Some(&[]));
     // `-e` is errexit for a shell, not inline code.
-    assert_eq!(t.caller(), Caller::Invoker { exe: bash, script: Some(script), hash: sha("echo hi") });
+    assert_eq!(t.caller(), Caller::Invoker { exe: bash, script: Some(script), hash: sha("echo hi"), relative: false });
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn an_interactive_shell_is_the_shell_itself() {
     let fish = t.file("fish", "elf");
     t.dybw(50);
     t.add(50, &fish, 1, Some(&["-fish"]), Some(&[]));
-    assert_eq!(t.caller(), Caller::Invoker { exe: fish, script: None, hash: sha("elf") });
+    assert_eq!(t.caller(), Caller::Invoker { exe: fish, script: None, hash: sha("elf"), relative: false });
 }
 
 #[test]
@@ -187,7 +187,7 @@ fn a_relative_script_resolves_against_the_cwd_of_the_interpreter() {
     t.add(50, &sh, 1, Some(&["sh", "rel.sh"]), Some(&[]));
     let with_cwd = Process { cwd: Some(t.dir.path().to_path_buf()), ..t.fake.process(50).unwrap() };
     t.fake.add(50, with_cwd);
-    assert!(matches!(t.caller(), Caller::Invoker { script: Some(s), .. } if s == script));
+    assert!(matches!(t.caller(), Caller::Invoker { script: Some(s), relative: true, .. } if s == script));
     // A script that vanished again.
     t.add(50, &sh, 1, Some(&["sh", "gone.sh"]), Some(&[]));
     t.fake.add(50, Process { cwd: Some(t.dir.path().to_path_buf()), ..t.fake.process(50).unwrap() });
@@ -401,6 +401,7 @@ fn a_harness_ancestor_classifies_even_with_a_cleared_environment() {
         ("/h/.local/share/claude/versions/2.1.0", vec!["2.1.0"], "claude"),
         ("/usr/bin/node", vec!["/home/u/bin/claude", "--resume"], "claude"),
         ("/usr/bin/node", vec!["node", "/h/cursor-agent/index.js"], "cursor"),
+        ("/usr/bin/node", vec!["node", "/h/node_modules/@anthropic-ai/claude-code/cli.js"], "claude"),
         ("/usr/bin/node", vec!["node", "/x/@google/gemini-cli/dist/index.js"], "gemini"),
         ("/usr/bin/node", vec!["node", "/x/@openai/codex/bin/codex.js"], "codex"),
         ("/usr/bin/node", vec!["node", "/x/@github/copilot/index.js"], "copilot"),
@@ -553,7 +554,7 @@ fn this_process_resolves_to_a_plausible_invoker() {
     let resolver = Resolver::new(Arc::new(dybw_peer::Os), Harnesses::default());
     let resolved = resolver.resolve(dybw_peer::peer_of_stream(&a).unwrap());
     match &resolved.caller {
-        Caller::Invoker { exe, script, hash } => {
+        Caller::Invoker { exe, script, hash, .. } => {
             assert!(exe.is_absolute());
             assert!(script.as_ref().is_none_or(|s| s.is_absolute()));
             assert_eq!(hash.len(), 64);
@@ -562,4 +563,30 @@ fn this_process_resolves_to_a_plausible_invoker() {
         Caller::Unknown { why } => assert!(!why.is_empty()),
     }
     assert!(resolver.recheck(&resolved));
+}
+
+#[test]
+fn only_a_named_absolute_invoker_is_rememberable() {
+    let t = Tree::new();
+    let app = t.file("app", "binary");
+    let sh = t.file("sh", "elf");
+    let script = t.file("s.sh", "x");
+    t.dybw(50);
+    let remember = |t: &Tree| t.caller().rememberable();
+    t.add(50, &app, 1, Some(&["app"]), Some(&[]));
+    assert!(remember(&t));
+    t.add(50, &sh, 1, Some(&["sh", &script.to_string_lossy()]), Some(&[]));
+    assert!(remember(&t));
+    // A bare interpreter: every script it runs would share the grant.
+    t.add(50, &sh, 1, Some(&["sh"]), Some(&[]));
+    assert!(!remember(&t));
+    // A relative script: the cwd may change under it.
+    t.add(50, &sh, 1, Some(&["sh", "s.sh"]), Some(&[]));
+    t.fake.add(50, Process { cwd: Some(t.dir.path().to_path_buf()), ..t.fake.process(50).unwrap() });
+    assert!(matches!(t.caller(), Caller::Invoker { relative: true, .. }));
+    assert!(!remember(&t));
+    t.add(50, &sh, 1, Some(&["sh", "-c", "x"]), Some(&[]));
+    assert!(!remember(&t));
+    t.add(50, Path::new("/opt/claude"), 1, Some(&["claude"]), Some(&[]));
+    assert!(!remember(&t));
 }

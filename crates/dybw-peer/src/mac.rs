@@ -129,7 +129,7 @@ pub(crate) fn started(start: u64) -> Option<std::time::SystemTime> {
 pub(crate) fn cwd(pid: u32) -> Result<Option<PathBuf>, Error> {
     let info: libc::proc_vnodepathinfo = match pidinfo(pid, libc::PROC_PIDVNODEPATHINFO) {
         Ok(info) => info,
-        Err(Error::Os(libc::EPERM | libc::EACCES)) => return Ok(None),
+        Err(Error::Os(libc::EPERM | libc::EACCES | libc::EINVAL)) => return Ok(None),
         Err(e) => return Err(e),
     };
     let bytes: Vec<u8> = info.pvi_cdir.vip_path.iter().flatten().map(|&c| c as u8).take_while(|&b| b != 0).collect();

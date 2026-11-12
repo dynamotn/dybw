@@ -146,12 +146,9 @@ fn list<T>(pid: u32, file: &str, f: fn(&[u8]) -> T) -> Result<Option<T>, Error> 
 /// The start time (clock ticks since boot, 100 per second: USER_HZ is fixed for userspace) as a wall-clock time,
 /// from the boot time in `/proc/stat`; `None` when that cannot be read.
 pub(crate) fn started(start: u64) -> Option<std::time::SystemTime> {
-    static BTIME: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let boot = (*BTIME.get_or_init(|| {
-        let mut buf = Vec::new();
-        std::fs::File::open("/proc/stat").ok()?.take(MAX_ARGS_BYTES as u64).read_to_end(&mut buf).ok()?;
-        parse::btime(&buf)
-    }))?;
+    let mut buf = Vec::new();
+    std::fs::File::open("/proc/stat").ok()?.take(MAX_ARGS_BYTES as u64).read_to_end(&mut buf).ok()?;
+    let boot = parse::btime(&buf)?;
     std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(boot * 1000 + start * 10))
 }
 
@@ -159,7 +156,7 @@ pub(crate) fn started(start: u64) -> Option<std::time::SystemTime> {
 pub(crate) fn cwd(pid: u32) -> Result<Option<PathBuf>, Error> {
     match std::fs::read_link(format!("/proc/{pid}/cwd")) {
         Ok(p) => Ok(Some(p)),
-        Err(e) if matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM)) => Ok(None),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM | libc::EINVAL)) => Ok(None),
         Err(e) => Err(io_err(e)),
     }
 }
