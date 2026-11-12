@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 use dybw_native::config::{read_doc, resolve};
 use toml::{Table, Value};
 
@@ -27,6 +27,14 @@ pub struct Profile {
     pub sync_interval: Duration,
     /// As written: a program name or an absolute path; see `trust::resolve_pinentry`.
     pub pinentry: String,
+}
+
+/// Profile names become directory names under the state and cache dirs, and the file may be synced.
+fn check_name(name: &str) -> anyhow::Result<()> {
+    let ok =
+        (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    ensure!(ok, "profile name {name:?} is not allowed: use 1 to 64 characters of A-Z, a-z, 0-9, `_` and `-`");
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -56,6 +64,9 @@ impl Config {
         if self.doc.get("bwss").is_some_and(|v| !v.is_table()) {
             bail!("unknown key `bwss` at the top level in {}", self.shown);
         }
+        if let Some(name) = name {
+            check_name(name)?;
+        }
         let mut doc = self.doc.clone();
         // `memory` skips bwss's own `auth` limit; the account is all `resolve` is used for here.
         let mut own = Table::new();
@@ -68,6 +79,7 @@ impl Config {
         let Some(account) = s.account else {
             bail!("no profile: pass -p, set DYBW_PROFILE, or set `default` in {}", self.shown);
         };
+        check_name(&account.profile).with_context(|| self.shown.clone())?;
         let auth_in = |t: &Table| t.get("auth").and_then(Value::as_str).map(str::to_owned);
         let own = self.doc.get("profiles").and_then(|p| p.get(&account.profile)).and_then(Value::as_table);
         let auth = match own.and_then(auth_in).or_else(|| auth_in(&self.doc)).as_deref() {
@@ -137,6 +149,31 @@ mod tests {
     fn other_tool_tables_are_ignored_even_the_bwss_one() {
         let c = config(&format!("{TWO}[bwss]\nbackend = \"nonsense\"\nprofile = \"home\"\n[other]\nx = 1\n"));
         assert_eq!(c.profile(None).unwrap().name, "work");
+    }
+
+    #[test]
+    fn profile_names_are_one_to_64_safe_characters() {
+        let long = "a".repeat(65);
+        for bad in ["..", "a/b", ".x", "", "a\0b", "a b", long.as_str()] {
+            let e = format!("{:#}", config(TWO).profile(Some(bad)).unwrap_err());
+            assert!(e.contains("A-Z"), "{bad:?}: {e}");
+        }
+        for bad in [".x", "a/b", ".."] {
+            let e =
+                err(&format!("default = \"{bad}\"\n[profiles.\"{bad}\"]\nserver_url = \"u\"\nemail = \"e\"\n"), None);
+            assert!(e.contains("A-Z") || e.contains("profile name"), "{bad}: {e}");
+        }
+        let ok = "default = \"work-2\"\n[profiles.work-2]\nserver_url = \"u\"\nemail = \"e\"\n";
+        assert_eq!(config(ok).profile(None).unwrap().name, "work-2");
+        assert_eq!(config(&ok.replace("work-2", &"a".repeat(64))).profile(None).unwrap().name.len(), 64);
+    }
+
+    #[test]
+    fn load_refuses_a_bad_profile_name_even_when_unused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("{TWO}[profiles.\".x\"]\nserver_url = \"u\"\nemail = \"e\"\n")).unwrap();
+        assert!(format!("{:#}", Config::load(&path).unwrap_err()).contains("A-Z"));
     }
 
     #[test]
