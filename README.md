@@ -25,6 +25,9 @@ items through the agent; writes, URI lookup and the SSH and git integrations com
 | `dybw list`, `dybw search <term>` | Names, or `--fields id,name,user,folder,type`, `--folder`, `--raw` (list only, JSON) |
 | `dybw get <item> [user]` | The main value; `-f <field>`, `--full`, `--raw`, `-l` (`--list-fields`), `--folder`, `-i` |
 | `dybw history <item>` | Previous passwords, newest first |
+| `dybw policy show\|allow\|deny\|forget` | Show or change which programs may read values (changes are confirmed in pinentry) |
+| `dybw audit [--ai] [-n N]` | The latest N audit lines (default 50) as tab-separated columns; `--ai` keeps AI-class callers. Read straight from the file, no agent needed |
+| `dybw doctor` | Check the socket directory, the agent (reachable, same version), config, pinentry, `policy.json` and `audit.log`; exit 0 when all pass, 1 otherwise. Under an AI harness it also warns that the harness sandbox must not reach the agent |
 | `dybw agent stop` | Stop the agent (locks every profile) |
 
 `--profile <name>` (or `DYBW_PROFILE`) picks the profile; the default is the config's `default`.
@@ -55,6 +58,19 @@ only says "see the agent log" is explained there.
   state directories. `dybw policy show` is open to every class; `allow`, `deny` and `forget` are confirmed in
   pinentry and refused for AI-class and unknown callers. `allow` refuses a bare interpreter or shell and relative
   scripts (they cannot be remembered); `deny` accepts them.
+- The audit log (`$XDG_STATE_HOME/dybw/audit.log`, 0600, append-only, never through a symlink) gets one JSON line per
+  value request and policy change: time (UTC), profile, caller (program and script, or the harness), class, op, what
+  `get` selected (`password`, `field`, `full`, `raw`, `list-fields`; never a field name), the item id (never its name
+  or a value) and the verdict. It rotates once to `audit.log.1` at 10 MiB (`dybw audit` reads only the current file).
+  A line that cannot be written is logged to the agent log and dropped: the request is still answered
+  (availability over completeness), so `dybw doctor` is where a broken log shows. Like `policy.json`, it is plain
+  same-user device state: a program running as you can edit or delete it.
+- A `policy.json` that fails its checks (wrong mode, owner, not valid) is ignored for decisions, and `dybw policy
+  allow|deny|forget` refuse to write over it, so a deny entry is never dropped by accident. Repair it by hand
+  (`chmod 600`, or fix or remove the file; the grants are then asked again). `dybw doctor` names the problem.
+- On macOS the agent calls `ptrace(PT_DENY_ATTACH)` first thing, so a debugger cannot attach to read the unlocked
+  vault: running `dybw-agent` under lldb kills it. (Linux sets `PR_SET_DUMPABLE=0` instead.) A failure is reported
+  on stderr and the agent keeps running.
 - No lookup by URI yet.
 - Items that ask for a master-password reprompt are denied until P4.3.
 - Organization items are readable.
