@@ -10,7 +10,7 @@ use std::process::ExitCode;
 
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand};
-use dybw_proto::{AgentError, Field, ItemSummary, Op, Reply, Select, Target};
+use dybw_proto::{AgentError, Field, ItemSummary, Op, PolicyAction, PolicyRule, Reply, Select, Target};
 use serde_json::{Map, Value};
 
 pub use client::{Env, Error as ClientError, START_WAIT};
@@ -90,6 +90,11 @@ enum Cmd {
         #[arg(long)]
         folder: Option<String>,
     },
+    /// Show or change which programs may read values (changes are confirmed in the pinentry).
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCmd,
+    },
     /// Talk to the agent process itself.
     Agent {
         #[command(subcommand)]
@@ -101,6 +106,28 @@ enum Cmd {
 enum AgentCmd {
     /// Stop the agent (locks every profile).
     Stop,
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCmd {
+    /// List the remembered programs: rule, program, script, hash.
+    Show,
+    /// Always let a program read values, as long as the program (or its script) is unchanged.
+    Allow {
+        /// The program's absolute path (for an interpreter, the interpreter).
+        invoker: String,
+        /// The script the program runs, an absolute path.
+        #[arg(long)]
+        script: Option<String>,
+    },
+    /// Never let a program read values, whatever it contains.
+    Deny {
+        invoker: String,
+        #[arg(long)]
+        script: Option<String>,
+    },
+    /// Drop what is remembered for a program or a script.
+    Forget { invoker: String },
 }
 
 /// What `list` and `search` show.
@@ -261,6 +288,27 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
                         .try_for_each(|e| writeln!(out, "{}: {}", escape(&e.last_used), e.password.expose()))?;
                     Ok(0)
                 }
+                _ => Err(Fail::Unexpected),
+            }
+        }
+        Cmd::Policy { command } => {
+            let action = match command {
+                PolicyCmd::Show => PolicyAction::Show,
+                PolicyCmd::Allow { invoker, script } => PolicyAction::Allow { invoker, script },
+                PolicyCmd::Deny { invoker, script } => PolicyAction::Deny { invoker, script },
+                PolicyCmd::Forget { invoker } => PolicyAction::Forget { invoker },
+            };
+            let shown = action == PolicyAction::Show;
+            match ask_started(env, Op::Policy { profile, action })? {
+                Reply::Policy { entries } if shown => {
+                    for e in entries {
+                        let rule = if e.rule == PolicyRule::Allow { "allow" } else { "deny" };
+                        let script = e.script.as_deref().unwrap_or("");
+                        writeln!(out, "{rule}\t{}\t{}\t{}", escape(&e.exe), escape(script), escape(&e.hash))?;
+                    }
+                    Ok(0)
+                }
+                reply if !shown => done(reply),
                 _ => Err(Fail::Unexpected),
             }
         }

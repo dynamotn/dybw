@@ -10,8 +10,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use dybw_proto::{
-    AgentError, Candidate, Entry, HistoryEntry, ItemSummary, Op, ProfileStatus, Reply, Request, Response, Secret,
-    Select, Target, decode_request, encode,
+    AgentError, Candidate, Entry, HistoryEntry, ItemSummary, Op, PolicyAction, PolicyEntry, PolicyRule, ProfileStatus,
+    Reply, Request, Response, Secret, Select, Target, decode_request, encode,
 };
 
 use super::*;
@@ -719,4 +719,49 @@ fn field_names_are_escaped_but_their_values_are_not() {
     ];
     let (r, _) = one(&["get", "n", "--full"], Reply::Full { entries });
     assert_eq!(r.1, "pw\nf\\x0aake: x: v\tal\n");
+}
+
+// policy
+
+#[test]
+fn policy_show_prints_one_escaped_row_per_entry() {
+    let entries = vec![
+        PolicyEntry { exe: s("/bin/sh"), script: Some(s("/opt/a\nb.sh")), hash: s("ab12"), rule: PolicyRule::Allow },
+        PolicyEntry { exe: s("/usr/bin/x"), script: None, hash: s(""), rule: PolicyRule::Deny },
+    ];
+    let ((code, out, _), op) = one(&["policy", "show"], Reply::Policy { entries });
+    assert_eq!(code, 0);
+    assert_eq!(out, "allow\t/bin/sh\t/opt/a\\x0ab.sh\tab12\ndeny\t/usr/bin/x\t\t\n");
+    assert_eq!(op, Op::Policy { profile: None, action: PolicyAction::Show });
+}
+
+#[test]
+fn policy_changes_send_their_action_and_succeed_on_done() {
+    let cases: [(&[&str], PolicyAction); 3] = [
+        (
+            &["policy", "allow", "/bin/sh", "--script", "/opt/a.sh"],
+            PolicyAction::Allow { invoker: s("/bin/sh"), script: Some(s("/opt/a.sh")) },
+        ),
+        (
+            &["-p", "home", "policy", "deny", "/usr/bin/x"],
+            PolicyAction::Deny { invoker: s("/usr/bin/x"), script: None },
+        ),
+        (&["policy", "forget", "/opt/a.sh"], PolicyAction::Forget { invoker: s("/opt/a.sh") }),
+    ];
+    for (args, action) in cases {
+        let ((code, out, _), op) = one(args, Reply::Done);
+        assert_eq!((code, out.as_str()), (0, ""), "{args:?}");
+        let profile = args.contains(&"home").then(|| s("home"));
+        assert_eq!(op, Op::Policy { profile, action });
+    }
+}
+
+#[test]
+fn a_policy_reply_that_does_not_fit_is_unexpected_and_a_refusal_is_denied() {
+    let ((code, _, err), _) = one(&["policy", "show"], Reply::Done);
+    assert_eq!((code, err.contains("does not fit")), (1, true));
+    let ((code, _, err), _) = one(&["policy", "forget", "/x"], Reply::Policy { entries: vec![] });
+    assert_eq!((code, err.contains("does not fit")), (1, true));
+    let ((code, _, err), _) = one(&["policy", "forget", "/x"], Reply::Error { error: AgentError::Denied });
+    assert_eq!((code, err.contains("denied")), (1, true));
 }
