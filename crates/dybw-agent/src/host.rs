@@ -114,6 +114,8 @@ pub(crate) mod fake {
         pub requests: Vec<String>,
         /// The `deviceName` of every login.
         pub device_names: Vec<String>,
+        /// The `Bitwarden-Client-Version` header of every request.
+        pub client_versions: Vec<String>,
         /// The `ciphers` and `folders` JSON lists the `/sync` answer carries.
         pub ciphers: String,
         pub folders: String,
@@ -150,6 +152,7 @@ pub(crate) mod fake {
                 sync_marker: 0,
                 requests: Vec::new(),
                 device_names: Vec::new(),
+                client_versions: Vec::new(),
                 ciphers: "[]".into(),
                 folders: "[]".into(),
                 profile: None,
@@ -196,6 +199,9 @@ pub(crate) mod fake {
             let (status, body, hang) = {
                 let mut w = self.0.lock().unwrap();
                 w.requests.push(format!("{:?} {path}", req.method));
+                w.client_versions.extend(
+                    req.headers.iter().filter(|(k, _)| k == "Bitwarden-Client-Version").map(|(_, v)| v.clone()),
+                );
                 if !w.online {
                     return Err(PortError("network: connection refused".into()));
                 }

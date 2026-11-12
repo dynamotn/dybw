@@ -85,6 +85,8 @@ async fn login_asks_for_both_halves_checks_the_key_and_stores_it_privately() {
         assert!(w.asked[0].0.contains("client_id") && w.asked[1].0.contains("client_secret"));
         assert!(w.asked.iter().all(|(d, e)| !d.contains(SECRET) && e.is_none()), "no secret in a question");
         assert_eq!(w.device_names, ["dybw+on+testhost"]);
+        // Servers hide SSH key items from clients older than 2024.12.
+        assert_eq!(w.client_versions, ["2025.1.0"]);
         assert_eq!(w.count("/identity/connect/token"), 1);
     }
     assert!(status(&agent, "work").await.0);

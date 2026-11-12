@@ -269,6 +269,9 @@ fn stored_key(ctx: &Ctx, origin: &str) -> Result<ApiKey, AgentError> {
     Ok(key_of(&creds))
 }
 
+/// Servers hide SSH key items (type 5) from clients older than 2024.12, so the agent announces a newer fixed version.
+const CLIENT_VERSION: &str = "2025.1.0";
+
 fn client<H: Host>(host: &H, ctx: &Ctx, urls: &ServerUrls) -> Result<Client<H::Http, SystemClock>, AgentError> {
     let internal = |what: &str, e: &dyn std::fmt::Display| {
         tracing::warn!(profile = %ctx.profile.name, "{what}: {e}");
@@ -281,7 +284,7 @@ fn client<H: Host>(host: &H, ctx: &Ctx, urls: &ServerUrls) -> Result<Client<H::H
         name: format!("dybw on {}", host.hostname()),
         device_type: DEVICE_TYPE,
         client_name: "dybw".into(),
-        client_version: env!("CARGO_PKG_VERSION").into(),
+        client_version: CLIENT_VERSION.into(),
     };
     Client::new(http, SystemClock, urls.clone(), device).map_err(|e| internal("device info", &e))
 }
