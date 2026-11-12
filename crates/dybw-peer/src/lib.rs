@@ -128,6 +128,8 @@ pub struct Process {
     pub argv: Option<Vec<OsString>>,
     /// At most [`MAX_ENTRIES`] entries; `None` when not visible.
     pub env: Option<Vec<(OsString, OsString)>>,
+    /// Working directory; `None` when not visible. Read in the same window as the rest.
+    pub cwd: Option<PathBuf>,
 }
 
 /// (ppid, start time, image) in one read.
@@ -164,8 +166,9 @@ impl Process {
         let before = read_id(pid)?;
         let exe = sys::exe(pid)?;
         let (argv, env) = sys::args(pid)?;
+        let cwd = sys::cwd(pid)?;
         unchanged(&before, &read_id(pid)?)?;
-        Ok(Self { exe, ppid: before.0, start: before.1, image: before.2, argv, env })
+        Ok(Self { exe, ppid: before.0, start: before.1, image: before.2, argv, env, cwd })
     }
 }
 
@@ -278,6 +281,8 @@ mod tests {
         assert_eq!(p.exe, std::env::current_exe().unwrap().canonicalize().unwrap());
         assert_eq!(p.argv.unwrap().last().unwrap(), "tests::child_body");
         assert!(p.env.unwrap().iter().any(|(k, v)| k == MARKER && v == "x=y"));
+        let here = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(p.cwd.unwrap().canonicalize().unwrap(), here);
         child.kill().unwrap();
         child.wait().unwrap();
     }

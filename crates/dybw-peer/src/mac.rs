@@ -35,6 +35,8 @@ unsafe trait Pod: Copy {}
 unsafe impl Pod for Uniq {}
 // SAFETY: integers only.
 unsafe impl Pod for libc::proc_bsdinfo {}
+// SAFETY: integers, and arrays of c_char (bytes), only.
+unsafe impl Pod for libc::proc_vnodepathinfo {}
 
 fn pidinfo<T: Pod>(pid: u32, flavor: libc::c_int) -> Result<T, Error> {
     let mut info = MaybeUninit::<T>::zeroed();
@@ -116,6 +118,17 @@ pub(crate) fn exe(pid: u32) -> Result<PathBuf, Error> {
 pub(crate) fn ppid_start(pid: u32) -> Result<(u32, u64), Error> {
     let info: libc::proc_bsdinfo = pidinfo(pid, libc::PROC_PIDTBSDINFO)?;
     Ok((info.pbi_ppid, info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec))
+}
+
+/// The working directory (`PROC_PIDVNODEPATHINFO`); `None` when the kernel refuses it or it has no path.
+pub(crate) fn cwd(pid: u32) -> Result<Option<PathBuf>, Error> {
+    let info: libc::proc_vnodepathinfo = match pidinfo(pid, libc::PROC_PIDVNODEPATHINFO) {
+        Ok(info) => info,
+        Err(Error::Os(e)) if e == libc::EPERM || e == libc::EACCES => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let bytes: Vec<u8> = info.pvi_cdir.vip_path.iter().flatten().map(|&c| c as u8).take_while(|&b| b != 0).collect();
+    Ok((!bytes.is_empty()).then(|| PathBuf::from(OsString::from_vec(bytes))))
 }
 
 /// argv and env through `KERN_PROCARGS2`. EINVAL/EPERM (another user's, a
@@ -203,6 +216,13 @@ mod tests {
         }
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn own_cwd_is_visible_and_a_missing_pid_is_gone() {
+        let own = cwd(std::process::id()).unwrap().unwrap();
+        assert_eq!(own.canonicalize().unwrap(), std::env::current_dir().unwrap().canonicalize().unwrap());
+        assert_eq!(cwd(u32::MAX - 1), Err(Error::Gone));
     }
 
     #[test]

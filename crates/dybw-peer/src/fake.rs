@@ -60,7 +60,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn proc(start: u64) -> Process {
-        Process { exe: PathBuf::from("/bin/x"), ppid: 1, start, image: vec![], argv: None, env: None }
+        Process { exe: PathBuf::from("/bin/x"), ppid: 1, start, image: vec![], argv: None, env: None, cwd: None }
     }
 
     #[test]

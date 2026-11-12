@@ -143,6 +143,15 @@ fn list<T>(pid: u32, file: &str, f: fn(&[u8]) -> T) -> Result<Option<T>, Error> 
     }
 }
 
+/// The working directory; another user's (EACCES/EPERM) is `None`.
+pub(crate) fn cwd(pid: u32) -> Result<Option<PathBuf>, Error> {
+    match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+        Ok(p) => Ok(Some(p)),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM)) => Ok(None),
+        Err(e) => Err(io_err(e)),
+    }
+}
+
 /// `PR_SET_DUMPABLE` is part of the agent's hardening, not this crate.
 pub(crate) fn deny_attach() -> Result<(), Error> {
     Ok(())
