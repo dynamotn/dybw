@@ -47,8 +47,14 @@ only says "see the agent log" is explained there.
 ## Limits
 
 - API-key login only (`auth = "password"` profiles are refused).
-- Every read of a value is confirmed through pinentry, including `get --list-fields`; `list` and `search` show only
-  names and never ask.
+- Reading a value (including `get --list-fields` and `history`) follows the caller policy: an AI-class caller is
+  denied, an unknown or detached caller is asked every time, any other invoker is asked once or "always" (remembered
+  by program, script and content hash; a changed script asks again). `list` and `search` show only names and never ask.
+- The policy file (`policy.json`, in the profile's state directory) is plain device state: a program running as the
+  same user can edit it directly. The boundary is the harness sandbox, which must not reach the agent's socket or
+  state directories. `dybw policy show` is open to every class; `allow`, `deny` and `forget` are confirmed in
+  pinentry and refused for AI-class and unknown callers. `allow` refuses a bare interpreter or shell and relative
+  scripts (they cannot be remembered); `deny` accepts them.
 - No lookup by URI yet.
 - Items that ask for a master-password reprompt are denied until P4.3.
 - Organization items are readable.
