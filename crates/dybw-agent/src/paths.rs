@@ -21,6 +21,7 @@ pub struct ProfilePaths {
 
 impl ProfilePaths {
     /// `home` is the validated one from `trust()`, never the raw `HOME`.
+    #[cfg(test)]
     pub fn from_env(profile: &Profile, home: &Path) -> Self {
         Self::with(&|var| std::env::var_os(var), home, profile)
     }

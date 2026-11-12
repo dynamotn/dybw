@@ -152,7 +152,7 @@ impl Agent {
             Op::Status { profile } => self.on_profile(profile.as_deref(), Cmd::Status).await,
             Op::Login { profile } => self.on_profile(profile.as_deref(), Cmd::Login).await,
             Op::Unlock { profile } => self.on_profile(profile.as_deref(), Cmd::Unlock).await,
-            Op::Sync { target: Target::Profile(name) } => self.on_profile(Some(&name), Cmd::Sync).await,
+            Op::Sync { target: Target::Profile(name) } => self.on_unlocked(Some(&name), Cmd::Sync).await,
             Op::Sync { target: Target::All } => self.sync_all().await,
             Op::Lock { target: Target::Profile(name) } => self.on_profile(Some(&name), Cmd::Lock).await,
             Op::Lock { target: Target::All } => {
@@ -160,18 +160,18 @@ impl Agent {
                 Reply::Done
             }
             Op::List { profile, fields, folder } => {
-                self.on_profile(profile.as_deref(), Cmd::List { fields, folder }).await
+                self.on_unlocked(profile.as_deref(), Cmd::List { fields, folder }).await
             }
             Op::Search { profile, term, folder, fields } => {
-                self.on_profile(profile.as_deref(), Cmd::Search { term, folder, fields }).await
+                self.on_unlocked(profile.as_deref(), Cmd::Search { term, folder, fields }).await
             }
             Op::Get { profile, needle, user, folder, ignorecase, select } => {
                 let find = Lookup { needle, user, folder, ignorecase };
-                self.on_profile(profile.as_deref(), Cmd::Get { find, select }).await
+                self.on_unlocked(profile.as_deref(), Cmd::Get { find, select }).await
             }
             Op::History { profile, needle, user, folder } => {
                 let find = Lookup { needle, user, folder, ignorecase: false };
-                self.on_profile(profile.as_deref(), Cmd::History { find }).await
+                self.on_unlocked(profile.as_deref(), Cmd::History { find }).await
             }
             _ => Reply::Error { error: AgentError::Internal },
         }
@@ -190,7 +190,20 @@ impl Agent {
                 Some(worker) => worker.call(cmd, self.clock.mono()).await,
                 None => Reply::Error { error: AgentError::Internal },
             },
-            Err(_) => Reply::Error { error: AgentError::Config },
+            Err(e) => {
+                // The text names the file and the key, never a value.
+                tracing::warn!("{e:#}");
+                Reply::Error { error: AgentError::Config }
+            }
+        }
+    }
+
+    /// Unlock on first need (profiles.md section 4): the same flow as `dybw unlock`, then `cmd`. A failed or cancelled
+    /// unlock is the answer, so nothing after it (lookup, confirmation, opening) runs.
+    async fn on_unlocked(&self, name: Option<&str>, cmd: Cmd) -> Reply {
+        match self.on_profile(name, Cmd::Unlock).await {
+            Reply::Done => self.on_profile(name, cmd).await,
+            failed => failed,
         }
     }
 

@@ -393,7 +393,12 @@ async fn get<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, find: Lookup, select
 }
 
 async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx) -> Reply {
+    // Every read starts here: an unlocked profile must not wait behind a sync or another unlock.
+    if shared.state.borrow().slot.is_some() {
+        return Reply::Done;
+    }
     let _op = shared.op.lock().await;
+    // Another unlock may have finished while this one waited for its turn.
     if shared.state.borrow().slot.is_some() {
         return Reply::Done;
     }

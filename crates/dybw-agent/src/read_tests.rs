@@ -602,14 +602,7 @@ async fn an_organization_item_of_an_organization_that_cannot_be_unlocked_is_left
 }
 
 #[tokio::test]
-async fn a_locked_profile_answers_locked_and_a_lock_while_waiting_for_the_user_cancels_the_read() {
-    let dir = tempfile::tempdir().unwrap();
-    let (agent, _, host) = agent_world(dir.path());
-    for op in [list_op(&[], None), search_op("x", &[], None), get_op("c1", Select::Password), history_op("c1")] {
-        assert_eq!(agent.dispatch(op).await, err(AgentError::Locked));
-    }
-    drop((agent, host, dir));
-
+async fn a_lock_while_waiting_for_the_user_cancels_the_read() {
     let (_dir, agent, host) = setup(|_| {}).await;
     host.world().confirms.push_back(Answer::Hang);
     let first = tokio::spawn({
@@ -629,7 +622,96 @@ async fn a_locked_profile_answers_locked_and_a_lock_while_waiting_for_the_user_c
     assert_eq!(second.await.unwrap(), err(AgentError::Locked));
     assert_eq!(host.world().confirmed.len(), 1);
     assert_eq!(agent.opens("work").await, 0);
-    assert_eq!(agent.dispatch(get_op("c1", Select::Password)).await, err(AgentError::Locked));
+    // The profile is locked now: a new request starts with the unlock, which the user cancels.
+    assert_eq!(agent.dispatch(get_op("c1", Select::Password)).await, err(AgentError::Denied));
+}
+
+/// A locked profile with a stored key and the fixture vault (nothing unlocked yet).
+fn locked_world() -> (tempfile::TempDir, Arc<Agent>, FakeHost) {
+    let dir = tempfile::tempdir().unwrap();
+    let (agent, _, host) = agent_world(dir.path());
+    let mut vault: Value = serde_json::from_str(VAULT).unwrap();
+    vault["ciphers"].as_array_mut().unwrap().iter_mut().for_each(|c| c["reprompt"] = json!(0));
+    host.vault(&vault.to_string());
+    seed_credentials(&agent, "work");
+    (dir, agent, host)
+}
+
+async fn unlocked(agent: &Agent) -> bool {
+    let Reply::Status { profiles, .. } = agent.dispatch(Op::Status { profile: Some("work".into()) }).await else {
+        panic!("no status")
+    };
+    profiles[0].unlocked
+}
+
+#[tokio::test]
+async fn a_locked_profile_unlocks_on_first_need_with_one_password_prompt_then_the_value_confirm() {
+    let (_dir, agent, host) = locked_world();
+    host.answer(Answer::Text(crate::host::fake::PASSWORD));
+    assert_eq!(text(allowed(&agent, &host, get_op("n1", Select::Password)).await), "the note's text");
+    assert_eq!(host.world().asked.len(), 1, "exactly one master-password prompt");
+    assert_eq!(host.world().confirmed.len(), 1, "and then the value confirm");
+    assert!(unlocked(&agent).await);
+    // Unlocked now: no second password prompt.
+    assert!(!items(agent.dispatch(list_op(&[], None)).await).is_empty());
+    assert_eq!(host.world().asked.len(), 1);
+}
+
+#[tokio::test]
+async fn list_search_and_history_also_unlock_on_first_need() {
+    for op in [list_op(&[], None), search_op("a", &[], None), history_op("c1")] {
+        let (_dir, agent, host) = locked_world();
+        host.answer(Answer::Text(crate::host::fake::PASSWORD));
+        host.allow();
+        let reply = agent.dispatch(op).await;
+        assert!(!matches!(reply, Reply::Error { error: AgentError::Locked }), "{reply:?}");
+        assert_eq!(host.world().asked.len(), 1);
+        assert!(unlocked(&agent).await);
+    }
+}
+
+#[tokio::test]
+async fn two_requests_on_a_locked_profile_share_one_unlock() {
+    let (_dir, agent, host) = locked_world();
+    host.answer(Answer::Held);
+    let asks: Vec<_> = (0..2)
+        .map(|_| {
+            let agent = agent.clone();
+            tokio::spawn(async move { agent.dispatch(list_op(&[], None)).await })
+        })
+        .collect();
+    until(|| host.world().asked.len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    host.world().release.notify_one();
+    for ask in asks {
+        assert!(matches!(ask.await.unwrap(), Reply::Items { .. }));
+    }
+    assert_eq!(host.world().asked.len(), 1, "the second request waited for the first unlock");
+}
+
+/// The value gate starts at the unlock: a cancelled or failed unlock is its own error, and nothing is looked up,
+/// confirmed or opened. (If the unlock error were swallowed, the read would go on and answer `Locked`.)
+#[tokio::test]
+async fn a_cancelled_first_need_unlock_opens_nothing_and_shows_no_value_confirm() {
+    for (cancel, expected) in [(true, AgentError::Denied), (false, AgentError::Prompt)] {
+        for op in [get_op("c1", Select::Password), history_op("c1"), list_op(&[], None), search_op("a", &[], None)] {
+            let (_dir, agent, host) = locked_world();
+            host.answer(if cancel { Answer::Cancel } else { Answer::Fail });
+            host.allow(); // a confirm would be answered yes: it must not be shown at all
+            assert_eq!(agent.dispatch(op).await, err(expected.clone()));
+            assert!(host.world().confirmed.is_empty(), "no value confirm after a failed unlock");
+            assert_eq!(agent.opens("work").await, 0);
+            assert!(!unlocked(&agent).await);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_logged_out_profile_is_not_logged_in_by_a_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (agent, _, host) = agent_world(dir.path());
+    assert_eq!(agent.dispatch(get_op("c1", Select::Password)).await, err(AgentError::NotLoggedIn));
+    assert!(host.world().asked.is_empty());
 }
 
 #[tokio::test]

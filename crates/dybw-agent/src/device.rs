@@ -9,6 +9,7 @@ use dybw_native::fsutil::write_private;
 
 use crate::paths::ProfilePaths;
 
+#[cfg(test)]
 pub fn device_id(paths: &ProfilePaths) -> anyhow::Result<String> {
     device_id_for(paths, crate::current_user().context("cannot tell which user this is")?.uid)
 }

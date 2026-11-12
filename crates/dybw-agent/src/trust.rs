@@ -35,6 +35,7 @@ fn trust_for(home: Option<OsString>, user: User, exe: PathBuf) -> anyhow::Result
 }
 
 /// The canonical path of a trusted pinentry, resolved once at start; hand it on as the program name afterwards.
+#[cfg(test)]
 pub fn resolve_pinentry(trust: &Trust, pinentry: &str) -> anyhow::Result<String> {
     Ok(trust.check(pinentry)?.0.to_string_lossy().into_owned())
 }

@@ -309,10 +309,10 @@ async fn a_weaker_kdf_than_the_pinned_one_and_a_broken_state_dir_refuse_the_unlo
 }
 
 #[tokio::test]
-async fn sync_needs_an_unlocked_profile_and_refreshes_the_copy() {
+async fn sync_unlocks_first_and_refreshes_the_copy() {
     let dir = tempfile::tempdir().unwrap();
     let (agent, _, host) = agent_world(dir.path());
-    assert_eq!(run(&agent, sync_op("work")).await, err(AgentError::Locked));
+    assert_eq!(run(&agent, sync_op("work")).await, err(AgentError::NotLoggedIn), "no implicit login");
     unlock(&agent, &host, "work").await;
     host.world().sync_marker = 5;
     assert_eq!(run(&agent, sync_op("work")).await, Reply::Done);
@@ -427,7 +427,8 @@ async fn lock_cancels_a_sync_in_flight() {
     until(|| host.world().count("excludeDomains=true") >= 2).await;
     assert_eq!(run(&agent, lock_op("work")).await, Reply::Done);
     assert_eq!(hung.await.unwrap(), err(AgentError::Locked));
-    assert_eq!(run(&agent, sync_op("work")).await, err(AgentError::Locked));
+    // A sync of a locked profile unlocks first; the user cancels.
+    assert_eq!(run(&agent, sync_op("work")).await, err(AgentError::Denied));
     assert!(!status(&agent, "work").await.1);
 }
 
@@ -552,7 +553,7 @@ async fn a_second_login_waits_for_the_first_and_never_opens_a_second_pinentry() 
 }
 
 #[tokio::test]
-async fn unusable_unlock_data_is_a_server_refusal_with_the_reason_in_the_log() {
+async fn unusable_unlock_data_is_a_named_refusal_with_the_reason_in_the_log() {
     let dir = tempfile::tempdir().unwrap();
     let (agent, _, host) = agent_world(dir.path());
     unlock(&agent, &host, "work").await;
@@ -564,6 +565,6 @@ async fn unusable_unlock_data_is_a_server_refusal_with_the_reason_in_the_log() {
     std::fs::write(&file, saved.to_string()).unwrap();
     host.world().online = false;
     host.answer(Answer::Text(PASSWORD));
-    assert_eq!(run(&agent, unlock_op("work")).await, err(AgentError::Server));
+    assert_eq!(run(&agent, unlock_op("work")).await, err(AgentError::Refused("unlock-data".into())));
     assert!(!status(&agent, "work").await.1);
 }

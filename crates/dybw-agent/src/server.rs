@@ -1,6 +1,7 @@
 //! The accept loop and one connection: peer check, one request under a read timeout, one reply.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,10 +24,11 @@ pub async fn serve(
     let listener = UnixListener::from_std(listener)?;
     let ticker = tokio::spawn(ticker(agent.clone()));
     let mut handlers = JoinSet::new();
+    let mut accept = || -> Accepting<'_> { Box::pin(async { listener.accept().await.map(|(stream, _)| stream) }) };
     let out = tokio::select! {
         out = shutdown => out,
         () = agent.stop.notified() => Ok(()),
-        out = accept_loop(&agent, &listener, &mut handlers) => out,
+        out = accept_loop(&agent, &mut accept, &mut handlers) => out,
     };
     ticker.abort();
     wind_down(&agent, handlers).await;
@@ -55,15 +57,28 @@ async fn ticker(agent: Arc<Agent>) {
     }
 }
 
+type Accepting<'a> = Pin<Box<dyn Future<Output = std::io::Result<UnixStream>> + Send + 'a>>;
+type Accept<'a> = dyn FnMut() -> Accepting<'a> + Send + 'a;
+
 /// Ends only on an accept error (out of descriptors, a dead socket): better to stop than to spin.
-// rustfmt::skip: coverage counts the closing brace of an endless loop as a line no test reaches, so it shares a line.
-#[rustfmt::skip]
-async fn accept_loop(agent: &Arc<Agent>, listener: &UnixListener, handlers: &mut JoinSet<()>) -> std::io::Result<()> {
-    loop {
+/// `accept` is a trait object, not a generic, so the real loop and the test's share one body.
+async fn accept_loop(agent: &Arc<Agent>, accept: &mut Accept<'_>, handlers: &mut JoinSet<()>) -> std::io::Result<()> {
+    let err = loop {
         while handlers.try_join_next().is_some() {}
-        let (stream, _) = listener.accept().await?;
-        let agent = agent.clone();
-        handlers.spawn(async move { if handle(agent.clone(), stream).await { agent.stop.notify_one(); } }); } }
+        match accept().await {
+            Ok(stream) => {
+                let agent = agent.clone();
+                handlers.spawn(async move {
+                    if handle(agent.clone(), stream).await {
+                        agent.stop.notify_one();
+                    }
+                });
+            }
+            Err(e) => break e,
+        }
+    };
+    Err(err)
+}
 
 /// One connection. A peer of another uid, a slow or oversize or malformed or wrong-version request is dropped
 /// without a reply and before any worker is touched. Returns true when the request was `StopAgent`, whose `Done`
@@ -153,6 +168,15 @@ mod tests {
 
     fn status() -> Vec<u8> {
         frame(r#"{"version":1,"op":"status","profile":null}"#)
+    }
+
+    #[tokio::test]
+    async fn the_accept_loop_ends_with_the_accept_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _) = agent(dir.path());
+        let mut accept = || -> Accepting<'_> { Box::pin(async { Err(std::io::Error::other("out of descriptors")) }) };
+        let e = accept_loop(&agent, &mut accept, &mut JoinSet::new()).await.unwrap_err();
+        assert_eq!(e.to_string(), "out of descriptors");
     }
 
     #[tokio::test]

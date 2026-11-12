@@ -254,17 +254,22 @@ pub(crate) mod fake {
             description: &str,
             error: Option<&str>,
         ) -> Result<Option<Zeroizing<String>>, PromptError> {
-            let answer = {
+            let (answer, release) = {
                 let mut w = self.0.lock().unwrap();
                 w.asked.push((description.to_owned(), error.map(str::to_owned)));
-                w.answers.pop_front().unwrap_or(Answer::Cancel)
+                (w.answers.pop_front().unwrap_or(Answer::Cancel), w.release.clone())
             };
             match answer {
                 Answer::Text(t) => Ok(Some(Zeroizing::new(t.to_owned()))),
                 Answer::Cancel => Ok(None),
                 Answer::Fail => Err(PromptError::Protocol("scripted".into())),
                 Answer::Timeout => Err(PromptError::Timeout),
-                Answer::Hang | Answer::Held => std::future::pending().await,
+                Answer::Hang => std::future::pending().await,
+                // The user types the right password once the test lets them.
+                Answer::Held => {
+                    release.notified().await;
+                    Ok(Some(Zeroizing::new(PASSWORD.to_owned())))
+                }
             }
         }
 

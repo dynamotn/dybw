@@ -270,6 +270,7 @@ fn stored_key(ctx: &Ctx, origin: &str) -> Result<ApiKey, AgentError> {
 }
 
 /// Servers hide SSH key items (type 5) from clients older than 2024.12, so the agent announces a newer fixed version.
+// Bump it when the core supports newer server formats.
 const CLIENT_VERSION: &str = "2025.1.0";
 
 fn client<H: Host>(host: &H, ctx: &Ctx, urls: &ServerUrls) -> Result<Client<H::Http, SystemClock>, AgentError> {
@@ -352,7 +353,7 @@ fn refused(e: ProfileError) -> Refused {
         // Unusable unlock data and the like. The text names the problem, never a key.
         e => {
             tracing::warn!("unlock refused: {e}");
-            Refused::Failed(AgentError::Server)
+            Refused::Failed(AgentError::Refused("unlock-data".into()))
         }
     }
 }
