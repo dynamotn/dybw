@@ -1,0 +1,13 @@
+[package]
+name = "dybw"
+description = "Command line client for the dybw agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true

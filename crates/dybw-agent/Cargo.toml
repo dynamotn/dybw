@@ -1,0 +1,14 @@
+[package]
+name = "dybw-agent"
+description = "The dybw agent: holds the vault session and serves dybw over a local socket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dybw-core.workspace = true
+dybw-proto.workspace = true
