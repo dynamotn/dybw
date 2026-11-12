@@ -263,13 +263,18 @@ fn entry(name: &str, value: &str) -> Entry {
     Entry { name: name.to_owned(), value: Secret::new(value.to_owned()) }
 }
 
-/// Every value of the item that is present: properties, every URI, the notes, then the custom fields.
+/// Every value of the item that is present: the main value first (what `get` prints, as rbw does), then the other
+/// properties, every URI, the notes, then the custom fields.
 fn full(item: &Item) -> Vec<Entry> {
-    let mut out: Vec<Entry> = props(item).into_iter().filter_map(|(_, cli, v)| Some(entry(cli, text(v)?))).collect();
+    let (main, value) = primary(item);
+    let mut out: Vec<Entry> = value.iter().map(|v| entry(main, v)).collect();
+    out.extend(
+        props(item).into_iter().filter(|(_, cli, _)| *cli != main).filter_map(|(_, cli, v)| Some(entry(cli, text(v)?))),
+    );
     if let Data::Login(l) = &item.data {
         out.extend(l.uris.iter().filter_map(|u| Some(entry("uri", text(&u.uri)?))));
     }
-    out.extend(text(&item.notes).map(|n| entry("notes", n)));
+    out.extend(text(&item.notes).filter(|_| main != "notes").map(|n| entry("notes", n)));
     out.extend(item.fields.iter().filter_map(|f| Some(entry(text(&f.name).unwrap_or_default(), text(&f.value)?))));
     out
 }

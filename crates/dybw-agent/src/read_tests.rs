@@ -286,8 +286,8 @@ async fn get_full_lists_every_value_present() {
     assert_eq!(
         got,
         [
-            ("user", "me@example.invalid"),
             ("password", "pw-ünï-😀"),
+            ("user", "me@example.invalid"),
             ("totp", "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP"),
             ("uri", "https://a.example.invalid"),
             ("uri", "https://b.example.invalid"),
@@ -303,6 +303,19 @@ async fn get_full_lists_every_value_present() {
     let Reply::Full { entries } = value_of(&agent, &host, "u1", Select::Full).await else { panic!() };
     let got: Vec<_> = entries.iter().map(|e| (e.name.as_str(), e.value.expose())).collect();
     assert_eq!(got, [("notes", "a type from a newer server"), ("iban", "XX00 0000")]);
+}
+
+#[tokio::test]
+async fn get_full_starts_with_the_value_get_prints() {
+    let (_dir, agent, host) = setup(|_| {}).await;
+    for (id, first, plain) in [
+        ("k1", "number", "4111111111111111"),
+        ("s1", "public-key", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI deploy@example.invalid"),
+    ] {
+        let Reply::Full { entries } = value_of(&agent, &host, id, Select::Full).await else { panic!() };
+        assert_eq!((entries[0].name.as_str(), entries[0].value.expose()), (first, plain), "{id}");
+        assert_eq!(entries.iter().filter(|e| e.name == first).count(), 1, "{id}: once");
+    }
 }
 
 #[tokio::test]
