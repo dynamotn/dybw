@@ -20,13 +20,17 @@ pub fn socket_dir(var: &dyn Fn(&str) -> Option<OsString>, uid: u32) -> PathBuf {
     }
 }
 
-/// Create `dir` 0700 if it is missing, then require that it is a real directory (not a symlink), owned by `uid`
-/// and closed to group and others.
-fn ensure_dir(dir: &Path, uid: u32) -> anyhow::Result<()> {
+/// Create `dir` 0700 if it is missing, then [`check_dir`] it.
+pub fn ensure_dir(dir: &Path, uid: u32) -> anyhow::Result<()> {
     match DirBuilder::new().mode(0o700).create(dir) {
         Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(e).context(format!("create {}", dir.display())),
         _ => {}
     }
+    check_dir(dir, uid)
+}
+
+/// Require that `dir` is a real directory (not a symlink), owned by `uid` and closed to group and others.
+pub fn check_dir(dir: &Path, uid: u32) -> anyhow::Result<()> {
     let meta = std::fs::symlink_metadata(dir).context(format!("stat {}", dir.display()))?;
     let shown = dir.display();
     ensure!(!meta.file_type().is_symlink(), "{shown} is a symbolic link");

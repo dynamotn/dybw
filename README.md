@@ -11,6 +11,9 @@ The `dybw` command line client and the `dybw-agent` that holds the vault session
 | `dybw-agent` | The agent (lib + bin), prints its version for now |
 | `dybw` | The client binary, `--version` for now |
 
+An agent started by `dybw` on demand inherits the environment of the first caller (`XDG_*`, `RUST_LOG`) and logs to
+`agent.log` in its socket directory.
+
 ## Build and test
 
 ```sh

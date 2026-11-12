@@ -131,6 +131,9 @@ enum Fail {
     Client(#[from] ClientError),
     #[error("{}", agent_text(.0))]
     Agent(AgentError),
+    /// A safety check refused the unlock; `log` names the log of the agent this command started.
+    #[error("the {check} check refused the unlock; see {}", .log.as_ref().map_or("the agent log".into(), |p| p.display().to_string()))]
+    Refused { check: String, log: Option<std::path::PathBuf> },
     #[error("the agent sent a reply that does not fit the request")]
     Unexpected,
     #[error("cannot write the output: {0}")]
@@ -143,7 +146,6 @@ fn agent_text(e: &AgentError) -> String {
         AgentError::Denied => "denied".into(),
         AgentError::Locked => "the vault is locked (run `dybw unlock`)".into(),
         AgentError::NotLoggedIn => "the profile is not logged in (run `dybw login`)".into(),
-        // Display of `Refused` already says to see the agent log.
         other => other.to_string(),
     }
 }
@@ -151,6 +153,9 @@ fn agent_text(e: &AgentError) -> String {
 /// Send `op`; an error reply becomes a failure.
 fn ask(env: &Env, op: Op, autostart: bool) -> Result<Option<Reply>, Fail> {
     match client::call(env, op, autostart)? {
+        Some(Reply::Error { error: AgentError::Refused(check) }) => {
+            Err(Fail::Refused { check, log: env.started_log.borrow().clone() })
+        }
         Some(Reply::Error { error }) => Err(Fail::Agent(error)),
         other => Ok(other),
     }
@@ -275,7 +280,7 @@ fn items(out: &mut dyn Write, reply: Reply, fields: &[Field], raw: bool) -> Resu
         writeln!(out, "{}", Value::Array(rows))?;
     } else {
         for item in &items {
-            let cells: Vec<&str> = fields.iter().map(|f| cell(item, *f).unwrap_or("")).collect();
+            let cells: Vec<String> = fields.iter().map(|f| escape(cell(item, *f).unwrap_or(""))).collect();
             writeln!(out, "{}", cells.join("\t"))?;
         }
     }
@@ -290,6 +295,19 @@ fn cell(item: &ItemSummary, field: Field) -> Option<&str> {
         Field::Folder => item.folder.as_deref(),
         Field::Type => item.kind.as_deref(),
     }
+}
+
+/// Control characters (tab and newline included) as `\xNN`: an item name must not forge columns, rows or terminal
+/// escapes in text output.
+fn escape(text: &str) -> String {
+    text.chars().fold(String::new(), |mut s, c| {
+        if c.is_control() {
+            s.push_str(&format!("\\x{:02x}", u32::from(c)));
+        } else {
+            s.push(c);
+        }
+        s
+    })
 }
 
 /// The requested fields of one item (`id` always), null when the item has none.
@@ -310,7 +328,8 @@ fn report(err: &mut dyn Write, fail: &Fail) {
     let _ = writeln!(err, "dybw: {fail}");
     if let Fail::Agent(AgentError::Ambiguous { candidates }) = fail {
         for c in candidates {
-            let _ = writeln!(err, "{}\t{}\t{}", c.id, c.name, c.user.as_deref().unwrap_or(""));
+            let user = c.user.as_deref().unwrap_or("");
+            let _ = writeln!(err, "{}\t{}\t{}", escape(&c.id), escape(&c.name), escape(user));
         }
     }
 }

@@ -33,16 +33,22 @@ fn env_in(base: &Path, profile: Option<&'static str>, exe_dir: Option<PathBuf>) 
             "DYBW_PROFILE" => profile.map(Into::into),
             _ => None,
         }),
-        uid: 501,
+        uid: euid(),
         exe_dir,
         start_wait: Duration::from_secs(3),
+        started_log: Default::default(),
     }
+}
+
+fn euid() -> u32 {
+    rustix::process::geteuid().as_raw()
 }
 
 /// A short base path: a socket path is limited to about 100 bytes.
 fn base() -> tempfile::TempDir {
     let base = tempfile::Builder::new().prefix("d").tempdir_in("/tmp").unwrap();
     std::fs::create_dir(base.path().join("dybw")).unwrap();
+    std::fs::set_permissions(base.path().join("dybw"), PermissionsExt::from_mode(0o700)).unwrap();
     base
 }
 
@@ -516,6 +522,10 @@ fn a_start_that_fails_is_reported() {
         let (code, out, err) = run_in(&env, &["unlock"]);
         assert_eq!((code, out.as_str()), (1, ""));
         assert!(err.starts_with("dybw: cannot start the agent: ") && err.contains(expect), "{err}");
+        if expect.contains("exited") || expect.contains("no answer") {
+            let log = base.path().join("dybw/agent.log");
+            assert!(err.trim_end().ends_with(&format!("see {}", log.display())), "{err}");
+        }
     };
     run(None, Duration::from_secs(1), "cannot locate the dybw executable");
     let empty = tempfile::tempdir().unwrap();
@@ -554,4 +564,147 @@ fn the_real_environment_reads_the_process() {
     assert!(env.exe_dir.is_some());
     assert_eq!(env.start_wait, START_WAIT);
     assert_eq!((env.var)("PATH"), std::env::var_os("PATH"));
+}
+
+#[test]
+fn the_executable_directory_is_the_real_one_behind_a_symlink() {
+    let real = tempfile::tempdir().unwrap();
+    let links = tempfile::tempdir().unwrap();
+    std::fs::write(real.path().join("dybw"), "").unwrap();
+    let link = links.path().join("rbw");
+    std::os::unix::fs::symlink(real.path().join("dybw"), &link).unwrap();
+    assert_eq!(client::exe_dir_of(Ok(link)), Some(std::fs::canonicalize(real.path()).unwrap()));
+    assert_eq!(client::exe_dir_of(Err(std::io::ErrorKind::NotFound.into())), None);
+    assert_eq!(client::exe_dir_of(Ok(real.path().join("missing"))), None);
+}
+
+#[test]
+fn an_agent_that_exits_but_answers_a_moment_later_is_still_awaited() {
+    let bin = agent_script("exit 1");
+    let base = base();
+    let back = base.path().join("dybw/agent.sock");
+    let listener = UnixListener::bind(&back).unwrap();
+    let hidden = base.path().join("dybw/hidden");
+    std::fs::rename(&back, &hidden).unwrap();
+    let marker = bin.path().join("started");
+    let f = std::thread::spawn(move || {
+        while !marker.exists() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Well after the script exited, inside the grace.
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::rename(hidden, back).unwrap();
+        serve(listener, vec![Act::Reply(Reply::Done)]).join().unwrap()
+    });
+    let env = env_in(base.path(), None, Some(bin.path().into()));
+    assert_eq!(run_in(&env, &["unlock"]).0, 0);
+    assert_eq!(f.join().unwrap(), [Op::Unlock { profile: None }]);
+}
+
+#[test]
+fn a_started_agent_logs_to_a_private_file_and_a_refusal_names_it() {
+    let bin = agent_script("echo to-stdout; echo to-stderr >&2; sleep 2");
+    let base = base();
+    let sock = base.path().join("dybw/agent.sock");
+    let marker = bin.path().join("started");
+    let agent = std::thread::spawn(move || {
+        while !marker.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        serve(
+            UnixListener::bind(sock).unwrap(),
+            vec![Act::Reply(Reply::Error { error: AgentError::Refused(s("kdf-downgrade")) })],
+        )
+    });
+    let env = env_in(base.path(), None, Some(bin.path().into()));
+    let (code, _, err) = run_in(&env, &["unlock"]);
+    agent.join().unwrap().join().unwrap();
+    let log = base.path().join("dybw/agent.log");
+    assert_eq!(code, 1);
+    assert_eq!(err, format!("dybw: the kdf-downgrade check refused the unlock; see {}\n", log.display()));
+    assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+    std::thread::sleep(Duration::from_millis(200));
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("to-stdout") && text.contains("to-stderr"), "{text}");
+}
+
+#[test]
+fn a_symlinked_log_is_refused_and_no_agent_is_started() {
+    let bin = agent_script("sleep 1");
+    let base = base();
+    let target = base.path().join("elsewhere");
+    std::fs::write(&target, "").unwrap();
+    std::os::unix::fs::symlink(&target, base.path().join("dybw/agent.log")).unwrap();
+    let env = env_in(base.path(), None, Some(bin.path().into()));
+    let (code, _, err) = run_in(&env, &["unlock"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("cannot open the agent log"), "{err}");
+    assert!(!started(&bin));
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "");
+}
+
+#[test]
+fn an_unsafe_socket_directory_is_refused_before_anything_is_sent() {
+    let bin = agent_script("sleep 1");
+    for autostart in [&["unlock"][..], &["unlocked"]] {
+        let base = base();
+        let dir = base.path().join("dybw");
+        std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o755)).unwrap();
+        let env = env_in(base.path(), None, Some(bin.path().into()));
+        let (code, _, err) = run_in(&env, autostart);
+        assert_eq!(code, 1);
+        assert!(err.contains("unsafe socket directory") && err.contains("open to other users"), "{err}");
+
+        std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o700)).unwrap();
+        let mut other = env_in(base.path(), None, Some(bin.path().into()));
+        other.uid = euid() + 1;
+        assert!(run_in(&other, autostart).2.contains("not owned by this user"));
+
+        std::fs::remove_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(base.path(), &dir).unwrap();
+        assert!(run_in(&env, autostart).2.contains("symbolic link"));
+    }
+    assert!(!started(&bin));
+}
+
+#[test]
+fn a_missing_socket_directory_means_no_agent_and_is_made_for_a_start() {
+    let base = tempfile::Builder::new().prefix("d").tempdir_in("/tmp").unwrap();
+    let env = env_in(base.path(), None, None);
+    assert_eq!(run_in(&env, &["unlocked"]).0, 1);
+    assert!(!base.path().join("dybw").exists());
+    // A start makes it 0700 (then fails here for want of an executable).
+    assert!(run_in(&env, &["unlock"]).2.contains("cannot locate"));
+    assert_eq!(std::fs::metadata(base.path().join("dybw")).unwrap().permissions().mode() & 0o777, 0o700);
+}
+
+#[test]
+fn text_output_escapes_control_characters_but_get_and_raw_do_not() {
+    let nasty = ItemSummary { name: Some(s("a\tb\nc\x1b[31m")), user: Some(s("u\r")), ..item("1", "x", None) };
+    let (r, _) = one(&["list", "--fields", "name,user"], Reply::Items { items: vec![nasty.clone()] });
+    assert_eq!(r.1, "a\\x09b\\x0ac\\x1b[31m\tu\\x0d\n");
+    let (r, _) = one(&["list", "--raw", "--fields", "name"], Reply::Items { items: vec![nasty] });
+    assert!(r.1.contains("\\u001b") && r.1.contains("\\n"), "{}", r.1);
+    let (r, _) = one(&["get", "n"], Reply::Value { value: secret("p\tw") });
+    assert_eq!(r.1, "p\tw\n");
+    let c = Candidate { id: s("i\td"), name: s("n\nm"), user: Some(s("\x1bu")) };
+    let (r, _) = one(&["get", "n"], Reply::Error { error: AgentError::Ambiguous { candidates: vec![c] } });
+    assert_eq!(r.2, "dybw: several items match\ni\\x09d\tn\\x0am\t\\x1bu\n");
+}
+
+#[test]
+fn a_connection_the_agent_cut_off_reads_as_closed() {
+    use std::io::ErrorKind::*;
+    for kind in [UnexpectedEof, BrokenPipe, ConnectionReset] {
+        assert!(matches!(client::gone(kind.into()), ClientError::Closed), "{kind:?}");
+    }
+    assert!(matches!(client::gone(PermissionDenied.into()), ClientError::Io(_)));
+}
+
+#[test]
+fn an_existing_directory_without_a_socket_is_no_agent() {
+    let base = base();
+    let env = env_in(base.path(), None, None);
+    assert_eq!(run_in(&env, &["unlocked"]), (1, s(""), s("")));
+    assert_eq!(run_in(&env, &["agent", "stop"]), (0, s(""), s("")));
 }
