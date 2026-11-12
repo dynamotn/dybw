@@ -357,13 +357,42 @@ async fn get_raw_is_the_decrypted_item_as_json() {
 }
 
 #[tokio::test]
-async fn list_fields_names_the_custom_fields_with_no_prompt() {
+async fn list_fields_names_the_custom_fields_after_a_confirmation_like_any_value() {
     let (_dir, agent, host) = setup(|_| {}).await;
-    let reply = agent.dispatch(get_op("c1", Select::ListFields)).await;
+    assert_eq!(agent.dispatch(get_op("c1", Select::ListFields)).await, err(AgentError::Denied));
+    assert_eq!(agent.opens("work").await, 0, "a no opens nothing");
+    let reply = allowed(&agent, &host, get_op("c1", Select::ListFields)).await;
     assert_eq!(reply, Reply::FieldNames { names: ["text", "hidden", "flag", "linked", ""].map(String::from).to_vec() });
-    assert!(host.world().confirmed.is_empty(), "names are not values");
+    assert_eq!(
+        host.world().confirmed[1],
+        format!("dybw profile work: allow reading the field names of the item \"{MAIL}\"?")
+    );
     assert_eq!(agent.opens("work").await, 1);
-    assert_eq!(agent.dispatch(get_op("c2", Select::ListFields)).await, Reply::FieldNames { names: vec![] });
+    assert_eq!(allowed(&agent, &host, get_op("c2", Select::ListFields)).await, Reply::FieldNames { names: vec![] });
+}
+
+#[tokio::test]
+async fn an_item_that_changed_while_the_user_was_asked_is_denied_and_not_opened() {
+    let (_dir, agent, host) = setup(|_| {}).await;
+    host.world().confirms.push_back(Answer::Held);
+    let task = tokio::spawn({
+        let agent = agent.clone();
+        async move { agent.dispatch(get_op("c2", Select::Password)).await }
+    });
+    until(|| host.world().confirmed.len() == 1).await;
+    // A sync during the question gives c2 another name (c3's): the answer was about the old one.
+    let mut vault: Value = serde_json::from_str(VAULT).unwrap();
+    let list = vault["ciphers"].as_array_mut().unwrap();
+    let other = list.iter().find(|c| c["id"] == "c3").unwrap()["name"].clone();
+    list.iter_mut().for_each(|c| c["reprompt"] = json!(0));
+    list.iter_mut().find(|c| c["id"] == "c2").unwrap()["name"] = other;
+    host.vault(&vault.to_string());
+    assert_eq!(agent.dispatch(Op::Sync { target: Target::Profile("work".into()) }).await, Reply::Done);
+    host.world().release.notify_one();
+    assert_eq!(task.await.unwrap(), err(AgentError::Denied));
+    assert_eq!(agent.opens("work").await, 0);
+    // Asked again, about what it is now, it opens.
+    assert_eq!(text(value_of(&agent, &host, "c2", Select::Field("name".into())).await), "");
 }
 
 #[tokio::test]
@@ -507,8 +536,8 @@ async fn a_reprompt_item_gives_no_value_and_no_question_until_p43_but_its_name_a
     assert_eq!(agent.dispatch(history_op(MAIL)).await, err(AgentError::Denied));
     assert!(host.world().confirmed.is_empty(), "the question is not even shown");
     assert_eq!(agent.opens("work").await, 0);
-    let names = agent.dispatch(get_op("c1", Select::ListFields)).await;
-    assert!(matches!(names, Reply::FieldNames { ref names } if names.len() == 5), "{names:?}");
+    host.allow();
+    assert_eq!(agent.dispatch(get_op("c1", Select::ListFields)).await, err(AgentError::Denied));
     let rows = items(agent.dispatch(list_op(&[Field::Name], None)).await);
     assert!(rows.iter().any(|r| r.id == "c1"));
     assert_eq!(text(value_of(&agent, &host, "n1", Select::Password).await), "the note's text", "others are unaffected");
@@ -540,10 +569,7 @@ async fn organization_items_read_like_personal_ones_with_the_organizations_unloc
     // The vectors' o1 and o2 ask for a reprompt.
     host.allow();
     assert_eq!(agent.dispatch(org(get_op("o1", Select::Password))).await, err(AgentError::Denied));
-    assert_eq!(
-        agent.dispatch(org(get_op("o2", Select::ListFields))).await,
-        Reply::FieldNames { names: vec!["pin".into()] }
-    );
+    assert_eq!(agent.dispatch(org(get_op("o2", Select::ListFields))).await, err(AgentError::Denied));
 }
 
 #[tokio::test]

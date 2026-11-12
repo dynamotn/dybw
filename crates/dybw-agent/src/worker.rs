@@ -347,6 +347,7 @@ fn ask_text(ctx: &Ctx, found: &Found, select: Option<&Select>) -> String {
         Some(Select::Field(name)) => format!("its field \"{}\"", tidy(name)),
         Some(Select::Full) => "the full item (every value)".to_owned(),
         Some(Select::Raw) => "the raw item as JSON".to_owned(),
+        Some(Select::ListFields) => "the field names".to_owned(),
         Some(_) => "its main value (password, notes, number or public key)".to_owned(),
         None => "its password history".to_owned(),
     };
@@ -354,20 +355,21 @@ fn ask_text(ctx: &Ctx, found: &Found, select: Option<&Select>) -> String {
 }
 
 /// `get` and `history`: find the item from its summary (a missing or ambiguous one ends here, with no prompt), get
-/// the user's yes (the value gate: a no or a timeout is `Denied`, and nothing was opened), and only then open the
-/// item, build the reply and drop it. A lock during the wait cancels this task.
+/// the user's yes (the value gate: a no or a timeout is `Denied`, and nothing was opened), check the item is still
+/// the one asked about, and only then open it, build the reply and drop it. A lock during the wait cancels this task.
 async fn get<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, find: Lookup, select: Option<Select>) -> Reply {
     let found = match with_vault(shared, |v| read::find(v, &find)) {
         Ok(found) => found,
         Err(e) => return error(e),
     };
-    // Names of custom fields are not values: no prompt.
-    if !matches!(select, Some(Select::ListFields)) {
-        if found.reprompt {
-            // Until P4.3 can ask for the master password again, a reprompt item gives no value and no question.
-            tracing::warn!(profile = %ctx.profile.name, id = %found.id, "value request denied: the item needs a reprompt (P4.3)");
-            return error(AgentError::Denied);
-        }
+    // TODO(core): field_names, a names-only decrypt; until then `--list-fields` opens the whole item, so it is a
+    // value request like any other.
+    if found.reprompt {
+        // Until P4.3 can ask for the master password again, a reprompt item gives no value and no question.
+        tracing::warn!(profile = %ctx.profile.name, id = %found.id, "value request denied: the item needs a reprompt (P4.3)");
+        return error(AgentError::Denied);
+    }
+    {
         let _one_at_a_time = shared.asking.lock().await;
         let answer = session::confirm(host, &ask_text(ctx, &found, select.as_ref())).await;
         tracing::info!(profile = %ctx.profile.name, id = %found.id, allowed = answer.is_ok(), "value request");
@@ -375,9 +377,17 @@ async fn get<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, find: Lookup, select
             return error(e);
         }
     }
-    let read = |v: &UnlockedVault| match &select {
-        Some(select) => read::value(v, &found.id, select),
-        None => read::history(v, &found.id),
+    let read = |v: &UnlockedVault| {
+        // The user answered about this item: it must still be the same one (a sync may have run meanwhile).
+        let now = read::find(v, &Lookup { needle: found.id.clone(), user: None, folder: None, ignorecase: false });
+        if now.as_ref().ok() != Some(&found) {
+            tracing::warn!(profile = %ctx.profile.name, id = %found.id, "the item changed while the user was asked");
+            return Err(AgentError::Denied);
+        }
+        match &select {
+            Some(select) => read::value(v, &found.id, select),
+            None => read::history(v, &found.id),
+        }
     };
     with_vault(shared, read).unwrap_or_else(error)
 }

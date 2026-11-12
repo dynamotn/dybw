@@ -24,10 +24,11 @@ pub struct Lookup {
 }
 
 /// The one item a lookup found: what the confirmation shows, never a value.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Found {
     pub id: String,
     pub name: String,
+    pub user: Option<String>,
     /// The cipher asks for the master password again (`reprompt`, a plain field): P4.3 supports that.
     pub reprompt: bool,
 }
@@ -121,6 +122,7 @@ pub fn find(vault: &UnlockedVault, q: &Lookup) -> Result<Found, AgentError> {
     let found = |(c, s): &(&Value, Summary)| Found {
         id: s.id.clone(),
         name: s.name.to_string(),
+        user: s.user.as_deref().cloned(),
         reprompt: c.get("reprompt").and_then(Value::as_u64).is_some_and(|r| r != 0),
     };
     let rows = summaries(vault);
@@ -369,7 +371,7 @@ impl Serialize for RawItem<'_> {
     }
 }
 
-/// What `get` was asked for, after the value gate (`ListFields` needs none: names are not values).
+/// What `get` was asked for, after the value gate.
 pub fn value(vault: &UnlockedVault, id: &str, select: &Select) -> Result<Reply, AgentError> {
     let item = item_of(vault, id)?;
     let value = |v: &str| Reply::Value { value: Secret::new(v.to_owned()) };

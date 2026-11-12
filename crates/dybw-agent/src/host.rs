@@ -88,6 +88,8 @@ pub(crate) mod fake {
         Timeout,
         /// Never answers: the user has walked away.
         Hang,
+        /// A confirmation that says yes once `World::release` is notified.
+        Held,
     }
 
     pub struct World {
@@ -121,6 +123,8 @@ pub(crate) mod fake {
         pub confirms: VecDeque<Answer>,
         /// Every confirmation asked.
         pub confirmed: Vec<String>,
+        /// What an `Answer::Held` confirmation waits for.
+        pub release: Arc<tokio::sync::Notify>,
     }
 
     impl World {
@@ -151,6 +155,7 @@ pub(crate) mod fake {
                 profile: None,
                 confirms: VecDeque::new(),
                 confirmed: Vec::new(),
+                release: Arc::new(tokio::sync::Notify::new()),
             })))
         }
 
@@ -253,16 +258,16 @@ pub(crate) mod fake {
                 Answer::Cancel => Ok(None),
                 Answer::Fail => Err(PromptError::Protocol("scripted".into())),
                 Answer::Timeout => Err(PromptError::Timeout),
-                Answer::Hang => std::future::pending().await,
+                Answer::Hang | Answer::Held => std::future::pending().await,
             }
         }
 
         #[expect(clippy::unwrap_used, reason = "tests")]
         async fn confirm(&self, description: &str) -> Result<bool, PromptError> {
-            let answer = {
+            let (answer, release) = {
                 let mut w = self.0.lock().unwrap();
                 w.confirmed.push(description.to_owned());
-                w.confirms.pop_front().unwrap_or(Answer::Cancel)
+                (w.confirms.pop_front().unwrap_or(Answer::Cancel), w.release.clone())
             };
             match answer {
                 Answer::Text(_) => Ok(true),
@@ -270,6 +275,10 @@ pub(crate) mod fake {
                 Answer::Fail => Err(PromptError::Protocol("scripted".into())),
                 Answer::Timeout => Err(PromptError::Timeout),
                 Answer::Hang => std::future::pending().await,
+                Answer::Held => {
+                    release.notified().await;
+                    Ok(true)
+                }
             }
         }
 
