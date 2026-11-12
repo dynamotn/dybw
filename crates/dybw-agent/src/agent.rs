@@ -192,13 +192,29 @@ impl Agent {
             self.audit.record(event);
             Reply::Error { error: AgentError::Denied }
         };
-        if let Some(s) = sensitive
+        if let Some(s) = sensitive.clone()
             && !self.resolver.recheck(who)
         {
             return changed(s);
         }
-        // The worker checks the peer again once the user has answered, right before it opens anything.
-        self.serve(op, who).await
+        // The worker checks the peer again once the user has answered, right before it opens anything; and once more
+        // here, right before a value is handed back to be written.
+        let reply = self.serve(op, who).await;
+        let holds_value = matches!(
+            reply,
+            Reply::Value { .. }
+                | Reply::Full { .. }
+                | Reply::Raw { .. }
+                | Reply::FieldNames { .. }
+                | Reply::History { .. }
+        );
+        if let Some(s) = sensitive
+            && holds_value
+            && !self.resolver.recheck(who)
+        {
+            return changed(s);
+        }
+        reply
     }
 
     async fn serve(&self, op: Op, who: &Resolved) -> Reply {
@@ -439,6 +455,14 @@ pub(crate) mod testing {
     /// An agent over [`CONFIG`], with the fake clock, the scripted host, a fake process table and every path under
     /// `dir`.
     pub fn rig(dir: &std::path::Path) -> Rig {
+        rig_with(dir, |tree| tree)
+    }
+
+    /// `rig` with the resolver reading the process table through `wrap`.
+    pub fn rig_with(
+        dir: &std::path::Path,
+        wrap: impl FnOnce(Arc<dybw_peer::Fake>) -> Arc<dyn dybw_peer::ProcessSource>,
+    ) -> Rig {
         let file = dir.join("config.toml");
         std::fs::write(&file, CONFIG).unwrap();
         let state = dir.join("state");
@@ -456,7 +480,7 @@ pub(crate) mod testing {
         let tree = Arc::new(dybw_peer::Fake::default());
         tree.set_peer(peer());
         tree.add(100, process(100));
-        let resolver = Arc::new(Resolver::new(tree.clone(), crate::caller::Harnesses::default()));
+        let resolver = Arc::new(Resolver::new(wrap(tree.clone()), crate::caller::Harnesses::default()));
         let audit = Arc::new(Recorder::default());
         let user = User { uid: me(), groups: None };
         let config = Config::load(&file).unwrap();

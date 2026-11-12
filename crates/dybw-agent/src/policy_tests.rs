@@ -10,7 +10,7 @@ use std::sync::Arc;
 use dybw_proto::{AgentError, Field, Op, PolicyAction, PolicyEntry, PolicyRule, Reply, Select};
 use serde_json::{Value, json};
 
-use crate::agent::testing::{Rig, process, rig, unlock};
+use crate::agent::testing::{Rig, process, rig, rig_with, unlock};
 use crate::caller::{Caller, Via, hash_of};
 use crate::host::fake::Answer;
 use crate::policy::Verdict;
@@ -470,4 +470,34 @@ async fn a_request_over_a_socket_is_resolved_at_accept_and_an_orphan_is_asked_ab
     assert_eq!(text(reply), "the note's text");
     assert!(rig.host.world().confirmed[0].contains("detached or unknown caller"));
     assert!(matches!(rig.audit.events()[0].caller, Caller::Unknown { .. }));
+}
+
+/// A process table that stops vouching for the peer after `n` questions about it.
+struct Flips(Arc<dybw_peer::Fake>, std::sync::atomic::AtomicUsize, usize);
+
+impl dybw_peer::ProcessSource for Flips {
+    fn peer_of(&self, sock: std::os::fd::BorrowedFd<'_>) -> Result<dybw_peer::Peer, dybw_peer::Error> {
+        self.0.peer_of(sock)
+    }
+    fn process(&self, pid: u32) -> Result<dybw_peer::Process, dybw_peer::Error> {
+        self.0.process(pid)
+    }
+    fn still_same(&self, peer: &dybw_peer::Peer) -> bool {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < self.2 && self.0.still_same(peer)
+    }
+}
+
+#[tokio::test]
+async fn a_peer_that_goes_after_the_worker_opened_the_item_still_gets_no_value() {
+    let dir = tempfile::tempdir().unwrap();
+    // Three checks of a get: before the request, after the answer (worker), and before the reply is written.
+    let rig = rig_with(dir.path(), |tree| Arc::new(Flips(tree, Default::default(), 2)));
+    let mut vault: Value = serde_json::from_str(VAULT).unwrap();
+    vault["ciphers"].as_array_mut().unwrap().iter_mut().for_each(|c| c["reprompt"] = json!(0));
+    rig.host.vault(&vault.to_string());
+    unlock(&rig.agent, &rig.host, "work").await;
+    rig.host.allow();
+    assert_eq!(password(&rig, tool("/opt/a.sh", "h1")).await, err(AgentError::Denied));
+    assert_eq!(rig.agent.opens("work").await, 1, "it was opened, and the reply was withheld");
+    assert_eq!(verdicts(&rig), [Verdict::Confirmed, Verdict::Denied]);
 }
