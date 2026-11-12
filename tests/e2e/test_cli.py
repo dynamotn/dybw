@@ -267,9 +267,24 @@ def test_lock(world, account):
     ensure_unlocked(world, account)
     assert world("lock").returncode == 0
     assert world("unlocked").returncode == 1
+    # A read on a locked profile unlocks first (profiles.md section 4); the user cancels the password question:
+    # a denial, nothing confirmed, still locked.
+    Path("/tmp/fake-pinentry.log").unlink(missing_ok=True)
     r = world("get", "login-item", confirm="always")
-    assert r.returncode == 1 and "locked" in r.stderr and r.stdout == ""
+    assert r.returncode == 1 and "denied" in r.stderr and r.stdout == ""
+    assert "CONFIRM" not in Path("/tmp/fake-pinentry.log").read_text()
+    assert world("unlocked").returncode == 1
     assert world("list").returncode == 1
+
+
+def test_locked_profile_get_unlocks_first(world, account):
+    world("lock")
+    Path("/tmp/fake-pinentry.log").unlink(missing_ok=True)
+    r = world("get", "login-item", pins=[account.password], confirm="once")
+    assert r.returncode == 0 and r.stdout == "login-pw\n", (r.stderr, world.log.read_text())
+    log = Path("/tmp/fake-pinentry.log").read_text()
+    assert log.count("GETPIN") == 1 and "CONFIRM" in log
+    assert world("unlocked").returncode == 0
 
 
 def test_offline_unlock_from_the_cache(world, account):
