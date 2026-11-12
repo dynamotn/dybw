@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 
 use crate::config::{Config, Profile};
 use crate::paths::ProfilePaths;
+use crate::read::Lookup;
 use crate::session::Ctx;
 use crate::worker::{Cmd, Worker};
 
@@ -158,8 +159,29 @@ impl Agent {
                 self.each(|| Cmd::Lock).await;
                 Reply::Done
             }
+            Op::List { profile, fields, folder } => {
+                self.on_profile(profile.as_deref(), Cmd::List { fields, folder }).await
+            }
+            Op::Search { profile, term, folder, fields } => {
+                self.on_profile(profile.as_deref(), Cmd::Search { term, folder, fields }).await
+            }
+            Op::Get { profile, needle, user, folder, ignorecase, select } => {
+                let find = Lookup { needle, user, folder, ignorecase };
+                self.on_profile(profile.as_deref(), Cmd::Get { find, select }).await
+            }
+            Op::History { profile, needle, user, folder } => {
+                let find = Lookup { needle, user, folder, ignorecase: false };
+                self.on_profile(profile.as_deref(), Cmd::History { find }).await
+            }
             _ => Reply::Error { error: AgentError::Internal },
         }
+    }
+
+    /// Test only: how many items the profile's worker has opened.
+    #[cfg(test)]
+    pub(crate) async fn opens(&self, profile: &str) -> usize {
+        let Reply::Value { value } = self.on_profile(Some(profile), Cmd::Opens).await else { return usize::MAX };
+        value.expose().parse().unwrap_or(usize::MAX)
     }
 
     async fn on_profile(&self, name: Option<&str>, cmd: Cmd) -> Reply {
@@ -380,8 +402,7 @@ mod tests {
         let (agent, _) = agent(dir.path());
         let nope = Op::Status { profile: Some("nope".into()) };
         assert_eq!(agent.dispatch(nope).await, Reply::Error { error: AgentError::Config });
-        let list = Op::List { profile: None, fields: vec![], folder: None };
-        assert_eq!(agent.dispatch(list).await, Reply::Error { error: AgentError::Internal });
+        assert_eq!(agent.dispatch(Op::Unknown).await, Reply::Error { error: AgentError::Internal });
         assert_eq!(agent.dispatch(Op::StopAgent).await, Reply::Done);
         // Only the connection handler stops the agent, after the reply is written.
         let stopped = tokio::time::timeout(Duration::from_millis(50), agent.stop.notified()).await;

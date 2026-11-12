@@ -7,6 +7,7 @@ pub mod device;
 pub mod hardening;
 pub mod host;
 pub mod paths;
+pub mod read;
 pub mod server;
 pub mod session;
 pub mod socket;
@@ -15,6 +16,8 @@ pub mod worker;
 
 #[cfg(test)]
 mod flow_tests;
+#[cfg(test)]
+mod read_tests;
 
 use std::sync::Arc;
 

@@ -6,21 +6,25 @@
 //! is never queued behind a pinentry or the network and cancels what is in flight. The state is behind a `RefCell`
 //! that is never borrowed across an await.
 //!
-//! Task 5 reaches the unlocked vault from a long command: take what it needs under a short `shared.state.borrow()`
-//! (`state.slot` is `Some(Session)` while unlocked, `Session::vault` is the core's `UnlockedVault`), drop the
-//! borrow, await (a confirmation prompt), and borrow again to decrypt. A `Lock` aborts the task at its next await,
-//! so nothing is installed or returned after it.
+//! The reads reach the unlocked vault under a short `shared.state.borrow()` (`state.slot` is `Some(Session)` while
+//! unlocked, `Session::vault` is the core's `UnlockedVault`). `list` and `search` are quick. `get` and `history`
+//! are long: find the item by its summary, drop the borrow, wait for the user's confirmation (the value gate),
+//! and only then borrow again to open it. A `Lock` aborts the task at its next await, so nothing is opened or
+//! returned after it.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use dybw_proto::{AgentError, ProfileStatus, Reply};
+use dybw_core::profile::UnlockedVault;
+use dybw_native::prompter::one_line;
+use dybw_proto::{AgentError, Field, ProfileStatus, Reply, Select};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 use crate::host::Host;
+use crate::read::{self, Found, Lookup};
 use crate::session::{self, Ctx, Session};
 
 /// How long `stop` waits for the thread: a worker that cannot end is left behind, and the process exit ends it.
@@ -41,8 +45,31 @@ pub enum Cmd {
     Lock,
     /// Lock when the profile has been idle for its lock timeout. Does not count as use.
     IdleCheck,
+    /// The names (and optionally users, folders, types) of every item.
+    List {
+        fields: Vec<Field>,
+        folder: Option<String>,
+    },
+    /// `List` for the items whose name or user has `term`.
+    Search {
+        term: String,
+        folder: Option<String>,
+        fields: Vec<Field>,
+    },
+    /// A value of one item, after the user confirmed (names of custom fields need no confirmation).
+    Get {
+        find: Lookup,
+        select: Select,
+    },
+    /// The previous passwords of one item, after the user confirmed.
+    History {
+        find: Lookup,
+    },
     /// Lock and end the thread.
     Exit,
+    /// Test only: how many items this worker has opened.
+    #[cfg(test)]
+    Opens,
     /// Test only: panic inside a command task.
     #[cfg(test)]
     Panic,
@@ -56,6 +83,8 @@ enum Long {
     Login,
     Unlock,
     Sync,
+    /// `Some` is a `get`, `None` the password history.
+    Read(Lookup, Option<Select>),
     #[cfg(test)]
     Panic,
 }
@@ -83,6 +112,8 @@ struct Shared {
     state: RefCell<State>,
     /// One login, unlock or sync at a time; a second waits (a periodic sync skips).
     op: tokio::sync::Mutex<()>,
+    /// One confirmation on the screen at a time: a second request waits for the first answer.
+    asking: tokio::sync::Mutex<()>,
 }
 
 /// The `Send` handle to a profile's worker thread.
@@ -191,6 +222,20 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
             lock(shared);
             return quick(reply, Reply::Done);
         }
+        Cmd::List { fields, folder } => {
+            let list = |v: &UnlockedVault| Ok(read::list(v, &fields, folder.as_deref(), None));
+            return quick(reply, with_vault(shared, list).unwrap_or_else(error));
+        }
+        Cmd::Search { term, folder, fields } => {
+            let search = |v: &UnlockedVault| Ok(read::list(v, &fields, folder.as_deref(), Some(&term)));
+            return quick(reply, with_vault(shared, search).unwrap_or_else(error));
+        }
+        Cmd::Get { find, select } => Long::Read(find, Some(select)),
+        Cmd::History { find } => Long::Read(find, None),
+        #[cfg(test)]
+        Cmd::Opens => {
+            return quick(reply, Reply::Value { value: dybw_proto::Secret::new(read::OPENS.get().to_string()) });
+        }
         Cmd::Exit => {
             lock(shared);
             let _ = reply.send(Reply::Done);
@@ -283,9 +328,53 @@ async fn run_long<H: Host>(shared: Rc<Shared>, host: Rc<H>, ctx: Rc<Ctx>, long: 
         }
         Long::Unlock => unlock(&shared, &*host, &ctx).await,
         Long::Sync => sync(&shared, &*host, &ctx, wait).await,
+        Long::Read(find, select) => get(&shared, &*host, &ctx, find, select).await,
         #[cfg(test)]
         Long::Panic => panic!("task panic for a test"),
     }
+}
+
+/// Run `f` on the unlocked vault; `Locked` when there is none.
+fn with_vault<T>(shared: &Shared, f: impl FnOnce(&UnlockedVault) -> Result<T, AgentError>) -> Result<T, AgentError> {
+    let st = shared.state.borrow();
+    f(&st.slot.as_ref().ok_or(AgentError::Locked)?.vault)
+}
+
+/// What the confirmation says is asked: the profile, the item's name and what is read, each on one line.
+fn ask_text(ctx: &Ctx, found: &Found, select: Option<&Select>) -> String {
+    let tidy = |s: &str| one_line(s).chars().take(80).collect::<String>();
+    let what = match select {
+        Some(Select::Field(name)) => format!("its field \"{}\"", tidy(name)),
+        Some(Select::Full) => "the full item (every value)".to_owned(),
+        Some(Select::Raw) => "the raw item as JSON".to_owned(),
+        Some(_) => "its main value (password, notes, number or public key)".to_owned(),
+        None => "its password history".to_owned(),
+    };
+    format!("dybw profile {}: allow reading {what} of the item \"{}\"?", ctx.profile.name, tidy(&found.name))
+}
+
+/// `get` and `history`: find the item from its summary (a missing or ambiguous one ends here, with no prompt), get
+/// the user's yes (the value gate: a no or a timeout is `Denied`, and nothing was opened), and only then open the
+/// item, build the reply and drop it. A lock during the wait cancels this task.
+async fn get<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, find: Lookup, select: Option<Select>) -> Reply {
+    let found = match with_vault(shared, |v| read::find(v, &find)) {
+        Ok(found) => found,
+        Err(e) => return error(e),
+    };
+    // Names of custom fields are not values: no prompt.
+    if !matches!(select, Some(Select::ListFields)) {
+        let _one_at_a_time = shared.asking.lock().await;
+        let answer = session::confirm(host, &ask_text(ctx, &found, select.as_ref())).await;
+        tracing::info!(profile = %ctx.profile.name, id = %found.id, allowed = answer.is_ok(), "value request");
+        if let Err(e) = answer {
+            return error(e);
+        }
+    }
+    let read = |v: &UnlockedVault| match &select {
+        Some(select) => read::value(v, &found.id, select),
+        None => read::history(v, &found.id),
+    };
+    with_vault(shared, read).unwrap_or_else(error)
 }
 
 async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx) -> Reply {

@@ -192,12 +192,14 @@ const LOG_SERVER_TEXT: usize = 200;
 /// cannot fill or forge log lines.
 fn describe(e: &ApiError) -> String {
     match e {
-        ApiError::Http { status, message } => {
-            let cut: String = one_line(message).chars().take(LOG_SERVER_TEXT).collect();
-            format!("HTTP {status} (server says: {cut})")
-        }
-        other => one_line(&other.to_string()).chars().take(LOG_SERVER_TEXT).collect(),
+        ApiError::Http { status, message } => format!("HTTP {status} (server says: {})", short(message)),
+        other => short(&other.to_string()),
     }
+}
+
+/// Text that came from the server (or a failed connection to it) on one line, cut for the log.
+fn short(text: &str) -> String {
+    one_line(text).chars().take(LOG_SERVER_TEXT).collect()
 }
 
 fn map_api(e: &ApiError) -> AgentError {
@@ -214,6 +216,19 @@ async fn ask<H: Host>(host: &H, description: &str, error: Option<&str>) -> Resul
     match host.password(description, error).await {
         Ok(Some(secret)) if !secret.is_empty() => Ok(secret),
         Ok(_) | Err(PromptError::Timeout) => Err(AgentError::Denied),
+        Err(e) => {
+            tracing::warn!("prompt: {e}");
+            Err(AgentError::Prompt)
+        }
+    }
+}
+
+/// Ask the user to allow one read of a value (the value gate). Only an explicit yes passes; a no, a cancel and a
+/// timeout are `Denied`, a prompt that could not be put is `Prompt`.
+pub async fn confirm<H: Host>(host: &H, text: &str) -> Result<(), AgentError> {
+    match host.confirm(text).await {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(PromptError::Timeout) => Err(AgentError::Denied),
         Err(e) => {
             tracing::warn!("prompt: {e}");
             Err(AgentError::Prompt)
@@ -376,7 +391,7 @@ async fn open<H: Host>(
         }
         // Only a network that is down: a 4xx or 5xx answer is the server speaking.
         Err(ProfileError::Api(ApiError::Network(why))) => {
-            tracing::info!(profile = %ctx.profile.name, "server unreachable ({why}); trying the offline copy");
+            tracing::info!(profile = %ctx.profile.name, "server unreachable ({}); trying the offline copy", short(&why));
             let cache = load_cache(ctx).ok_or(Refused::Failed(AgentError::Network))?;
             let cached = CachedSync { sync: cache.sync, prelogin_kdf: cache.kdf.map(Into::into), email: cache.email };
             profile::unlock_vault_cached(cached, &storage, &key.origin, password, kdf, rsa, orgs).await.map_err(refused)

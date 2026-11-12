@@ -6,7 +6,7 @@ use std::time::Duration;
 use dybw_core::ports::{Http, PortError};
 use dybw_native::config::Trust;
 use dybw_native::ports::http::HttpPort;
-use dybw_native::prompter::{PromptError, Prompter, SESSION_ENV};
+use dybw_native::prompter::{Confirm, PromptError, Prompter, SESSION_ENV};
 use zeroize::Zeroizing;
 
 /// How long the user has to answer one pinentry question.
@@ -20,6 +20,8 @@ pub trait Host: Send + 'static {
     fn http(&self) -> Result<Self::Http, PortError>;
     /// Ask for a secret; `None` is the user's cancel.
     async fn password(&self, description: &str, error: Option<&str>) -> Result<Option<Zeroizing<String>>, PromptError>;
+    /// Ask the user to allow something; `false` is the user's no.
+    async fn confirm(&self, description: &str) -> Result<bool, PromptError>;
     /// The machine's name, for the device name the server shows.
     fn hostname(&self) -> String;
 }
@@ -47,6 +49,13 @@ impl Host for RealHost {
     async fn password(&self, description: &str, error: Option<&str>) -> Result<Option<Zeroizing<String>>, PromptError> {
         match &self.prompter {
             Ok(p) => p.password(description, error).await,
+            Err(why) => Err(PromptError::Untrusted(why.clone())),
+        }
+    }
+
+    async fn confirm(&self, description: &str) -> Result<bool, PromptError> {
+        match &self.prompter {
+            Ok(p) => Ok(p.confirm(description, false).await? != Confirm::Deny),
             Err(why) => Err(PromptError::Untrusted(why.clone())),
         }
     }
@@ -102,6 +111,13 @@ pub(crate) mod fake {
         pub requests: Vec<String>,
         /// The `deviceName` of every login.
         pub device_names: Vec<String>,
+        /// The `ciphers` and `folders` JSON lists the `/sync` answer carries.
+        pub ciphers: String,
+        pub folders: String,
+        /// What the user does with each confirmation (`Text` allows; none left means no).
+        pub confirms: VecDeque<Answer>,
+        /// Every confirmation asked.
+        pub confirmed: Vec<String>,
     }
 
     impl World {
@@ -127,6 +143,10 @@ pub(crate) mod fake {
                 sync_marker: 0,
                 requests: Vec::new(),
                 device_names: Vec::new(),
+                ciphers: "[]".into(),
+                folders: "[]".into(),
+                confirms: VecDeque::new(),
+                confirmed: Vec::new(),
             })))
         }
 
@@ -137,6 +157,19 @@ pub(crate) mod fake {
 
         pub fn answer(&self, answer: Answer) {
             self.world().answers.push_back(answer);
+        }
+
+        pub fn allow(&self) {
+            self.world().confirms.push_back(Answer::Text("yes"));
+        }
+
+        /// The `ciphers` and `folders` of `/sync`, from a `{ciphers, folders}` JSON text.
+        #[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
+        pub fn vault(&self, json: &str) {
+            let v: serde_json::Value = serde_json::from_str(json).unwrap();
+            let mut w = self.world();
+            w.ciphers = v["ciphers"].to_string();
+            w.folders = v["folders"].to_string();
         }
     }
 
@@ -172,7 +205,8 @@ pub(crate) mod fake {
                     "/api/sync?excludeDomains=true" => {
                         let marker = w.sync_marker;
                         let body = format!(
-                            r#"{{"profile":{{"id":"u1","key":"{PROFILE_KEY}"}},"ciphers":[],"folders":[],"marker":{marker}}}"#
+                            r#"{{"profile":{{"id":"u1","key":"{PROFILE_KEY}"}},"ciphers":{},"folders":{},"marker":{marker}}}"#,
+                            w.ciphers, w.folders
                         );
                         (if w.sync_fails { 500 } else { 200 }, body, w.sync_hangs)
                     }
@@ -217,6 +251,22 @@ pub(crate) mod fake {
         }
 
         #[expect(clippy::unwrap_used, reason = "tests")]
+        async fn confirm(&self, description: &str) -> Result<bool, PromptError> {
+            let answer = {
+                let mut w = self.0.lock().unwrap();
+                w.confirmed.push(description.to_owned());
+                w.confirms.pop_front().unwrap_or(Answer::Cancel)
+            };
+            match answer {
+                Answer::Text(_) => Ok(true),
+                Answer::Cancel => Ok(false),
+                Answer::Fail => Err(PromptError::Protocol("scripted".into())),
+                Answer::Timeout => Err(PromptError::Timeout),
+                Answer::Hang => std::future::pending().await,
+            }
+        }
+
+        #[expect(clippy::unwrap_used, reason = "tests")]
         fn hostname(&self) -> String {
             self.0.lock().unwrap().hostname.clone()
         }
@@ -243,6 +293,8 @@ mod tests {
         assert!(!host.hostname().is_empty() && !host.hostname().chars().any(char::is_control));
         let e = host.password("x", None).await.err().unwrap();
         assert!(matches!(e, PromptError::Untrusted(_)), "{e}");
+        let e = host.confirm("x").await.err().unwrap();
+        assert!(matches!(e, PromptError::Untrusted(_)), "{e}");
     }
 
     #[tokio::test]
@@ -250,6 +302,8 @@ mod tests {
         // `true` is not a pinentry: it says nothing, which is a protocol error, and that proves it was run.
         let host = RealHost::new(trust(), "/usr/bin/true");
         let e = host.password("x", None).await.err().unwrap();
+        assert!(!matches!(e, PromptError::Untrusted(_)), "{e}");
+        let e = host.confirm("x").await.err().unwrap();
         assert!(!matches!(e, PromptError::Untrusted(_)), "{e}");
     }
 }
