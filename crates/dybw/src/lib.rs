@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod client;
+mod doctor;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -95,6 +96,17 @@ enum Cmd {
         #[command(subcommand)]
         command: PolicyCmd,
     },
+    /// Show the audit log: who asked for which item, and what was decided (never a value).
+    Audit {
+        /// Only requests from AI-class callers.
+        #[arg(long)]
+        ai: bool,
+        /// How many of the latest lines to show.
+        #[arg(short, default_value_t = 50)]
+        n: usize,
+    },
+    /// Check this machine: socket directory, agent, config, pinentry, policy and audit files.
+    Doctor,
     /// Talk to the agent process itself.
     Agent {
         #[command(subcommand)]
@@ -166,6 +178,8 @@ enum Fail {
     Logged { what: &'static str, log: Option<std::path::PathBuf> },
     #[error("the agent sent a reply that does not fit the request")]
     Unexpected,
+    #[error("{0}")]
+    Log(String),
     #[error("cannot write the output: {0}")]
     Output(#[from] std::io::Error),
 }
@@ -312,9 +326,45 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
                 _ => Err(Fail::Unexpected),
             }
         }
+        Cmd::Audit { ai, n } => audit(env, ai, n, out),
+        Cmd::Doctor => {
+            let me = doctor::home_of(env)
+                .and_then(|home| dybw_agent::caller::this_process(&dybw_agent::paths::harnesses_path(&env.var, &home)));
+            let pinentry = |p: &str| dybw_agent::trust::pinentry_of(p).map_err(|e| format!("{e:#}"));
+            Ok(doctor::run(env, profile.as_deref(), me, &pinentry, out)?)
+        }
         // Nothing to stop when no agent runs, and none is started to be stopped.
         Cmd::Agent { command: AgentCmd::Stop } => done(ask(env, Op::StopAgent, false)?.unwrap_or(Reply::Done)),
     }
+}
+
+/// The last `n` lines of the audit log (the file is read directly: same user, no agent needed).
+fn audit(env: &Env, ai: bool, n: usize, out: &mut dyn Write) -> Result<u8, Fail> {
+    let home = doctor::home_of(env).ok_or_else(|| Fail::Log("HOME is not set to an absolute path".into()))?;
+    let path = dybw_agent::paths::audit_path(&env.var, &home);
+    let log = match dybw_agent::audit::read(&path, env.uid) {
+        Ok(log) => log,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(Fail::Log(format!("cannot read the audit log {}: {e}", path.display()))),
+    };
+    let shown: Vec<_> = log.entries.iter().filter(|e| !ai || e.class == "ai").collect();
+    for e in shown.iter().skip(shown.len().saturating_sub(n)) {
+        let who = e.harness.as_deref().or(e.exe.as_deref());
+        let cells = [
+            Some(e.time.as_str()),
+            Some(e.profile.as_str()),
+            Some(e.class.as_str()),
+            who,
+            e.script.as_deref(),
+            Some(e.op.as_str()),
+            e.kind.as_deref(),
+            e.item.as_deref(),
+            Some(e.verdict.as_str()),
+        ];
+        let row: Vec<String> = cells.into_iter().map(|c| escape(c.unwrap_or("-"))).collect();
+        writeln!(out, "{}", row.join("\t"))?;
+    }
+    Ok(0)
 }
 
 /// `--all`, or the named or default profile. `None`: no agent runs and `autostart` is off.

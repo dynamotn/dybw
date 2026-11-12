@@ -30,6 +30,7 @@ fn env_in(base: &Path, profile: Option<&'static str>, exe_dir: Option<PathBuf>) 
     Env {
         var: Box::new(move |name| match name {
             "XDG_RUNTIME_DIR" => Some(base.clone().into()),
+            "HOME" => Some(base.clone().into()),
             "DYBW_PROFILE" => profile.map(Into::into),
             _ => None,
         }),
@@ -764,4 +765,242 @@ fn a_policy_reply_that_does_not_fit_is_unexpected_and_a_refusal_is_denied() {
     assert_eq!((code, err.contains("does not fit")), (1, true));
     let ((code, _, err), _) = one(&["policy", "forget", "/x"], Reply::Error { error: AgentError::Denied });
     assert_eq!((code, err.contains("denied")), (1, true));
+}
+
+// audit
+
+fn audit_event(
+    caller: dybw_agent::caller::Caller,
+    verdict: dybw_agent::policy::Verdict,
+) -> dybw_agent::policy::AuditEvent {
+    dybw_agent::policy::AuditEvent {
+        time: std::time::UNIX_EPOCH + Duration::from_secs(1_794_528_000),
+        profile: s("work"),
+        caller,
+        op: "get",
+        kind: Some("password"),
+        item: Some(s("id-1")),
+        verdict,
+    }
+}
+
+fn audit_log(base: &Path) -> PathBuf {
+    base.join(".local/state/dybw/audit.log")
+}
+
+/// Three lines: an invoker with a script, an AI harness, an unknown caller.
+fn write_audit(base: &Path) {
+    use dybw_agent::audit::FileAudit;
+    use dybw_agent::caller::{Caller, Via};
+    use dybw_agent::policy::{Audit, Verdict};
+    let log = FileAudit::new(&audit_log(base), euid());
+    let tool = Caller::Invoker {
+        exe: "/usr/bin/tool".into(),
+        script: Some("/opt/a.sh".into()),
+        hash: s("h"),
+        relative: false,
+    };
+    log.record(audit_event(tool, Verdict::Confirmed));
+    log.record(audit_event(Caller::Ai { harness: s("claude"), via: Via::Ancestry }, Verdict::Denied));
+    log.record(audit_event(Caller::Unknown { why: s("orphan") }, Verdict::Declined));
+}
+
+#[test]
+fn audit_prints_the_log_as_a_table_and_never_asks_the_agent() {
+    let base = base();
+    write_audit(base.path());
+    // No socket exists: the file is read directly.
+    let (code, out, err) = run_in(&env_in(base.path(), None, None), &["audit"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let rows: Vec<Vec<&str>> = out.lines().map(|l| l.split('\t').collect()).collect();
+    assert_eq!(rows.len(), 3);
+    let t = "2026-11-13T00:00:00Z";
+    assert_eq!(rows[0], [t, "work", "invoker", "/usr/bin/tool", "/opt/a.sh", "get", "password", "id-1", "confirmed"]);
+    assert_eq!(rows[1], [t, "work", "ai", "claude", "-", "get", "password", "id-1", "denied"]);
+    assert_eq!(rows[2], [t, "work", "unknown", "-", "-", "get", "password", "id-1", "declined"]);
+}
+
+#[test]
+fn audit_can_show_only_ai_callers_and_only_the_latest_lines() {
+    let base = base();
+    write_audit(base.path());
+    let env = env_in(base.path(), None, None);
+    let (_, out, _) = run_in(&env, &["audit", "--ai"]);
+    assert_eq!(out.lines().count(), 1);
+    assert!(out.contains("\tai\tclaude\t"));
+    let (_, out, _) = run_in(&env, &["audit", "-n", "1"]);
+    assert_eq!(out.lines().count(), 1);
+    assert!(out.contains("declined"));
+    let (_, out, _) = run_in(&env, &["audit", "-n", "0"]);
+    assert_eq!(out, "");
+}
+
+#[test]
+fn audit_without_a_log_is_empty_and_an_untrusted_or_homeless_one_fails() {
+    let base = base();
+    let env = env_in(base.path(), None, None);
+    assert_eq!(run_in(&env, &["audit"]), (0, s(""), s("")));
+    write_audit(base.path());
+    std::fs::set_permissions(audit_log(base.path()), PermissionsExt::from_mode(0o644)).unwrap();
+    let (code, out, err) = run_in(&env, &["audit"]);
+    assert_eq!((code, out.as_str()), (1, ""));
+    assert!(err.contains("cannot read the audit log") && err.contains("chmod 600"), "{err}");
+    let mut homeless = env_in(base.path(), None, None);
+    homeless.var = Box::new(|_| None);
+    let (code, _, err) = run_in(&homeless, &["audit"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("HOME"), "{err}");
+}
+
+// doctor
+
+const CONFIG: &str =
+    "default = \"work\"\n[profiles.work]\nserver_url = \"https://w.example.org\"\nemail = \"w@example.org\"\n";
+
+fn write_config(base: &Path) {
+    let file = base.join(".config/dybw/config.toml");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, CONFIG).unwrap();
+}
+
+fn doctor_with(env: &Env, me: Option<dybw_agent::caller::Caller>, pinentry_ok: bool) -> (u8, String) {
+    let pinentry = |p: &str| if pinentry_ok { Ok(format!("/usr/bin/{p}")) } else { Err(s("not found")) };
+    let mut out = vec![];
+    let code = crate::doctor::run(env, None, me, &pinentry, &mut out).unwrap();
+    (code, String::from_utf8(out).unwrap())
+}
+
+#[test]
+fn doctor_passes_a_healthy_machine_with_no_agent_running() {
+    let base = base();
+    write_config(base.path());
+    write_audit(base.path());
+    let (code, out) = doctor_with(&env_in(base.path(), None, None), None, true);
+    assert_eq!(code, 0, "{out}");
+    for want in [
+        "[ok] socket directory: ",
+        "[ok] agent: not running",
+        "[ok] config: ",
+        "[ok] profile: work",
+        "[ok] pinentry: /usr/bin/pinentry",
+        "[ok] policy: ",
+        ", none yet",
+        "[ok] audit log: ",
+        ", 3 lines",
+    ] {
+        assert!(out.contains(want), "{want:?} in {out}");
+    }
+    assert!(!out.contains("warning"));
+}
+
+#[test]
+fn doctor_warns_under_an_ai_harness_but_a_healthy_machine_still_passes() {
+    let base = base();
+    write_config(base.path());
+    let me = dybw_agent::caller::Caller::Ai { harness: s("claude"), via: dybw_agent::caller::Via::Ancestry };
+    let (code, out) = doctor_with(&env_in(base.path(), None, None), Some(me), true);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.starts_with("[warning] caller: this runs under the AI harness claude"), "{out}");
+    // Any other caller is not remarked on.
+    let other = dybw_agent::caller::Caller::Unknown { why: s("x") };
+    assert!(!doctor_with(&env_in(base.path(), None, None), Some(other), true).1.contains("warning"));
+}
+
+#[test]
+fn doctor_reports_the_agent_it_finds() {
+    let version = env!("CARGO_PKG_VERSION");
+    let status = |v: &str| Reply::Status { agent_version: s(v), profiles: vec![] };
+    let cases = [
+        (Act::Reply(status(version)), true, "[ok] agent: running, version"),
+        (Act::Reply(status("0.0.1")), false, "[problem] agent: version 0.0.1"),
+        (
+            Act::Reply(Reply::Error { error: AgentError::Config }),
+            false,
+            "[problem] agent: running, but answers with an error",
+        ),
+        (Act::Reply(Reply::Done), false, "[problem] agent: running, but the reply does not fit"),
+        (Act::Close, false, "[problem] agent: the agent closed the connection"),
+    ];
+    for (act, healthy, want) in cases {
+        let f = fake(vec![act]);
+        write_config(f.base.path());
+        let (code, out) = doctor_with(&env_in(f.base.path(), None, None), None, true);
+        assert_eq!((code == 0, out.contains(want)), (healthy, true), "{want}: {out}");
+        f.ops();
+    }
+}
+
+#[test]
+fn doctor_flags_a_socket_directory_others_can_reach() {
+    let base = base();
+    write_config(base.path());
+    std::fs::set_permissions(base.path().join("dybw"), PermissionsExt::from_mode(0o755)).unwrap();
+    let (code, out) = doctor_with(&env_in(base.path(), None, None), None, true);
+    assert_eq!(code, 1);
+    assert!(out.contains("[problem] socket directory: "), "{out}");
+    // A directory that is not there yet is fine: the first command makes it.
+    let fresh = tempfile::Builder::new().prefix("d").tempdir_in("/tmp").unwrap();
+    write_config(fresh.path());
+    let (code, out) = doctor_with(&env_in(fresh.path(), None, None), None, true);
+    assert!(code == 0 && out.contains("made on first use"), "{out}");
+}
+
+#[test]
+fn doctor_flags_a_missing_home_a_bad_config_a_bad_profile_and_a_bad_pinentry() {
+    let base = base();
+    let mut homeless = env_in(base.path(), None, None);
+    homeless.var = Box::new(|_| None);
+    homeless.uid = euid();
+    let (code, out) = doctor_with(&homeless, None, true);
+    assert_eq!(code, 1);
+    assert!(out.contains("[problem] home: HOME is not set"), "{out}");
+
+    let env = env_in(base.path(), None, None);
+    let file = base.path().join(".config/dybw/config.toml");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "[profiles.work]\nbogus = 1\n").unwrap();
+    let (code, out) = doctor_with(&env, None, true);
+    assert!(code == 1 && out.contains("[problem] config: "), "{out}");
+    // No profile to use: no default, none named.
+    std::fs::write(&file, "[profiles.work]\nserver_url = \"https://w.example.org\"\nemail = \"w@example.org\"\n")
+        .unwrap();
+    let (code, out) = doctor_with(&env, None, true);
+    assert!(code == 1 && out.contains("[problem] profile: "), "{out}");
+    write_config(base.path());
+    let (code, out) = doctor_with(&env, None, false);
+    assert!(code == 1 && out.contains("[problem] pinentry: pinentry: not found"), "{out}");
+}
+
+#[test]
+fn doctor_flags_a_policy_or_audit_file_that_cannot_be_trusted_and_says_how_to_repair_the_policy() {
+    let base = base();
+    write_config(base.path());
+    let env = env_in(base.path(), None, None);
+    let policy = base.path().join(".local/state/dybw/profiles/work/policy.json");
+    std::fs::create_dir_all(policy.parent().unwrap()).unwrap();
+    std::fs::write(&policy, "{\"version\":1,\"entries\":[]}").unwrap();
+    std::fs::set_permissions(&policy, PermissionsExt::from_mode(0o600)).unwrap();
+    let (code, out) = doctor_with(&env, None, true);
+    assert!(code == 0 && out.contains("0 entries"), "{out}");
+    std::fs::set_permissions(&policy, PermissionsExt::from_mode(0o644)).unwrap();
+    let (code, out) = doctor_with(&env, None, true);
+    assert!(code == 1 && out.contains("[problem] policy: ") && out.contains("or remove it"), "{out}");
+
+    write_audit(base.path());
+    let log = audit_log(base.path());
+    std::fs::OpenOptions::new().append(true).open(&log).unwrap().write_all(b"not json\n").unwrap();
+    let (_, out) = doctor_with(&env, None, true);
+    assert!(out.contains("[problem] audit log: ") && out.contains("1 lines are not entries"), "{out}");
+    std::fs::set_permissions(&log, PermissionsExt::from_mode(0o644)).unwrap();
+    let (_, out) = doctor_with(&env, None, true);
+    assert!(out.contains("nothing is recorded until it is fixed"), "{out}");
+}
+
+#[test]
+fn the_doctor_command_runs_the_real_checks() {
+    let base = base();
+    write_config(base.path());
+    let (code, out, _) = run_in(&env_in(base.path(), None, None), &["doctor"]);
+    // The pinentry and the harness depend on the machine; the checks themselves always run.
+    assert!(code <= 1 && out.contains("[ok] socket directory") && out.contains("] pinentry: "), "{out}");
 }
