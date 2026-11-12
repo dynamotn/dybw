@@ -363,6 +363,11 @@ async fn get<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, find: Lookup, select
     };
     // Names of custom fields are not values: no prompt.
     if !matches!(select, Some(Select::ListFields)) {
+        if found.reprompt {
+            // Until P4.3 can ask for the master password again, a reprompt item gives no value and no question.
+            tracing::warn!(profile = %ctx.profile.name, id = %found.id, "value request denied: the item needs a reprompt (P4.3)");
+            return error(AgentError::Denied);
+        }
         let _one_at_a_time = shared.asking.lock().await;
         let answer = session::confirm(host, &ask_text(ctx, &found, select.as_ref())).await;
         tracing::info!(profile = %ctx.profile.name, id = %found.id, allowed = answer.is_ok(), "value request");

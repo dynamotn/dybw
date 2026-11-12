@@ -10,7 +10,7 @@ use dybw_proto::{AgentError, Candidate, Field, Op, Reply, Select, Target};
 use serde_json::{Value, json};
 
 use crate::agent::Agent;
-use crate::agent::testing::{agent_world, unlock};
+use crate::agent::testing::{agent_world, seed_credentials, unlock};
 use crate::host::fake::{Answer, FakeHost};
 
 const VAULT: &str = include_str!("../tests/fixtures/vault.json");
@@ -21,9 +21,22 @@ async fn setup(edit: impl FnOnce(&mut Value)) -> (tempfile::TempDir, Arc<Agent>,
     let dir = tempfile::tempdir().unwrap();
     let (agent, _, host) = agent_world(dir.path());
     let mut vault: Value = serde_json::from_str(VAULT).unwrap();
+    // The vectors' items ask for a reprompt: most tests are about something else.
+    vault["ciphers"].as_array_mut().unwrap().iter_mut().for_each(|c| c["reprompt"] = json!(0));
     edit(&mut vault);
     host.vault(&vault.to_string());
     unlock(&agent, &host, "work").await;
+    (dir, agent, host)
+}
+
+/// The `org` account's vault (the vectors' `open/organization`, its own keys and organizations), unlocked.
+async fn org_setup() -> (tempfile::TempDir, Arc<Agent>, FakeHost) {
+    let dir = tempfile::tempdir().unwrap();
+    let (agent, _, host) = agent_world(dir.path());
+    host.vault(include_str!("../tests/fixtures/org-vault.json"));
+    seed_credentials(&agent, "org");
+    host.answer(Answer::Text("vectors-org-password"));
+    assert_eq!(agent.dispatch(Op::Unlock { profile: Some("org".into()) }).await, Reply::Done);
     (dir, agent, host)
 }
 
@@ -54,6 +67,18 @@ fn search_op(term: &str, fields: &[Field], folder: Option<&str>) -> Op {
         fields: fields.to_vec(),
         folder: folder.map(Into::into),
     }
+}
+
+/// The same request for the `org` profile.
+fn org(mut op: Op) -> Op {
+    if let Op::List { profile, .. }
+    | Op::Search { profile, .. }
+    | Op::Get { profile, .. }
+    | Op::History { profile, .. } = &mut op
+    {
+        *profile = Some("org".into());
+    }
+    op
 }
 
 /// The user says yes once, then the request is made.
@@ -289,7 +314,7 @@ async fn get_raw_is_the_decrypted_item_as_json() {
         got,
         json!({
             "id": "c1", "type": 1, "name": MAIL, "notes": "line 1\nline 2", "folderId": "folder-1",
-            "organizationId": null, "reprompt": true,
+            "organizationId": null, "reprompt": false,
             "fields": [
                 {"name": "text", "value": "shown", "type": 0, "linkedId": null},
                 {"name": "hidden", "value": "kept-secret", "type": 1, "linkedId": null},
@@ -455,29 +480,86 @@ async fn several_matches_are_ambiguous_by_id_name_and_user_only_with_no_prompt_a
 }
 
 #[tokio::test]
-async fn a_url_finds_the_login_with_that_host_when_no_name_matches() {
+async fn a_url_names_no_item_and_opens_nothing() {
+    let (_dir, agent, host) = setup(|_| {}).await;
+    for url in ["https://a.example.invalid/some/path", "https://b.example.invalid", "a.example.invalid"] {
+        assert_eq!(agent.dispatch(get_op(url, Select::Password)).await, err(AgentError::NotFound), "{url}");
+    }
+    assert!(host.world().confirmed.is_empty());
+    assert_eq!(agent.opens("work").await, 0, "no URI matching: lookup never goes beyond the summary");
+}
+
+#[tokio::test]
+async fn a_reprompt_item_gives_no_value_and_no_question_until_p43_but_its_name_and_field_names_show() {
     let (_dir, agent, host) = setup(|v| {
-        let list = v["ciphers"].as_array_mut().unwrap();
-        let mut twin = list.iter().find(|c| c["id"] == "c1").unwrap().clone();
-        twin["id"] = json!("c1b");
-        list.push(twin);
+        for c in v["ciphers"].as_array_mut().unwrap() {
+            if c["id"] == "c1" {
+                c["reprompt"] = json!(1);
+            }
+        }
     })
     .await;
-    // Both items carry the URI: ambiguous. The twin is gone in the next vault, so one is left.
-    let both = agent.dispatch(get_op("https://A.example.invalid/some/path?x=1", Select::Password)).await;
-    assert!(
-        matches!(both, Reply::Error { error: AgentError::Ambiguous { ref candidates } } if candidates.len() == 2),
-        "{both:?}"
-    );
-    assert!(host.world().confirmed.is_empty());
-    assert!(agent.opens("work").await > 0, "a URL match reads the URIs of the logins (and no other type)");
-
-    let (_dir, agent, host) = setup(|_| {}).await;
-    let by_host = value_of(&agent, &host, "https://b.example.invalid", Select::Password).await;
-    assert_eq!(text(by_host), "pw-ünï-😀");
-    for no in ["https://nothing.example.invalid", "a.example.invalid", "c.example.invalid", "https:///"] {
-        assert_eq!(agent.dispatch(get_op(no, Select::Password)).await, err(AgentError::NotFound), "{no}");
+    for select in [Select::Password, Select::Field("user".into()), Select::Full, Select::Raw] {
+        host.allow();
+        assert_eq!(agent.dispatch(get_op("c1", select)).await, err(AgentError::Denied));
     }
+    host.allow();
+    assert_eq!(agent.dispatch(history_op(MAIL)).await, err(AgentError::Denied));
+    assert!(host.world().confirmed.is_empty(), "the question is not even shown");
+    assert_eq!(agent.opens("work").await, 0);
+    let names = agent.dispatch(get_op("c1", Select::ListFields)).await;
+    assert!(matches!(names, Reply::FieldNames { ref names } if names.len() == 5), "{names:?}");
+    let rows = items(agent.dispatch(list_op(&[Field::Name], None)).await);
+    assert!(rows.iter().any(|r| r.id == "c1"));
+    assert_eq!(text(value_of(&agent, &host, "n1", Select::Password).await), "the note's text", "others are unaffected");
+}
+
+#[tokio::test]
+async fn organization_items_read_like_personal_ones_with_the_organizations_unlocked() {
+    let (_dir, agent, host) = org_setup().await;
+    let rows = items(agent.dispatch(org(list_op(&[Field::Name, Field::Type], None))).await);
+    let mut seen: Vec<_> =
+        rows.iter().map(|r| (r.id.as_str(), r.name.as_deref().unwrap(), r.kind.as_deref().unwrap())).collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [("o1", MAIL, "Login"), ("o2", "Visa", "Card"), ("o3", "Partial", "Identity"), ("p1", "Note", "Note")]
+    );
+    assert_eq!(items(agent.dispatch(org(search_op("visa", &[Field::Name], None))).await).len(), 1);
+    assert_eq!(
+        text(allowed(&agent, &host, org(get_op("o3", Select::Password))).await),
+        "Ann",
+        "an organization item (org-b)"
+    );
+    assert_eq!(
+        text(allowed(&agent, &host, org(get_op("Note", Select::Password))).await),
+        "the note's text",
+        "a personal item"
+    );
+    assert_eq!(text(allowed(&agent, &host, org(get_op("p1", Select::Field("f".into())))).await), "v");
+    // The vectors' o1 and o2 ask for a reprompt.
+    host.allow();
+    assert_eq!(agent.dispatch(org(get_op("o1", Select::Password))).await, err(AgentError::Denied));
+    assert_eq!(
+        agent.dispatch(org(get_op("o2", Select::ListFields))).await,
+        Reply::FieldNames { names: vec!["pin".into()] }
+    );
+}
+
+#[tokio::test]
+async fn an_organization_item_of_an_organization_that_cannot_be_unlocked_is_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let (agent, _, host) = agent_world(dir.path());
+    let mut vault: Value = serde_json::from_str(include_str!("../tests/fixtures/org-vault.json")).unwrap();
+    vault["profile"]["organizations"][0]["enabled"] = json!(false);
+    host.vault(&vault.to_string());
+    seed_credentials(&agent, "org");
+    host.answer(Answer::Text("vectors-org-password"));
+    assert_eq!(agent.dispatch(Op::Unlock { profile: Some("org".into()) }).await, Reply::Done);
+    let rows = items(agent.dispatch(org(list_op(&[Field::Name], None))).await);
+    let mut ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, ["o3", "p1"], "org-a is off: its items are held");
 }
 
 #[tokio::test]

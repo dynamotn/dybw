@@ -73,6 +73,7 @@ pub(crate) mod fake {
     use std::sync::{Arc, Mutex};
 
     use dybw_core::ports::{HttpRequest, HttpResponse};
+    use serde_json::Value;
 
     use super::*;
 
@@ -114,6 +115,8 @@ pub(crate) mod fake {
         /// The `ciphers` and `folders` JSON lists the `/sync` answer carries.
         pub ciphers: String,
         pub folders: String,
+        /// The `profile` object of `/sync`; the pbkdf2 account's when `None`.
+        pub profile: Option<String>,
         /// What the user does with each confirmation (`Text` allows; none left means no).
         pub confirms: VecDeque<Answer>,
         /// Every confirmation asked.
@@ -145,6 +148,7 @@ pub(crate) mod fake {
                 device_names: Vec::new(),
                 ciphers: "[]".into(),
                 folders: "[]".into(),
+                profile: None,
                 confirms: VecDeque::new(),
                 confirmed: Vec::new(),
             })))
@@ -170,6 +174,7 @@ pub(crate) mod fake {
             let mut w = self.world();
             w.ciphers = v["ciphers"].to_string();
             w.folders = v["folders"].to_string();
+            w.profile = v.get("profile").map(Value::to_string);
         }
     }
 
@@ -204,8 +209,10 @@ pub(crate) mod fake {
                     }
                     "/api/sync?excludeDomains=true" => {
                         let marker = w.sync_marker;
+                        let profile =
+                            w.profile.clone().unwrap_or_else(|| format!(r#"{{"id":"u1","key":"{PROFILE_KEY}"}}"#));
                         let body = format!(
-                            r#"{{"profile":{{"id":"u1","key":"{PROFILE_KEY}"}},"ciphers":{},"folders":{},"marker":{marker}}}"#,
+                            r#"{{"profile":{profile},"ciphers":{},"folders":{},"marker":{marker}}}"#,
                             w.ciphers, w.folders
                         );
                         (if w.sync_fails { 500 } else { 200 }, body, w.sync_hangs)

@@ -382,7 +382,7 @@ async fn open<H: Host>(
 ) -> Result<UnlockedVault, Refused> {
     let storage = ctx.storage();
     let mut client = client(host, ctx, urls).map_err(Refused::Failed)?;
-    let (kdf, rsa, orgs) = (&BlockingArgon2, &AwsLcRsa, &Organizations::None);
+    let (kdf, rsa, orgs) = (&BlockingArgon2, &AwsLcRsa, &Organizations::All);
     match profile::unlock_vault(&mut client, &storage, key, &ctx.profile.email, password.clone(), kdf, rsa, orgs).await
     {
         Ok(vault) => {

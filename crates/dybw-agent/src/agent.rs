@@ -295,6 +295,7 @@ pub(crate) mod testing {
         [profiles.work]\nserver_url = \"https://w.example.org\"\nemail = \"pbkdf2@vectors.invalid\"\nlock_timeout_minutes = 5\n\
         [profiles.home]\nserver_url = \"https://h.example.org\"\nemail = \"pbkdf2@vectors.invalid\"\nlock_timeout_minutes = 0\n\
         [profiles.fast]\nserver_url = \"https://f.example.org\"\nemail = \"pbkdf2@vectors.invalid\"\nlock_timeout_minutes = 0\nsync_interval_seconds = 1\n\
+        [profiles.org]\nserver_url = \"https://o.example.org\"\nemail = \"org@vectors.invalid\"\n\
         [profiles.pw]\nserver_url = \"https://p.example.org\"\nemail = \"pbkdf2@vectors.invalid\"\nauth = \"password\"\n\
         [profiles.plain]\nserver_url = \"http://plain.example.org\"\nemail = \"pbkdf2@vectors.invalid\"\n";
 

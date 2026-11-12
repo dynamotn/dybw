@@ -28,6 +28,8 @@ pub struct Lookup {
 pub struct Found {
     pub id: String,
     pub name: String,
+    /// The cipher asks for the master password again (`reprompt`, a plain field): P4.3 supports that.
+    pub reprompt: bool,
 }
 
 // Opened items so far on this thread, for tests of the value gate (a worker is one thread).
@@ -112,32 +114,18 @@ pub fn list(vault: &UnlockedVault, fields: &[Field], folder: Option<&str>, term:
     Reply::Items { items }
 }
 
-/// `https://user@Host:8080/x` is `host`; text with no scheme has no host. Bracketed IPv6 hosts are not handled.
-fn host_of(uri: &str) -> Option<String> {
-    let rest = uri.split_once("://")?.1;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let host = authority.rsplit('@').next()?.split(':').next()?;
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
-}
-
-/// Logins that have a URI on `host`. This opens each login to read its URIs, which is more than a summary: it
-/// happens only for a needle that is a URL and named no item, and nothing leaves the function but a match.
-fn by_uri<'a>(vault: &UnlockedVault, rows: &'a [(&Value, Summary)], host: &str) -> Vec<&'a Summary> {
-    let on_host = |cipher: &Value| {
-        let Ok(item) = open(cipher, vault) else { return false };
-        let Data::Login(login) = &item.data else { return false };
-        login.uris.iter().filter_map(|u| u.uri.as_deref()).any(|u| host_of(u).as_deref() == Some(host))
-    };
-    rows.iter().filter(|(c, s)| s.kind == 1 && on_host(c)).map(|(_, s)| s).collect()
-}
-
-/// rbw's lookup: the cipher id, else the item name, else (for a URL) the host of an item's URIs; `user` and the
-/// folder narrow the name and URI matches. Several matches are `Ambiguous`, naming id, name and user only.
+/// rbw's lookup, as far as a summary allows: the cipher id, else the item name; `user` and the folder narrow the
+/// name matches. Several matches are `Ambiguous`, naming id, name and user only. A URL names no item here.
+// TODO(core): rbw also matches a URL against an item's URIs; that needs a core summary that decrypts the URIs only.
 pub fn find(vault: &UnlockedVault, q: &Lookup) -> Result<Found, AgentError> {
-    let found = |s: &Summary| Found { id: s.id.clone(), name: s.name.to_string() };
+    let found = |(c, s): &(&Value, Summary)| Found {
+        id: s.id.clone(),
+        name: s.name.to_string(),
+        reprompt: c.get("reprompt").and_then(Value::as_u64).is_some_and(|r| r != 0),
+    };
     let rows = summaries(vault);
-    if let Some((_, s)) = rows.iter().find(|(_, s)| s.id == q.needle) {
-        return Ok(found(s));
+    if let Some(row) = rows.iter().find(|(_, s)| s.id == q.needle) {
+        return Ok(found(row));
     }
     let names = q.folder.is_some().then(|| folder_names(&vault.sync, vault.keys.user()));
     let narrowed = |s: &Summary| {
@@ -148,18 +136,18 @@ pub fn find(vault: &UnlockedVault, q: &Lookup) -> Result<Found, AgentError> {
         user && folder
     };
     let rows: Vec<_> = rows.into_iter().filter(|(_, s)| narrowed(s)).collect();
-    let mut hits: Vec<&Summary> =
-        rows.iter().map(|(_, s)| s).filter(|s| same(&s.name, &q.needle, q.ignorecase)).collect();
-    if hits.is_empty() {
-        hits = host_of(&q.needle).map(|host| by_uri(vault, &rows, &host)).unwrap_or_default();
-    }
+    let hits: Vec<_> = rows.iter().filter(|(_, s)| same(&s.name, &q.needle, q.ignorecase)).collect();
     match hits.as_slice() {
         [] => Err(AgentError::NotFound),
         [one] => Ok(found(one)),
         many => Err(AgentError::Ambiguous {
             candidates: many
                 .iter()
-                .map(|s| Candidate { id: s.id.clone(), name: s.name.to_string(), user: s.user.as_deref().cloned() })
+                .map(|(_, s)| Candidate {
+                    id: s.id.clone(),
+                    name: s.name.to_string(),
+                    user: s.user.as_deref().cloned(),
+                })
                 .collect(),
         }),
     }
@@ -425,13 +413,5 @@ mod tests {
         count.write_all(b"abc").unwrap();
         count.flush().unwrap();
         assert_eq!(count.0, 3);
-    }
-
-    #[test]
-    fn the_host_of_a_uri() {
-        assert_eq!(host_of("https://User@Example.ORG:8080/a?b#c").as_deref(), Some("example.org"));
-        assert_eq!(host_of("http://a.example").as_deref(), Some("a.example"));
-        assert_eq!(host_of("example.org/path"), None, "no scheme, no host");
-        assert_eq!(host_of("https:///path"), None);
     }
 }
