@@ -566,6 +566,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dybw-peer"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "dybw-proto"
 version = "0.1.0"
 dependencies = [

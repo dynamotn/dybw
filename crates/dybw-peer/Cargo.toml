@@ -1,0 +1,28 @@
+[package]
+name = "dybw-peer"
+description = "Who is on the other end of a Unix socket: peer identity and process ancestry (the only crate with unsafe)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The one crate allowed unsafe: the rest of the workspace forbids it.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+undocumented_unsafe_blocks = "deny"
+
+[features]
+# A scripted ProcessSource for the tests of the crates above this one.
+fake = []
+
+[dependencies]
+libc.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
