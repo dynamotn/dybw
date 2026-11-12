@@ -1,0 +1,92 @@
+# CI for GitLab: lint, tests, coverage, audit, MSRV and end-to-end tests against Vaultwarden.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG =~ /^v/
+
+stages: [check, test]
+
+variables:
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo-home
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  VAULTWARDEN_IMAGE: vaultwarden/server:1.37.4@sha256:efb3cde962015fcc036b2ea625242248611943b27212ebf4392841fb30fad055
+
+default:
+  image: rust:1-trixie
+  interruptible: true
+
+.cargo-cache:
+  cache:
+    key:
+      prefix: $CI_JOB_NAME
+      files: [Cargo.lock]
+    paths:
+      - .cargo-home/registry/index/
+      - .cargo-home/registry/cache/
+      - target/
+
+lint:
+  stage: check
+  extends: .cargo-cache
+  script:
+    - rustup component add rustfmt clippy
+    - cargo fmt --all --check
+    - cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+audit:
+  stage: check
+  extends: .cargo-cache
+  script:
+    - cargo install --locked cargo-audit
+    - cargo audit
+
+msrv:
+  stage: check
+  image: rust:1.89-trixie
+  extends: .cargo-cache
+  script:
+    - cargo check --workspace --locked --all-targets
+
+test:
+  stage: test
+  extends: .cargo-cache
+  script:
+    - cargo test --workspace --locked
+
+coverage:
+  stage: test
+  extends: .cargo-cache
+  before_script:
+    - rustup component add llvm-tools-preview
+    - cargo install cargo-llvm-cov --locked --version '^0.9'
+  script:
+    - cargo llvm-cov --workspace --locked --fail-under-lines 100
+
+e2e:
+  stage: test
+  extends: .cargo-cache
+  services:
+    - name: $VAULTWARDEN_IMAGE
+      alias: vaultwarden
+      variables:
+        SIGNUPS_ALLOWED: "true"
+        SIGNUPS_VERIFY: "false"
+        DISABLE_ICON_DOWNLOAD: "true"
+        I_REALLY_WANT_VOLATILE_STORAGE: "true"
+        LOGIN_RATELIMIT_MAX_BURST: "1000"
+        LOGIN_RATELIMIT_SECONDS: "1"
+  variables:
+    BW_E2E_URL: http://vaultwarden:80
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends curl python3-pytest python3-cryptography
+  script:
+    - cargo build --locked --release
+    - for _ in $(seq 60); do curl -fsS "$BW_E2E_URL/alive" && break; sleep 2; done
+    - python3 -m pytest -q -rf -p no:cacheprovider tests/e2e
+  timeout: 20 minutes
