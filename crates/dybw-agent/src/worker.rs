@@ -411,8 +411,8 @@ async fn gate<H: Host>(
         Decision::Deny => (Verdict::Denied, Err(AgentError::Denied)),
         Decision::Confirm { rememberable } => {
             match session::confirm(host, &ask_text(ctx, caller, found, select), rememberable).await {
-                Ok(true) if rememberable => (remember(ctx, &store, caller), Ok(())),
-                Ok(_) => (Verdict::Confirmed, Ok(())),
+                Ok(true) => (remember(ctx, &store, caller), Ok(())),
+                Ok(false) => (Verdict::Confirmed, Ok(())),
                 Err(e) => (Verdict::Declined, Err(e)),
             }
         }
@@ -424,8 +424,9 @@ async fn gate<H: Host>(
 /// Store the grant "always" asks for. A failed write still lets this one request through (the user said yes), and
 /// is logged.
 fn remember(ctx: &Ctx, store: &Store, caller: &Caller) -> Verdict {
-    let nothing = || std::io::Error::other("this caller cannot be remembered");
-    match policy::grant_for(caller).map_or_else(|| Err(nothing()), |entry| store.set(entry)) {
+    // "Always" is only offered for a caller that has a grant; for any other it is just a yes.
+    let Some(entry) = policy::grant_for(caller) else { return Verdict::Confirmed };
+    match store.set(entry) {
         Ok(()) => Verdict::Remembered,
         Err(e) => {
             tracing::warn!(profile = %ctx.profile.name, "the grant was not saved: {e}");

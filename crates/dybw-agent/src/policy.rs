@@ -146,6 +146,10 @@ struct File {
     entries: Vec<PolicyEntry>,
 }
 
+fn untrusted<T>(why: &str) -> std::io::Result<T> {
+    Err(std::io::Error::other(why.to_owned()))
+}
+
 /// A profile's policy file.
 pub struct Store {
     path: PathBuf,
@@ -161,43 +165,37 @@ impl Store {
     pub fn load(&self) -> Vec<PolicyEntry> {
         match self.read() {
             Ok(entries) => entries,
-            Err(why) if why.is_empty() => Vec::new(),
-            Err(why) => {
-                tracing::warn!(file = %self.path.display(), "ignoring the caller policy: {why}");
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                tracing::warn!(file = %self.path.display(), "ignoring the caller policy: {e}");
                 Vec::new()
             }
         }
     }
 
-    /// `Err("")` is a missing file: nothing to say.
-    fn read(&self) -> Result<Vec<PolicyEntry>, String> {
-        let link = match std::fs::symlink_metadata(&self.path) {
-            Ok(link) => link,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(String::new()),
-            Err(e) => return Err(e.kind().to_string()),
-        };
-        if link.file_type().is_symlink() || !link.is_file() {
-            return Err("it is not a regular file".into());
+    fn read(&self) -> std::io::Result<Vec<PolicyEntry>> {
+        let link = std::fs::symlink_metadata(&self.path)?;
+        // Not opened before it is known to be a plain file: opening a FIFO would wait for ever.
+        if !link.is_file() {
+            return untrusted("it is not a regular file");
         }
-        let file = std::fs::File::open(&self.path).map_err(|e| e.kind().to_string())?;
-        let meta = file.metadata().map_err(|e| e.kind().to_string())?;
-        if (meta.dev(), meta.ino()) != (link.dev(), link.ino()) {
-            return Err("it changed while it was read".into());
-        }
-        if meta.uid() != self.uid {
-            return Err("it is owned by another user".into());
+        let file = std::fs::File::open(&self.path)?;
+        let meta = file.metadata()?;
+        if (meta.dev(), meta.ino()) != (link.dev(), link.ino()) || meta.uid() != self.uid {
+            return untrusted("it is not the file it was, or it is owned by another user");
         }
         if meta.mode() & 0o077 != 0 {
-            return Err("it must not be accessible to others (chmod 600)".into());
+            return untrusted("it must not be accessible to others (chmod 600)");
         }
         let mut text = String::new();
-        file.take(MAX_FILE + 1).read_to_string(&mut text).map_err(|e| e.kind().to_string())?;
+        file.take(MAX_FILE + 1).read_to_string(&mut text)?;
         if text.len() as u64 > MAX_FILE {
-            return Err("it is too large".into());
+            return untrusted("it is too large");
         }
-        let parsed: File = serde_json::from_str(&text).map_err(|e| format!("not valid (line {})", e.line()))?;
+        let parsed: File =
+            serde_json::from_str(&text).or_else(|e| untrusted(&format!("not valid (line {})", e.line())))?;
         if parsed.version != FILE_VERSION {
-            return Err(format!("version {} is not supported", parsed.version));
+            return untrusted("its version is not supported");
         }
         Ok(parsed.entries)
     }

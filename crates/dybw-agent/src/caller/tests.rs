@@ -590,3 +590,14 @@ fn only_a_named_absolute_invoker_is_rememberable() {
     t.add(50, Path::new("/opt/claude"), 1, Some(&["claude"]), Some(&[]));
     assert!(!remember(&t));
 }
+
+#[test]
+fn a_file_the_user_names_is_hashed_and_a_missing_or_huge_one_is_refused() {
+    let tree = Tree::new();
+    let file = tree.file("named", "content");
+    assert_eq!(hash_of(&file).unwrap(), sha("content"));
+    assert!(hash_of(&file.with_file_name("missing")).is_err());
+    let huge = tree.file("huge", "");
+    std::fs::OpenOptions::new().write(true).open(&huge).unwrap().set_len(MAX_HASH_BYTES + 1).unwrap();
+    assert!(hash_of(&huge).is_err());
+}
