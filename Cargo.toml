@@ -17,13 +17,19 @@ expect_used = "warn"
 indexing_slicing = "warn"
 
 [workspace.dependencies]
-# Pinned by rev on its public URL, like bwss. TODO(P4.1): re-pin to a rev that has dybw-native and add it here.
-dybw-core = { git = "https://gitlab.com/dynamo-tools/dybw-core.git", rev = "928e7f999a8cbc6ef4ae44e2438e182507e8bea6" }
+# Pinned by rev on its public URL, like bwss.
+dybw-core = { git = "https://gitlab.com/dynamo-tools/dybw-core.git", rev = "3088ceb5f93d9470716235cfe238acde5d177799" }
+dybw-native = { git = "https://gitlab.com/dynamo-tools/dybw-core.git", rev = "3088ceb5f93d9470716235cfe238acde5d177799" }
 dybw-proto = { path = "crates/dybw-proto" }
 clap = { version = "4.6.7", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
+anyhow = "1.0.104"
+toml = "1.1.8"
+uuid = { version = "1.28.0", features = ["v4"] }
+zeroize = { version = "1.9.1", features = ["derive", "serde"] }
+tempfile = "3.27.0"
 
 [profile.release]
 overflow-checks = true

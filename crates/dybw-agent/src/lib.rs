@@ -1,4 +1,10 @@
-//! The dybw agent. P4.0 skeleton: P4.1 adds the socket server and the vault session.
+//! The dybw agent. P4.1 builds it up: the config layer first, then the socket server and the vault session.
+
+pub mod config;
+pub mod credentials;
+pub mod device;
+pub mod paths;
+pub mod trust;
 
 use dybw_proto::PROTOCOL_VERSION;
 
