@@ -718,5 +718,5 @@ fn field_names_are_escaped_but_their_values_are_not() {
         Entry { name: s("f\nake: x"), value: secret("v\tal") },
     ];
     let (r, _) = one(&["get", "n", "--full"], Reply::Full { entries });
-    assert_eq!(r.1, "pw\nf\\x0ake: x: v\tal\n");
+    assert_eq!(r.1, "pw\nf\\x0aake: x: v\tal\n");
 }
