@@ -19,6 +19,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "fake")]
 mod fake;
+#[cfg(all(feature = "fake", not(debug_assertions)))]
+compile_error!("the `fake` feature is for tests only and must not be built in release");
 #[cfg(target_os = "linux")]
 mod linux;
 mod parse;
@@ -37,6 +39,9 @@ pub use fake::Fake;
 
 /// Largest `argv` + environment block read for one process.
 pub const MAX_ARGS_BYTES: usize = 1 << 20;
+
+/// Most argv entries, and most environment entries, kept for one process.
+pub const MAX_ENTRIES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -60,7 +65,7 @@ impl Error {
     }
 }
 
-/// What makes a pid this process and not a later one with the same number.
+/// What makes a pid this process running this program and not a later one.
 #[derive(Debug, Clone)]
 pub struct Token {
     /// macOS audit-token pidversion (0 on Linux).
@@ -68,6 +73,10 @@ pub struct Token {
     /// Process start time: microseconds since the epoch on macOS, clock ticks
     /// since boot on Linux. Only ever compared with itself.
     pub start: u64,
+    /// The running image, as opaque bytes compared for equality: macOS
+    /// unique id + pidversion + executable UUID, Linux exe link target +
+    /// (dev, ino). It changes when the process `exec`s another program.
+    pub image: Vec<u8>,
     /// Linux pidfd of the peer when the kernel gave one; kept open so the pid
     /// cannot be reused while this token lives.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -75,13 +84,14 @@ pub struct Token {
 }
 
 impl Token {
-    pub(crate) fn new(version: u32, start: u64, pidfd: Option<OwnedFd>) -> Self {
-        Self { version, start, pidfd: pidfd.map(Arc::new) }
+    pub(crate) fn new(version: u32, start: u64, image: Vec<u8>, pidfd: Option<OwnedFd>) -> Self {
+        Self { version, start, image, pidfd: pidfd.map(Arc::new) }
     }
 
-    /// A token with no pidfd, for fakes and tests.
+    /// A token with no pidfd and no image, for fakes and tests.
+    #[cfg(any(test, feature = "fake"))]
     pub fn plain(version: u32, start: u64) -> Self {
-        Self::new(version, start, None)
+        Self::new(version, start, Vec::new(), None)
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -100,21 +110,46 @@ pub struct Peer {
 }
 
 /// What the kernel says about a process now.
+///
+/// `exe` and `ppid` are the primary facts (ancestry). `argv` and `env` are
+/// advisory and may only ever tighten a decision: `None` means "not visible"
+/// (another user's process, SIP, EPERM/EINVAL/EACCES), never "empty", and a
+/// caller must not read `None` as clean. Every `Process::of` error met while
+/// walking ancestry must likewise be treated as "unknown".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Process {
     pub exe: PathBuf,
     pub ppid: u32,
     /// Same unit as [`Token::start`].
     pub start: u64,
-    /// Empty when the process belongs to another user and the kernel refuses.
-    pub argv: Vec<OsString>,
-    /// Same caveat as `argv`.
-    pub env: Vec<(OsString, OsString)>,
+    /// Same meaning as [`Token::image`].
+    pub image: Vec<u8>,
+    /// At most [`MAX_ENTRIES`] entries; `None` when not visible.
+    pub argv: Option<Vec<OsString>>,
+    /// At most [`MAX_ENTRIES`] entries; `None` when not visible.
+    pub env: Option<Vec<(OsString, OsString)>>,
 }
 
-/// The process was replaced between two reads when its start time moved.
-fn unchanged(before: u64, after: u64) -> Result<(), Error> {
-    if before == after { Ok(()) } else { Err(Error::Gone) }
+/// (ppid, start time, image) in one read.
+type Id = (u32, u64, Vec<u8>);
+
+fn read_id(pid: u32) -> Result<Id, Error> {
+    let (ppid, start) = sys::ppid_start(pid)?;
+    Ok((ppid, start, sys::image(pid)?))
+}
+
+/// The process was replaced (pid reused, or exec of another program) between
+/// two reads when its start time or image moved.
+fn unchanged(before: &Id, after: &Id) -> Result<(), Error> {
+    if before.1 == after.1 && before.2 == after.2 { Ok(()) } else { Err(Error::Gone) }
+}
+
+/// Two reads that must agree: a pid reused between the start time and the
+/// image reads would pair one process's start with another's image.
+pub(crate) fn stable_id(pid: u32) -> Result<Id, Error> {
+    let first = read_id(pid)?;
+    unchanged(&first, &read_id(pid)?)?;
+    Ok(first)
 }
 
 /// Identify the peer of a connected Unix socket.
@@ -123,24 +158,28 @@ pub fn peer_of(sock: BorrowedFd<'_>) -> Result<Peer, Error> {
 }
 
 impl Process {
-    /// Read a process. `Err(Gone)` when it does not exist, or when it exited
-    /// (or was replaced) while being read.
+    /// Read a process. `Err(Gone)` when it does not exist, or when it exited,
+    /// was replaced or exec'd another program while being read.
     pub fn of(pid: u32) -> Result<Self, Error> {
-        let (ppid, start) = sys::ppid_start(pid)?;
+        let before = read_id(pid)?;
         let exe = sys::exe(pid)?;
         let (argv, env) = sys::args(pid)?;
-        unchanged(start, sys::ppid_start(pid)?.1)?;
-        Ok(Self { exe, ppid, start, argv, env })
+        unchanged(&before, &read_id(pid)?)?;
+        Ok(Self { exe, ppid: before.0, start: before.1, image: before.2, argv, env })
     }
 }
 
-/// Is `peer` still the very process it was at connect time?
+/// Is `peer` still the very process, running the very program, it was at
+/// connect time?
 pub fn still_same(peer: &Peer) -> bool {
-    sys::still_same(peer)
+    sys::alive(peer)
+        && read_id(peer.pid).is_ok_and(|(_, start, image)| start == peer.token.start && image == peer.token.image)
 }
 
 /// Refuse debugger attachment to this process (macOS `PT_DENY_ATTACH`; on
 /// Linux the equivalent, `PR_SET_DUMPABLE`, is set with the other hardening).
+/// Call it first in the daemon. A hash of a path describes the file, not
+/// necessarily the image that is running.
 pub fn deny_attach() -> Result<(), Error> {
     sys::deny_attach()
 }
@@ -177,16 +216,20 @@ pub fn peer_of_stream(stream: &impl AsFd) -> Result<Peer, Error> {
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
-    use std::process::{Command, Stdio};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
 
     const MARKER: &str = "DYBW_PEER_MARKER";
 
     /// macOS withholds the environment of platform binaries (`/bin/sleep`),
     /// so the child is this test binary re-run on `child_body`.
-    fn sleeper() -> std::process::Child {
+    fn spawn_child(arg0: &str) -> Child {
         Command::new(std::env::current_exe().unwrap())
+            .arg0(arg0)
             .args(["--exact", "tests::child_body"])
             .env(MARKER, "x=y")
             .stdin(Stdio::null())
@@ -195,25 +238,15 @@ mod tests {
             .unwrap()
     }
 
+    fn sleeper() -> Child {
+        spawn_child("child")
+    }
+
     /// A no-op in the normal run; the child sleeps (the marker is its cue).
     #[test]
     fn child_body() {
         let secs = if std::env::var_os(MARKER).is_some() { 30 } else { 0 };
-        std::thread::sleep(std::time::Duration::from_secs(secs));
-    }
-
-    #[test]
-    fn peer_of_a_socketpair_is_self() {
-        let (a, _b) = UnixStream::pair().unwrap();
-        let peer = peer_of_stream(&a).unwrap();
-        assert_eq!(peer.pid, std::process::id());
-        assert_eq!(peer.uid, euid());
-        assert!(still_same(&peer));
-        let me = Process::of(peer.pid).unwrap();
-        assert_eq!(me.start, peer.token.start);
-        assert_eq!(Os.process(peer.pid).unwrap(), me);
-        assert!(Os.still_same(&Os.peer_of(a.as_fd()).unwrap()));
-        assert!(peer_of(a.as_fd()).is_ok());
+        std::thread::sleep(Duration::from_secs(secs));
     }
 
     fn euid() -> u32 {
@@ -222,29 +255,68 @@ mod tests {
     }
 
     #[test]
+    fn peer_of_a_socketpair_is_self() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let peer = peer_of_stream(&a).unwrap();
+        assert_eq!(peer.pid, std::process::id());
+        assert_eq!(peer.uid, euid());
+        assert!(!peer.token.image.is_empty());
+        assert!(still_same(&peer));
+        let me = Process::of(peer.pid).unwrap();
+        assert_eq!((me.start, &me.image), (peer.token.start, &peer.token.image));
+        assert_eq!(Os.process(peer.pid).unwrap(), me);
+        assert!(Os.still_same(&Os.peer_of(a.as_fd()).unwrap()));
+        assert!(peer_of(a.as_fd()).is_ok());
+        assert!(me.argv.is_some() && me.env.is_some());
+    }
+
+    #[test]
     fn a_child_reads_back_exe_argv_env_and_ppid() {
         let mut child = sleeper();
         let p = Process::of(child.id()).unwrap();
         assert_eq!(p.ppid, std::process::id());
         assert_eq!(p.exe, std::env::current_exe().unwrap().canonicalize().unwrap());
-        assert_eq!(p.argv.last().unwrap(), "tests::child_body");
-        assert!(p.env.iter().any(|(k, v)| k == MARKER && v == "x=y"));
+        assert_eq!(p.argv.unwrap().last().unwrap(), "tests::child_body");
+        assert!(p.env.unwrap().iter().any(|(k, v)| k == MARKER && v == "x=y"));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn an_empty_argv0_stays_an_argv_entry() {
+        let mut child = spawn_child("");
+        let argv = Process::of(child.id()).unwrap().argv.unwrap();
+        assert_eq!(argv.first().unwrap(), "");
+        assert_eq!(argv.get(1).unwrap(), "--exact");
         child.kill().unwrap();
         child.wait().unwrap();
     }
 
     #[test]
     fn an_exited_child_is_gone_and_not_the_same() {
-        let (a, _b) = UnixStream::pair().unwrap();
         let mut child = sleeper();
-        let mut peer = peer_of_stream(&a).unwrap();
-        peer.pid = child.id();
-        peer.token.start = Process::of(child.id()).unwrap().start;
+        let peer = sys::peer_of_pid(child.id()).unwrap();
         assert!(still_same(&peer));
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!still_same(&peer));
         assert_eq!(Process::of(peer.pid), Err(Error::Gone));
+    }
+
+    #[test]
+    fn a_child_that_execs_another_program_is_not_the_same() {
+        let mut child =
+            Command::new("/bin/sh").args(["-c", "read x; exec /bin/sleep 30"]).stdin(Stdio::piped()).spawn().unwrap();
+        let peer = sys::peer_of_pid(child.id()).unwrap();
+        assert!(still_same(&peer));
+        child.stdin.take().unwrap().write_all(b"\n").unwrap();
+        let begun = Instant::now();
+        while still_same(&peer) {
+            assert!(begun.elapsed() < Duration::from_secs(10), "exec went unnoticed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]
@@ -267,8 +339,10 @@ mod tests {
 
     #[test]
     fn a_process_replaced_mid_read_is_gone() {
-        assert_eq!(unchanged(1, 1), Ok(()));
-        assert_eq!(unchanged(1, 2), Err(Error::Gone));
+        let id = |start: u64, image: &[u8]| (1, start, image.to_vec());
+        assert_eq!(unchanged(&id(1, b"a"), &id(1, b"a")), Ok(()));
+        assert_eq!(unchanged(&id(1, b"a"), &id(2, b"a")), Err(Error::Gone));
+        assert_eq!(unchanged(&id(1, b"a"), &id(1, b"b")), Err(Error::Gone));
     }
 
     #[test]

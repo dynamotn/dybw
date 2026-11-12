@@ -4,6 +4,8 @@
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 
+use crate::MAX_ENTRIES;
+
 pub(crate) type Env = Vec<(OsString, OsString)>;
 
 fn os(bytes: &[u8]) -> OsString {
@@ -17,20 +19,22 @@ fn env_pairs<'a>(entries: impl Iterator<Item = &'a [u8]>) -> Env {
             let eq = e.iter().position(|b| *b == b'=')?;
             Some((os(e.get(..eq)?), os(e.get(eq + 1..)?)))
         })
+        .take(MAX_ENTRIES)
         .collect()
 }
 
-/// macOS `KERN_PROCARGS2`: native-endian `argc`, the exec path, NUL padding,
-/// `argc` argv strings, then the environment. A truncated tail is tolerated.
+/// macOS `KERN_PROCARGS2`: native-endian `argc`, the exec path, NUL padding
+/// that rounds the path (with its terminator) up to a multiple of 8, `argc`
+/// argv strings, then the environment. Only that padding is skipped, so an
+/// empty `argv[0]` stays an entry. A truncated tail is tolerated.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) fn procargs2(buf: &[u8]) -> Option<(Vec<OsString>, Env)> {
     let (head, rest) = buf.split_first_chunk::<4>()?;
     let argc = usize::try_from(i32::from_ne_bytes(*head)).ok()?;
     let path_end = rest.iter().position(|b| *b == 0)?;
-    let rest = rest.get(path_end..)?;
-    let rest = rest.get(rest.iter().position(|b| *b != 0).unwrap_or(rest.len())..)?;
+    let rest = rest.get(path_end + (8 - path_end % 8)..).unwrap_or_default();
     let mut parts = rest.split(|b| *b == 0);
-    let argv = parts.by_ref().take(argc).map(os).collect();
+    let argv = parts.by_ref().take(argc.min(MAX_ENTRIES)).map(os).collect();
     Some((argv, env_pairs(parts)))
 }
 
@@ -41,7 +45,7 @@ pub(crate) fn cmdline(buf: &[u8]) -> Vec<OsString> {
     if buf.is_empty() {
         return Vec::new();
     }
-    buf.split(|b| *b == 0).map(os).collect()
+    buf.split(|b| *b == 0).take(MAX_ENTRIES).map(os).collect()
 }
 
 /// `/proc/<pid>/environ`.
@@ -62,6 +66,13 @@ pub(crate) fn proc_stat(buf: &[u8]) -> Option<(u32, u64)> {
     let ppid = fields.nth(1)?.parse().ok()?;
     let start = fields.nth(17)?.parse().ok()?;
     Some((ppid, start))
+}
+
+/// `/proc/self/fdinfo/<pidfd>` → the `Pid:` line (-1 once the process is gone).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn pidfd_pid(buf: &[u8]) -> Option<i64> {
+    let text = std::str::from_utf8(buf).ok()?;
+    text.lines().find_map(|l| l.strip_prefix("Pid:")).and_then(|v| v.trim().parse().ok())
 }
 
 /// macOS audit token: eight `u32`s; euid is word 1, pid word 5, pidversion 7.
@@ -99,7 +110,7 @@ mod tests {
 
     #[test]
     fn procargs2_splits_argv_and_env() {
-        let b = args2(2, b"/bin/x\0\0\0x\0-a\0A=1\0B=\0noeq\0\0");
+        let b = args2(2, b"/bin/x\0\0x\0-a\0A=1\0B=\0noeq\0\0");
         let (argv, env) = procargs2(&b).unwrap();
         assert_eq!(argv, vec![s("x"), s("-a")]);
         assert_eq!(env, vec![(s("A"), s("1")), (s("B"), s(""))]);
@@ -113,7 +124,7 @@ mod tests {
         assert!(procargs2(&args2(1, b"/no-nul")).is_none());
         // no args at all, then an argc larger than the data.
         assert_eq!(procargs2(&args2(0, b"/x\0")).unwrap(), (vec![], vec![]));
-        let (argv, env) = procargs2(&args2(i32::MAX, b"/x\0\0a\0b")).unwrap();
+        let (argv, env) = procargs2(&args2(i32::MAX, b"/x\0\0\0\0\0\0a\0b")).unwrap();
         assert_eq!(argv, vec![s("a"), s("b")]);
         assert!(env.is_empty());
         // a path with nothing after it, and truncation at every length.
@@ -122,6 +133,32 @@ mod tests {
         for n in 0..=full.len() {
             let _ = procargs2(full.get(..n).unwrap());
         }
+    }
+
+    #[test]
+    fn procargs2_keeps_an_empty_argv0_and_caps_entries() {
+        // "/bin/x" (6) + terminator rounds to 8: two NULs, then argv[0] = "".
+        let (argv, _) = procargs2(&args2(2, b"/bin/x\0\0\0a\0")).unwrap();
+        assert_eq!(argv, vec![s(""), s("a")]);
+        // a path that is a multiple of 8 gets a full 8 NULs.
+        let (argv, _) = procargs2(&args2(1, b"/bin/abc\0\0\0\0\0\0\0\0z\0")).unwrap();
+        assert_eq!(argv, vec![s("z")]);
+        let mut many = b"/x\0\0\0\0\0\0".to_vec();
+        many.extend(std::iter::repeat_n(&b"a\0"[..], MAX_ENTRIES + 10).flatten());
+        assert_eq!(procargs2(&args2(i32::MAX, &many)).unwrap().0.len(), MAX_ENTRIES);
+        let mut env = many.clone();
+        env.extend(std::iter::repeat_n(&b"K=v\0"[..], MAX_ENTRIES + 10).flatten());
+        assert_eq!(procargs2(&args2(0, &env)).unwrap().1.len(), MAX_ENTRIES);
+        assert_eq!(cmdline(&many).len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn pidfd_fdinfo() {
+        assert_eq!(pidfd_pid(b"pos:\t0\nflags:\t02\nPid:\t1234\nNSpid:\t1234\n"), Some(1234));
+        assert_eq!(pidfd_pid(b"Pid:\t-1\n"), Some(-1));
+        assert_eq!(pidfd_pid(b"pos:\t0\n"), None);
+        assert_eq!(pidfd_pid(b"Pid:\tx\n"), None);
+        assert_eq!(pidfd_pid(b"\xff"), None);
     }
 
     #[test]

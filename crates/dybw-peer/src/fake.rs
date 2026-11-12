@@ -44,9 +44,9 @@ impl ProcessSource for Fake {
         self.state().procs.get(&pid).cloned().ok_or(Error::Gone)
     }
 
-    /// Same pid, still in the table, same start time.
+    /// Same pid, still in the table, same start time and image (an exec changes it).
     fn still_same(&self, peer: &Peer) -> bool {
-        self.state().procs.get(&peer.pid).is_some_and(|p| p.start == peer.token.start)
+        self.state().procs.get(&peer.pid).is_some_and(|p| p.start == peer.token.start && p.image == peer.token.image)
     }
 }
 
@@ -60,7 +60,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn proc(start: u64) -> Process {
-        Process { exe: PathBuf::from("/bin/x"), ppid: 1, start, argv: vec![], env: vec![] }
+        Process { exe: PathBuf::from("/bin/x"), ppid: 1, start, image: vec![], argv: None, env: None }
     }
 
     #[test]
@@ -76,6 +76,8 @@ mod tests {
         assert_eq!(fake.process(7).unwrap(), proc(5));
         assert!(fake.still_same(&peer));
         fake.add(7, proc(6));
+        assert!(!fake.still_same(&peer));
+        fake.add(7, Process { image: vec![1], ..proc(5) });
         assert!(!fake.still_same(&peer));
         fake.kill(7);
         assert_eq!(fake.process(7), Err(Error::Gone));

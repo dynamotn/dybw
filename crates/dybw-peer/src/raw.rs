@@ -14,7 +14,6 @@ pub(crate) fn cvt(rc: libc::c_int) -> Result<(), Error> {
 }
 
 /// Refuse to read an argument block past [`crate::MAX_ARGS_BYTES`].
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn within_cap(size: usize) -> Result<(), Error> {
     if size > crate::MAX_ARGS_BYTES { Err(Error::TooLarge) } else { Ok(()) }
 }
