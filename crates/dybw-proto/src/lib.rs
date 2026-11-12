@@ -66,6 +66,43 @@ pub enum Select {
     ListFields,
 }
 
+/// What a remembered invoker may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyRule {
+    Allow,
+    Deny,
+}
+
+/// One invoker of a profile's caller policy: its executable, the script it runs if any, and the SHA-256 (hex) of
+/// the script (else the executable) that an `allow` was given for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyEntry {
+    pub exe: String,
+    pub script: Option<String>,
+    pub hash: String,
+    pub rule: PolicyRule,
+}
+
+/// What `dybw policy` does. `invoker` is an executable path, `script` the file an interpreter runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyAction {
+    Show,
+    Allow {
+        invoker: String,
+        script: Option<String>,
+    },
+    Deny {
+        invoker: String,
+        script: Option<String>,
+    },
+    /// Drop every entry whose executable or script is `invoker`.
+    Forget {
+        invoker: String,
+    },
+}
+
 /// What the client asks. `profile: None` means the agent's default profile.
 /// No op carries a secret: `Login` makes the agent prompt for the API key itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +148,11 @@ pub enum Op {
         needle: String,
         user: Option<String>,
         folder: Option<String>,
+    },
+    /// Show or change the caller policy of the profile.
+    Policy {
+        profile: Option<String>,
+        action: PolicyAction,
     },
     StopAgent,
     /// Any op this build does not know; refused by `decode_request`, never sent.
@@ -228,6 +270,10 @@ pub enum Reply {
     /// `History`: previous passwords, newest first.
     History {
         entries: Vec<HistoryEntry>,
+    },
+    /// `Policy` with `Show`.
+    Policy {
+        entries: Vec<PolicyEntry>,
     },
     Error {
         error: AgentError,
@@ -470,6 +516,13 @@ mod tests {
                 select: Select::ListFields,
             },
             Op::History { profile: p(), needle: s("n"), user: None, folder: Some(s("f")) },
+            Op::Policy { profile: p(), action: PolicyAction::Show },
+            Op::Policy {
+                profile: None,
+                action: PolicyAction::Allow { invoker: s("/bin/sh"), script: Some(s("/a.sh")) },
+            },
+            Op::Policy { profile: None, action: PolicyAction::Deny { invoker: s("/bin/sh"), script: None } },
+            Op::Policy { profile: None, action: PolicyAction::Forget { invoker: s("/bin/sh") } },
             Op::StopAgent,
         ];
         for op in ops {
@@ -515,6 +568,9 @@ mod tests {
             Reply::Raw { json: Secret::new(s("{}")) },
             Reply::FieldNames { names: vec![s("totp")] },
             Reply::History { entries: vec![HistoryEntry { last_used: s("d"), password: Secret::new(s("old")) }] },
+            Reply::Policy {
+                entries: vec![PolicyEntry { exe: s("/bin/sh"), script: None, hash: s("ab"), rule: PolicyRule::Deny }],
+            },
             Reply::Error {
                 error: AgentError::Ambiguous { candidates: vec![Candidate { id: s("i"), name: s("n"), user: None }] },
             },
