@@ -11,6 +11,8 @@ use zeroize::Zeroizing;
 
 /// How long the user has to answer one pinentry question.
 pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
+/// The title of every pinentry window.
+pub const TITLE: &str = "dybw";
 
 #[expect(async_fn_in_trait, reason = "the worker is single-threaded: its futures are never sent anywhere")]
 pub trait Host: Send + 'static {
@@ -18,10 +20,15 @@ pub trait Host: Send + 'static {
 
     /// A fresh HTTP client (redirects refused), one per login or sync.
     fn http(&self) -> Result<Self::Http, PortError>;
-    /// Ask for a secret; `None` is the user's cancel.
-    async fn password(&self, description: &str, error: Option<&str>) -> Result<Option<Zeroizing<String>>, PromptError>;
-    /// Ask the user to allow something; `false` is the user's no.
-    async fn confirm(&self, description: &str) -> Result<bool, PromptError>;
+    /// Ask for a secret (`prompt` is the field label); `None` is the user's cancel.
+    async fn password(
+        &self,
+        prompt: &str,
+        description: &str,
+        error: Option<&str>,
+    ) -> Result<Option<Zeroizing<String>>, PromptError>;
+    /// Ask the user to allow something; "always" is offered only when `offer_always`.
+    async fn confirm(&self, description: &str, offer_always: bool) -> Result<Confirm, PromptError>;
     /// The machine's name, for the device name the server shows.
     fn hostname(&self) -> String;
 }
@@ -46,16 +53,21 @@ impl Host for RealHost {
         HttpPort::new()
     }
 
-    async fn password(&self, description: &str, error: Option<&str>) -> Result<Option<Zeroizing<String>>, PromptError> {
+    async fn password(
+        &self,
+        prompt: &str,
+        description: &str,
+        error: Option<&str>,
+    ) -> Result<Option<Zeroizing<String>>, PromptError> {
         match &self.prompter {
-            Ok(p) => p.password(description, error).await,
+            Ok(p) => p.ask_password(TITLE, prompt, description, error).await,
             Err(why) => Err(PromptError::Untrusted(why.clone())),
         }
     }
 
-    async fn confirm(&self, description: &str) -> Result<bool, PromptError> {
+    async fn confirm(&self, description: &str, offer_always: bool) -> Result<Confirm, PromptError> {
         match &self.prompter {
-            Ok(p) => Ok(p.confirm(description, false).await? != Confirm::Deny),
+            Ok(p) => p.ask_confirm(TITLE, description, offer_always).await,
             Err(why) => Err(PromptError::Untrusted(why.clone())),
         }
     }
@@ -96,6 +108,8 @@ pub(crate) mod fake {
         pub answers: VecDeque<Answer>,
         /// Every question: the description and the error line.
         pub asked: Vec<(String, Option<String>)>,
+        /// The prompt (field label) of every question, in the same order.
+        pub prompts: Vec<String>,
         /// False: every request fails like a dead network.
         pub online: bool,
         /// The status of `/connect/token`: 200 logs in, 400 is a refused key.
@@ -125,6 +139,8 @@ pub(crate) mod fake {
         pub confirms: VecDeque<Answer>,
         /// Every confirmation asked.
         pub confirmed: Vec<String>,
+        /// Whether "always" was offered, per confirmation.
+        pub offered: Vec<bool>,
         /// What an `Answer::Held` confirmation waits for.
         pub release: Arc<tokio::sync::Notify>,
     }
@@ -143,6 +159,7 @@ pub(crate) mod fake {
             FakeHost(Arc::new(Mutex::new(World {
                 answers: VecDeque::new(),
                 asked: Vec::new(),
+                prompts: Vec::new(),
                 online: true,
                 token_status: 200,
                 http_fails: false,
@@ -158,6 +175,7 @@ pub(crate) mod fake {
                 profile: None,
                 confirms: VecDeque::new(),
                 confirmed: Vec::new(),
+                offered: Vec::new(),
                 release: Arc::new(tokio::sync::Notify::new()),
             })))
         }
@@ -251,12 +269,14 @@ pub(crate) mod fake {
         #[expect(clippy::unwrap_used, reason = "tests")]
         async fn password(
             &self,
+            prompt: &str,
             description: &str,
             error: Option<&str>,
         ) -> Result<Option<Zeroizing<String>>, PromptError> {
             let (answer, release) = {
                 let mut w = self.0.lock().unwrap();
                 w.asked.push((description.to_owned(), error.map(str::to_owned)));
+                w.prompts.push(prompt.to_owned());
                 (w.answers.pop_front().unwrap_or(Answer::Cancel), w.release.clone())
             };
             match answer {
@@ -274,21 +294,22 @@ pub(crate) mod fake {
         }
 
         #[expect(clippy::unwrap_used, reason = "tests")]
-        async fn confirm(&self, description: &str) -> Result<bool, PromptError> {
+        async fn confirm(&self, description: &str, offer_always: bool) -> Result<Confirm, PromptError> {
             let (answer, release) = {
                 let mut w = self.0.lock().unwrap();
                 w.confirmed.push(description.to_owned());
+                w.offered.push(offer_always);
                 (w.confirms.pop_front().unwrap_or(Answer::Cancel), w.release.clone())
             };
             match answer {
-                Answer::Text(_) => Ok(true),
-                Answer::Cancel => Ok(false),
+                Answer::Text(_) => Ok(Confirm::Once),
+                Answer::Cancel => Ok(Confirm::Deny),
                 Answer::Fail => Err(PromptError::Protocol("scripted".into())),
                 Answer::Timeout => Err(PromptError::Timeout),
                 Answer::Hang => std::future::pending().await,
                 Answer::Held => {
                     release.notified().await;
-                    Ok(true)
+                    Ok(Confirm::Once)
                 }
             }
         }
@@ -318,9 +339,9 @@ mod tests {
         let host = RealHost::new(trust(), "/nonexistent/pinentry");
         assert!(host.http().is_ok());
         assert!(!host.hostname().is_empty() && !host.hostname().chars().any(char::is_control));
-        let e = host.password("x", None).await.err().unwrap();
+        let e = host.password("p", "x", None).await.err().unwrap();
         assert!(matches!(e, PromptError::Untrusted(_)), "{e}");
-        let e = host.confirm("x").await.err().unwrap();
+        let e = host.confirm("x", false).await.err().unwrap();
         assert!(matches!(e, PromptError::Untrusted(_)), "{e}");
     }
 
@@ -328,9 +349,9 @@ mod tests {
     async fn the_real_host_runs_a_trusted_pinentry() {
         // `true` is not a pinentry: it says nothing, which is a protocol error, and that proves it was run.
         let host = RealHost::new(trust(), "/usr/bin/true");
-        let e = host.password("x", None).await.err().unwrap();
+        let e = host.password("p", "x", None).await.err().unwrap();
         assert!(!matches!(e, PromptError::Untrusted(_)), "{e}");
-        let e = host.confirm("x").await.err().unwrap();
+        let e = host.confirm("x", false).await.err().unwrap();
         assert!(!matches!(e, PromptError::Untrusted(_)), "{e}");
     }
 }

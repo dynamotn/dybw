@@ -83,6 +83,7 @@ async fn login_asks_for_both_halves_checks_the_key_and_stores_it_privately() {
         let w = host.world();
         assert_eq!(w.asked.len(), 2);
         assert!(w.asked[0].0.contains("client_id") && w.asked[1].0.contains("client_secret"));
+        assert_eq!(w.prompts, ["API key client_id:", "API key client_secret:"]);
         assert!(w.asked.iter().all(|(d, e)| !d.contains(SECRET) && e.is_none()), "no secret in a question");
         assert_eq!(w.device_names, ["dybw+on+testhost"]);
         // Servers hide SSH key items from clients older than 2024.12.
@@ -174,6 +175,7 @@ async fn an_online_unlock_opens_the_vault_and_keeps_the_ciphertext_privately() {
         let w = host.world();
         assert_eq!(w.asked.len(), 1);
         assert!(w.asked[0].0.contains("work") && w.asked[0].0.contains("pbkdf2@vectors.invalid"));
+        assert_eq!(w.prompts, ["Master password:"]);
         assert_eq!((w.count("connect/token"), w.count("excludeDomains=true"), w.count("prelogin")), (1, 1, 1));
         assert_eq!(w.device_names, ["dybw+on+testhost"]);
     }

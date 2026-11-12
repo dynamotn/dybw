@@ -371,7 +371,7 @@ async fn get<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, find: Lookup, select
     }
     {
         let _one_at_a_time = shared.asking.lock().await;
-        let answer = session::confirm(host, &ask_text(ctx, &found, select.as_ref())).await;
+        let answer = session::confirm(host, &ask_text(ctx, &found, select.as_ref()), false).await;
         tracing::info!(profile = %ctx.profile.name, id = %found.id, allowed = answer.is_ok(), "value request");
         if let Err(e) = answer {
             return error(e);

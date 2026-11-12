@@ -13,7 +13,7 @@ use dybw_core::profile::{self, CachedSync, ProfileError, UnlockedVault};
 use dybw_core::vault::Organizations;
 use dybw_native::fsutil::{User, write_private};
 use dybw_native::ports::{clock::SystemClock, kdf::BlockingArgon2};
-use dybw_native::prompter::{PromptError, one_line};
+use dybw_native::prompter::{Confirm, PromptError, one_line};
 use dybw_proto::AgentError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -212,8 +212,13 @@ fn map_api(e: &ApiError) -> AgentError {
 }
 
 /// Ask for a secret. A cancel, an empty answer and a timeout are the user's no; anything else is a failed prompt.
-async fn ask<H: Host>(host: &H, description: &str, error: Option<&str>) -> Result<Zeroizing<String>, AgentError> {
-    match host.password(description, error).await {
+async fn ask<H: Host>(
+    host: &H,
+    prompt: &str,
+    description: &str,
+    error: Option<&str>,
+) -> Result<Zeroizing<String>, AgentError> {
+    match host.password(prompt, description, error).await {
         Ok(Some(secret)) if !secret.is_empty() => Ok(secret),
         Ok(_) | Err(PromptError::Timeout) => Err(AgentError::Denied),
         Err(e) => {
@@ -223,12 +228,13 @@ async fn ask<H: Host>(host: &H, description: &str, error: Option<&str>) -> Resul
     }
 }
 
-/// Ask the user to allow one read of a value (the value gate). Only an explicit yes passes; a no, a cancel and a
-/// timeout are `Denied`, a prompt that could not be put is `Prompt`.
-pub async fn confirm<H: Host>(host: &H, text: &str) -> Result<(), AgentError> {
-    match host.confirm(text).await {
-        Ok(true) => Ok(()),
-        Ok(false) | Err(PromptError::Timeout) => Err(AgentError::Denied),
+/// Ask the user to allow one read of a value. Only an explicit yes passes (`true`: and "always"); a no, a cancel
+/// and a timeout are `Denied`, a prompt that could not be put is `Prompt`.
+pub async fn confirm<H: Host>(host: &H, text: &str, offer_always: bool) -> Result<bool, AgentError> {
+    match host.confirm(text, offer_always).await {
+        Ok(Confirm::Once) => Ok(false),
+        Ok(Confirm::Always) => Ok(true),
+        Ok(Confirm::Deny) | Err(PromptError::Timeout) => Err(AgentError::Denied),
         Err(e) => {
             tracing::warn!("prompt: {e}");
             Err(AgentError::Prompt)
@@ -309,12 +315,13 @@ pub async fn login<H: Host>(host: &H, ctx: &Ctx) -> Result<(), AgentError> {
     let who = format!("dybw profile {} ({})", ctx.profile.name, one_line(&ctx.profile.server_url));
     // The pinentry says "Master password:" whatever is asked, so the description must say what this is.
     let notice = "This is the API key, NOT your master password.";
-    let client_id = ask(host, &format!("{notice} Log in to {who}: API key client_id (user.<uuid>)"), None).await?;
+    let desc = format!("{notice} Log in to {who}: API key client_id (user.<uuid>)");
+    let client_id = ask(host, "API key client_id:", &desc, None).await?;
     if !is_client_id(&client_id) {
         return Err(AgentError::NotAnApiKey);
     }
     let desc = format!("{notice} Log in to {who}: API key client_secret (20 to 64 letters and digits)");
-    let client_secret = ask(host, &desc, None).await?;
+    let client_secret = ask(host, "API key client_secret:", &desc, None).await?;
     if !is_client_secret(&client_secret) {
         return Err(AgentError::NotAnApiKey);
     }
@@ -367,7 +374,7 @@ pub async fn unlock<H: Host>(host: &H, ctx: &Ctx) -> Result<Session, AgentError>
     let description = format!("Unlock dybw profile {} ({})", ctx.profile.name, one_line(&ctx.profile.email));
     let mut wrong = None;
     for _ in 0..ATTEMPTS {
-        let password = ask(host, &description, wrong).await?;
+        let password = ask(host, "Master password:", &description, wrong).await?;
         match open(host, ctx, &urls, &key, password).await {
             Ok(vault) => return Ok(Session { vault, origin, urls }),
             Err(Refused::WrongPassword) => wrong = Some("Wrong master password."),
