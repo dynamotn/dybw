@@ -4,8 +4,10 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use dybw_peer::{Peer, Process, ProcessSource};
 use serde::Deserialize;
@@ -14,9 +16,13 @@ use sha2::{Digest, Sha256};
 /// Most ancestors looked at before the walk gives up (`Unknown`).
 const MAX_DEPTH: usize = 64;
 /// Largest script or executable hashed; a bigger one is `Unknown`.
-const MAX_HASH_BYTES: u64 = 64 << 20;
+const MAX_HASH_BYTES: u64 = 16 << 20;
 /// The CLI (and the `rbw` stand-in): a `dybw` run by one of these is looked through.
 const CLI_NAMES: [&str; 2] = ["dybw", "rbw"];
+/// Processes that adopt orphans: an invoker named so is a detached caller, not a program that ran dybw.
+const SUBREAPERS: [&str; 5] = ["systemd", "init", "launchd", "tini", "dumb-init"];
+/// Privilege wrappers: anything run through them is not named by its invoker.
+const ELEVATORS: [&str; 5] = ["sudo", "doas", "su", "run0", "pkexec"];
 const INTERPRETERS: [&str; 4] = ["node", "perl", "ruby", "osascript"];
 /// Environment variables a harness sets (profiles §4); they only ever tighten.
 const MARKERS: [(&str, &str); 8] = [
@@ -70,6 +76,15 @@ impl Harness {
         }
     }
 
+    /// Without empty fragments (they would match everything); `None` when no name or nothing to match is left.
+    fn cleaned(mut self) -> Option<Self> {
+        for list in [&mut self.exe, &mut self.exe_contains, &mut self.argv_contains, &mut self.argv_base] {
+            list.retain(|f| !f.is_empty());
+        }
+        let any = [&self.exe, &self.exe_contains, &self.argv_contains, &self.argv_base].iter().any(|l| !l.is_empty());
+        (!self.name.is_empty() && any).then_some(self)
+    }
+
     fn matches(&self, p: &Process) -> bool {
         let exe = p.exe.to_string_lossy();
         let base = p.exe.file_name().map(|b| b.to_string_lossy().into_owned()).unwrap_or_default();
@@ -98,12 +113,12 @@ struct HarnessFile {
 impl Default for Harnesses {
     fn default() -> Self {
         Self(vec![
-            Harness::new("claude", &["claude"], &[], &[], &[]),
+            Harness::new("claude", &["claude"], &["/claude/versions/", "/installs/claude/"], &[], &["claude"]),
             Harness::new("codex", &["codex"], &[], &["@openai/codex"], &[]),
             Harness::new("gemini", &[], &[], &["@google/gemini-cli"], &[]),
             Harness::new("antigravity", &["agy", "antigravity"], &[], &[], &[]),
             Harness::new("copilot", &["copilot"], &[], &["@github/copilot"], &[]),
-            Harness::new("cursor", &[], &["cursor-agent/versions/"], &[], &["cursor-agent"]),
+            Harness::new("cursor", &[], &["cursor-agent/versions/"], &["cursor-agent/"], &["cursor-agent"]),
             Harness::new("goose", &["goose"], &[], &[], &[]),
             Harness::new("opencode", &["opencode"], &[], &["opencode.cjs"], &[]),
             Harness::new("aider", &[], &[], &[], &["aider"]),
@@ -116,13 +131,13 @@ impl Harnesses {
     /// The defaults plus the entries of `file`; a missing, oversized or malformed file adds nothing (and is logged).
     pub fn load(file: &Path) -> Self {
         let mut table = Self::default();
-        let text = match read_capped(file, 64 << 10) {
+        let text = match std::fs::File::open(file).and_then(|f| read_capped(f, 64 << 10)) {
             Ok(bytes) => String::from_utf8(bytes).ok(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return table,
             Err(_) => None,
         };
         match text.and_then(|t| toml::from_str::<HarnessFile>(&t).ok()) {
-            Some(extra) => table.0.extend(extra.harness.into_iter().filter(|h| !h.name.is_empty())),
+            Some(extra) => table.0.extend(extra.harness.into_iter().filter_map(Harness::cleaned)),
             None => tracing::warn!(file = %file.display(), "ignoring an unreadable harness list"),
         }
         table
@@ -155,6 +170,12 @@ pub struct Resolved {
     chain: Vec<Seen>,
 }
 
+impl Resolved {
+    fn unknown(peer: Peer, why: &str) -> Self {
+        Self { caller: Caller::Unknown { why: why.into() }, peer, chain: Vec::new() }
+    }
+}
+
 pub struct Resolver {
     source: Arc<dyn ProcessSource>,
     harnesses: Harnesses,
@@ -165,7 +186,15 @@ impl Resolver {
         Self { source, harnesses }
     }
 
-    /// Resolve the peer. Call it as soon as the connection is accepted.
+    /// Resolve the peer on a blocking thread (it reads and hashes files). Call it as soon as the connection is
+    /// accepted.
+    pub async fn resolve_async(self: Arc<Self>, peer: Peer) -> Resolved {
+        let (me, p) = (self.clone(), peer.clone());
+        let joined = tokio::task::spawn_blocking(move || me.resolve(p)).await;
+        joined.unwrap_or(Resolved::unknown(peer, "the resolver failed"))
+    }
+
+    /// Resolve the peer on this thread.
     pub fn resolve(&self, peer: Peer) -> Resolved {
         let (caller, chain) = self.classify(&peer);
         Resolved { caller, peer, chain }
@@ -216,9 +245,18 @@ impl Resolver {
         if !complete {
             return (Caller::Unknown { why: "the ancestry could not be read to the top".into() }, seen);
         }
+        if !chain.first().is_some_and(is_cli) {
+            return (Caller::Unknown { why: "the peer is not dybw".into() }, seen);
+        }
         let Some((index, process)) = invoker else {
             return (Caller::Unknown { why: "no process above dybw (orphan)".into() }, seen);
         };
+        if chain.iter().any(|p| named(p, &ELEVATORS)) {
+            return (Caller::Unknown { why: "run through a privilege wrapper".into() }, seen);
+        }
+        if named(process, &SUBREAPERS) || base(process).starts_with("containerd-shim") {
+            return (Caller::Unknown { why: "the invoker adopts orphans: a detached caller".into() }, seen);
+        }
         match identify(process) {
             Ok(caller) => (caller, seen.into_iter().take(index + 1).collect()),
             Err(why) => (Caller::Unknown { why }, seen),
@@ -240,79 +278,107 @@ impl Resolver {
 /// Index in `chain` (peer first) of the invoker: the first ancestor that is not `dybw`/`rbw`. `None` for an orphan
 /// (nothing above the peer, or only CLI names above it).
 fn invoker_index(chain: &[Process]) -> Option<(usize, &Process)> {
-    let is_cli = |p: &Process| p.exe.file_name().is_some_and(|n| CLI_NAMES.iter().any(|c| n == *c));
     chain.iter().enumerate().skip(1).find(|(_, p)| !is_cli(p))
 }
 
-/// The option letters that mean "the program is given inline" for this interpreter, `None` if it is not one.
-/// (`-e` is errexit for a shell, so only `-c` counts there.)
-fn inline_letters(exe: &Path) -> Option<&'static [char]> {
+fn base(p: &Process) -> String {
+    p.exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+fn named(p: &Process, names: &[&str]) -> bool {
+    names.contains(&base(p).as_str())
+}
+
+fn is_cli(p: &Process) -> bool {
+    named(p, &CLI_NAMES)
+}
+
+/// The valueless option letters an interpreter may carry before its script, `None` if it is not an interpreter.
+/// Anything else (an option with a value, `-c`, `-e`, `-m`, `-s`, `-`, `--opt=x`) makes the script unknowable.
+fn flag_letters(exe: &Path) -> Option<&'static [char]> {
     let name = exe.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     if ["sh", "bash", "zsh", "fish", "dash"].contains(&name.as_str()) {
-        Some(&['c'])
-    } else if INTERPRETERS.contains(&name.as_str()) || name.starts_with("python") {
-        Some(&['c', 'e', 'E', 'm', 'p'])
+        Some(&['e', 'x', 'u', 'l', 'i'])
+    } else if name.starts_with("python") {
+        Some(&['u', 'B', 'E', 'I', 's'])
+    } else if INTERPRETERS.contains(&name.as_str()) {
+        Some(&[])
     } else {
         None
     }
 }
 
-/// An option that gives the program inline (`-c`, `-e`, `-lc`, `--eval`) or as a module (`-m`).
-fn is_inline(arg: &str, letters: &[char]) -> bool {
-    match arg.strip_prefix('-') {
-        Some(rest) if !rest.starts_with('-') => {
-            rest.len() <= 3 && rest.chars().all(char::is_alphabetic) && rest.contains(letters)
-        }
-        _ => ["--eval", "--print", "--command"].contains(&arg),
-    }
-}
-
-/// The script an interpreter runs: the first non-option argument that is an existing file (canonical). `Ok(None)`:
-/// no script (an interactive shell); `Err`: cannot be named (inline code, a relative path we cannot resolve since
-/// the working directory is not known, argv hidden).
+/// The script an interpreter runs: argv[1], or the argument after `--`, preceded only by known valueless flags;
+/// canonical (a relative path is resolved against the process's cwd). `Ok(None)`: no argument at all (an interactive
+/// interpreter). `Err`: cannot be named (inline code, any other option, hidden argv or cwd, a script that does not
+/// resolve to a file).
 fn script_of(p: &Process, letters: &[char]) -> Result<Option<PathBuf>, String> {
     let argv = p.argv.as_deref().ok_or("the interpreter's arguments are not visible")?;
-    let mut after_dashes = false;
+    let mut dashes = false;
+    let mut script = None;
     for arg in argv.iter().skip(1) {
         let arg = arg.to_string_lossy();
-        if !after_dashes && arg == "--" {
-            after_dashes = true;
-        } else if !after_dashes && is_inline(&arg, letters) {
-            return Err("the interpreter runs inline code or a module".into());
-        } else if after_dashes || !arg.starts_with('-') {
-            if !Path::new(&*arg).is_absolute() {
-                return Err("the script path is relative and its directory is unknown".into());
+        if !dashes && arg == "--" {
+            dashes = true;
+        } else if !dashes && arg.starts_with('-') {
+            let valueless = arg.len() > 1 && arg.chars().skip(1).all(|c| letters.contains(&c));
+            if !valueless {
+                return Err("the interpreter has an option that may hide its script".into());
             }
-            if let Ok(path) = std::fs::canonicalize(&*arg)
-                && path.is_file()
-            {
-                return Ok(Some(path));
-            }
+        } else {
+            script = Some(arg.into_owned());
+            break;
         }
     }
-    Ok(None)
+    let Some(script) = script else { return Ok(None) };
+    let path = match (Path::new(&script).is_absolute(), &p.cwd) {
+        (true, _) => PathBuf::from(&script),
+        (false, Some(cwd)) => cwd.join(&script),
+        (false, None) => return Err("the script path is relative and the working directory is not visible".into()),
+    };
+    let path = std::fs::canonicalize(path).map_err(|_| "the script cannot be found".to_owned())?;
+    if path.is_file() { Ok(Some(path)) } else { Err("the script is not a file".into()) }
 }
 
 fn identify(p: &Process) -> Result<Caller, String> {
-    let script = match inline_letters(&p.exe) {
+    let script = match flag_letters(&p.exe) {
         Some(letters) => script_of(p, letters)?,
         None => None,
     };
-    let hash = hash_file(script.as_deref().unwrap_or(&p.exe))?;
+    let hash = hash_file(script.as_deref().unwrap_or(&p.exe), p.started)?;
     Ok(Caller::Invoker { exe: p.exe.clone(), script, hash })
 }
 
-fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+fn read_capped(file: std::fs::File, cap: u64) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?.take(cap + 1).read_to_end(&mut bytes)?;
+    file.take(cap + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > cap {
         return Err(std::io::Error::other("file too large"));
     }
     Ok(bytes)
 }
 
-fn hash_file(path: &Path) -> Result<String, String> {
-    let bytes = read_capped(path, MAX_HASH_BYTES).map_err(|_| "the invoker's file cannot be read".to_owned())?;
+/// Slack for a start time kept in clock ticks (10 ms on Linux).
+const TICK: Duration = Duration::from_millis(20);
+
+/// The last time the file was written or its inode changed.
+fn changed(md: &std::fs::Metadata) -> Option<SystemTime> {
+    let ctime = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::new(u64::try_from(md.ctime()).ok()?, u32::try_from(md.ctime_nsec()).ok()?))?;
+    Some(ctime.max(md.modified().ok()?))
+}
+
+/// SHA-256 (hex) of the file, opened once: what is hashed is what was `fstat`ed. A file written or changed after the
+/// process started is not what the process is running, so it is refused.
+fn hash_file(path: &Path, started: Option<SystemTime>) -> Result<String, String> {
+    let unreadable = |_| "the invoker's file cannot be read".to_owned();
+    let file = std::fs::File::open(path).map_err(unreadable)?;
+    let md = file.metadata().map_err(unreadable)?;
+    let started = started.ok_or("the invoker's start time is unknown")?;
+    if changed(&md).is_none_or(|t| t > started + TICK) {
+        return Err("the invoker's file changed after it started".into());
+    }
+    let bytes = read_capped(file, MAX_HASH_BYTES).map_err(unreadable)?;
     Ok(Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect())
 }
 

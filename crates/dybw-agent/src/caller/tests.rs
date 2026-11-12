@@ -40,6 +40,8 @@ impl Tree {
                 image: Vec::new(),
                 argv: argv.map(|a| a.iter().map(|s| os(s)).collect()),
                 env: env.map(|e| e.iter().map(|k| (os(k), os("1"))).collect()),
+                cwd: None,
+                started: Some(SystemTime::now() + Duration::from_secs(3600)),
             },
         );
     }
@@ -145,20 +147,149 @@ fn inline_code_a_module_a_relative_script_or_hidden_argv_is_unknown() {
 }
 
 #[test]
-fn a_script_after_double_dash_and_a_missing_script_are_handled() {
+fn a_script_after_double_dash_and_clustered_flags_are_handled() {
     let t = Tree::new();
     let sh = t.file("sh", "elf");
+    let py = t.file("python3", "elf");
     let script = t.file("s.sh", "x");
     t.dybw(50);
     t.add(50, &sh, 1, Some(&["sh", "--", &script.to_string_lossy()]), Some(&[]));
     assert!(matches!(t.caller(), Caller::Invoker { script: Some(s), .. } if s == script));
-    // An absolute path that is not a file is skipped: the shell itself is the invoker.
-    t.add(50, &sh, 1, Some(&["sh", "/no/such/script"]), Some(&[]));
-    assert!(matches!(t.caller(), Caller::Invoker { script: None, .. }));
-    // A directory is not a script either.
+    t.add(50, &sh, 1, Some(&["sh", "-eux", &script.to_string_lossy(), "-c", "ignored"]), Some(&[]));
+    assert!(matches!(t.caller(), Caller::Invoker { script: Some(s), .. } if s == script));
+    t.add(50, &py, 1, Some(&["python3", "-uB", "-I", &script.to_string_lossy()]), Some(&[]));
+    assert!(matches!(t.caller(), Caller::Invoker { script: Some(s), .. } if s == script));
+    // Only flags, or nothing: an interactive interpreter.
+    for argv in [vec!["sh"], vec!["sh", "-l"], vec!["sh", "--"]] {
+        t.add(50, &sh, 1, Some(&argv), Some(&[]));
+        assert!(matches!(t.caller(), Caller::Invoker { script: None, .. }), "{argv:?}");
+    }
+}
+
+#[test]
+fn a_script_that_does_not_resolve_is_unknown() {
+    let t = Tree::new();
+    let sh = t.file("sh", "elf");
+    t.dybw(50);
     let dir = t.dir.path().to_string_lossy().into_owned();
-    t.add(50, &sh, 1, Some(&["sh", &dir]), Some(&[]));
-    assert!(matches!(t.caller(), Caller::Invoker { script: None, .. }));
+    for arg in ["/no/such/script", dir.as_str()] {
+        t.add(50, &sh, 1, Some(&["sh", arg]), Some(&[]));
+        assert!(matches!(t.caller(), Caller::Unknown { .. }), "{arg}");
+    }
+}
+
+#[test]
+fn a_relative_script_resolves_against_the_cwd_of_the_interpreter() {
+    let t = Tree::new();
+    let sh = t.file("sh", "elf");
+    let script = t.file("rel.sh", "x");
+    t.dybw(50);
+    t.add(50, &sh, 1, Some(&["sh", "rel.sh"]), Some(&[]));
+    let with_cwd = Process { cwd: Some(t.dir.path().to_path_buf()), ..t.fake.process(50).unwrap() };
+    t.fake.add(50, with_cwd);
+    assert!(matches!(t.caller(), Caller::Invoker { script: Some(s), .. } if s == script));
+    // A script that vanished again.
+    t.add(50, &sh, 1, Some(&["sh", "gone.sh"]), Some(&[]));
+    t.fake.add(50, Process { cwd: Some(t.dir.path().to_path_buf()), ..t.fake.process(50).unwrap() });
+    assert!(unknown(&t.caller()).contains("cannot be found"));
+}
+
+#[test]
+fn options_that_may_hide_the_script_are_unknown() {
+    // Every bypass the review listed: an attacker's /abs/g.* is the existing file a naive scan would take.
+    let t = Tree::new();
+    let sh = t.file("bash", "elf");
+    let py = t.file("python3", "elf");
+    let node = t.file("node", "elf");
+    let g = |name: &str| t.file(name, "good").to_string_lossy().into_owned();
+    let (gsh, gpy, gjs) = (g("g.sh"), g("g.py"), g("g.js"));
+    t.dybw(50);
+    for (exe, argv) in [
+        (&sh, vec!["bash", "-s", &gsh]),
+        (&sh, vec!["bash", "-", &gsh]),
+        (&sh, vec!["bash", "--rcfile", &gsh, "evil.sh"]),
+        (&sh, vec!["bash", "-euxc", "evil"]),
+        (&sh, vec!["bash", "-c", "evil", &gsh]),
+        (&sh, vec!["bash", "-ic", "evil"]),
+        (&sh, vec!["bash", "--command", "evil"]),
+        (&sh, vec!["bash", "-o", "pipefail", &gsh]),
+        (&py, vec!["python3", "-", &gpy]),
+        (&py, vec!["python3", "-W", &gpy, "evil.py"]),
+        (&py, vec!["python3", "-c\"import os\"", &gpy]),
+        (&py, vec!["python3", "-mpytest", &gpy]),
+        (&py, vec!["python3", "-m", "pytest", &gpy]),
+        (&py, vec!["python3", "-X", "dev", &gpy]),
+        (&node, vec!["node", "--require", &gjs, "evil.js"]),
+        (&node, vec!["node", "-e'evil'", &gjs]),
+        (&node, vec!["node", "--eval=evil", &gjs]),
+        (&node, vec!["node", "-p", "evil", &gjs]),
+        (&node, vec!["node", "--inspect", &gjs]),
+        (&node, vec!["node", "-r", &gjs, "evil.js"]),
+    ] {
+        t.add(50, exe, 1, Some(&argv), Some(&[]));
+        assert!(matches!(t.caller(), Caller::Unknown { .. }), "{argv:?}");
+    }
+}
+
+#[test]
+fn a_file_changed_after_the_process_started_is_unknown() {
+    // The grant must not rest on a hash of content the process never ran.
+    let t = Tree::new();
+    let sh = t.file("sh", "elf");
+    let script = t.file("s.sh", "x");
+    t.dybw(50);
+    t.add(50, &sh, 1, Some(&["sh", &script.to_string_lossy()]), Some(&[]));
+    let long_ago = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    t.fake.add(50, Process { started: Some(long_ago), ..t.fake.process(50).unwrap() });
+    assert!(unknown(&t.caller()).contains("changed after"));
+    // The same for an executable with no script, and for an unknown start time.
+    t.add(50, &sh, 1, Some(&["sh"]), Some(&[]));
+    t.fake.add(50, Process { started: Some(long_ago), ..t.fake.process(50).unwrap() });
+    assert!(unknown(&t.caller()).contains("changed after"));
+    t.fake.add(50, Process { started: None, ..t.fake.process(50).unwrap() });
+    assert!(unknown(&t.caller()).contains("start time"));
+}
+
+#[test]
+fn subreapers_privilege_wrappers_and_other_peers_are_unknown() {
+    let t = Tree::new();
+    let app = t.file("app", "binary");
+    for name in ["systemd", "init", "launchd", "tini", "dumb-init", "containerd-shim-runc-v2"] {
+        t.dybw(50);
+        t.add(50, Path::new(&format!("/usr/bin/{name}")), 1, Some(&[name]), Some(&[]));
+        assert!(unknown(&t.caller()).contains("adopts"), "{name}");
+    }
+    for name in ["sudo", "doas", "su", "run0", "pkexec"] {
+        t.dybw(50);
+        t.add(50, &app, 40, Some(&["app"]), Some(&[]));
+        t.add(40, Path::new(&format!("/usr/bin/{name}")), 1, Some(&[name]), Some(&[]));
+        assert!(unknown(&t.caller()).contains("privilege"), "{name}");
+        // The harness above it is still the answer.
+        t.add(40, Path::new(&format!("/usr/bin/{name}")), 30, Some(&[name]), Some(&[]));
+        t.add(30, Path::new("/opt/claude"), 1, Some(&["claude"]), Some(&[]));
+        assert_eq!(ai_via(&t.caller()), ("claude", Via::Ancestry));
+    }
+    // The peer must be dybw (or rbw).
+    t.add(50, &app, 1, Some(&["app"]), Some(&[]));
+    t.add(PEER, Path::new("/bin/other"), 50, Some(&["other"]), Some(&[]));
+    assert!(unknown(&t.caller()).contains("not dybw"));
+}
+
+#[test]
+fn resolving_off_the_async_thread_gives_the_same_answer() {
+    let t = Tree::new();
+    let app = t.file("app", "binary");
+    t.dybw(50);
+    t.add(50, &app, 1, Some(&["app"]), Some(&[]));
+    let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let peer = t.fake.peer_of(a.as_fd()).unwrap();
+    let resolver = Arc::new(t.resolver());
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let resolved = runtime.block_on(resolver.clone().resolve_async(peer));
+    assert!(matches!(&resolved.caller, Caller::Invoker { exe, .. } if *exe == app));
+    assert!(resolver.recheck(&resolved));
+    let failed = Resolved::unknown(resolved.peer.clone(), "the resolver failed");
+    assert!(unknown(&failed.caller).contains("failed"));
 }
 
 #[test]
@@ -208,7 +339,19 @@ fn a_peer_whose_pid_is_reused_fails_the_recheck() {
     let resolved = t.resolve();
     assert!(t.resolver().recheck(&resolved));
     // The peer exits and another program gets its pid.
-    t.fake.add(PEER, Process { exe: "/bin/other".into(), ppid: 50, start: 5000, image: vec![], argv: None, env: None });
+    t.fake.add(
+        PEER,
+        Process {
+            exe: "/bin/other".into(),
+            ppid: 50,
+            start: 5000,
+            image: vec![],
+            argv: None,
+            env: None,
+            cwd: None,
+            started: None,
+        },
+    );
     assert!(!t.resolver().recheck(&resolved));
     t.fake.kill(PEER);
     assert!(!t.resolver().recheck(&resolved));
@@ -254,6 +397,10 @@ fn a_harness_ancestor_classifies_even_with_a_cleared_environment() {
     t.add(50, &sh, 40, Some(&["zsh", &script.to_string_lossy()]), Some(&[]));
     for (exe, argv, harness) in [
         ("/opt/claude", vec!["claude"], "claude"),
+        ("/h/.local/share/mise/installs/claude/2.1.0/claude", vec!["x"], "claude"),
+        ("/h/.local/share/claude/versions/2.1.0", vec!["2.1.0"], "claude"),
+        ("/usr/bin/node", vec!["/home/u/bin/claude", "--resume"], "claude"),
+        ("/usr/bin/node", vec!["node", "/h/cursor-agent/index.js"], "cursor"),
         ("/usr/bin/node", vec!["node", "/x/@google/gemini-cli/dist/index.js"], "gemini"),
         ("/usr/bin/node", vec!["node", "/x/@openai/codex/bin/codex.js"], "codex"),
         ("/usr/bin/node", vec!["node", "/x/@github/copilot/index.js"], "copilot"),
@@ -349,9 +496,10 @@ fn an_unreadable_invoker_file_is_unknown() {
 fn reading_is_capped() {
     let t = Tree::new();
     let f = t.file("big", "12345");
-    assert_eq!(read_capped(&f, 5).unwrap(), b"12345");
-    assert!(read_capped(&f, 4).is_err());
-    assert!(hash_file(Path::new("/no/such")).is_err());
+    let open = || std::fs::File::open(&f).unwrap();
+    assert_eq!(read_capped(open(), 5).unwrap(), b"12345");
+    assert!(read_capped(open(), 4).is_err());
+    assert!(hash_file(Path::new("/no/such"), None).is_err());
 }
 
 #[test]
@@ -364,10 +512,29 @@ fn the_harness_list_only_grows() {
         .unwrap();
     let table = Harnesses::load(&file);
     assert_eq!(table.0.len(), defaults + 1);
-    let mine = Process { exe: "/bin/my-agent".into(), ppid: 1, start: 0, image: vec![], argv: None, env: None };
+    let mine = Process {
+        exe: "/bin/my-agent".into(),
+        ppid: 1,
+        start: 0,
+        image: vec![],
+        argv: None,
+        env: None,
+        cwd: None,
+        started: None,
+    };
     assert_eq!(table.find(&mine), Some("mine"));
     let claude = Process { exe: "/bin/claude".into(), ..mine };
     assert_eq!(table.find(&claude), Some("claude"));
+    // Empty fragments would match everything: dropped, and an entry left with nothing is dropped.
+    std::fs::write(
+        &file,
+        "[[harness]]\nname = \"a\"\nexe = [\"\"]\n[[harness]]\nname = \"b\"\nexe = [\"b\", \"\"]\nargv_contains = [\"\"]\n",
+    )
+    .unwrap();
+    let table = Harnesses::load(&file);
+    assert_eq!(table.0.len(), defaults + 1);
+    assert_eq!(table.find(&claude), Some("claude"));
+    assert!(table.find(&Process { exe: "/bin/zzz".into(), ..claude.clone() }).is_none());
     for bad in ["not toml [", "[[harness]]\nexe = 3\n"] {
         std::fs::write(&file, bad).unwrap();
         assert_eq!(Harnesses::load(&file).0.len(), defaults);
