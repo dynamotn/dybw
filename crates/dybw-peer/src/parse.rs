@@ -32,9 +32,15 @@ pub(crate) fn procargs2(buf: &[u8]) -> Option<(Vec<OsString>, Env)> {
     let (head, rest) = buf.split_first_chunk::<4>()?;
     let argc = usize::try_from(i32::from_ne_bytes(*head)).ok()?;
     let path_end = rest.iter().position(|b| *b == 0)?;
-    let rest = rest.get(path_end + (8 - path_end % 8)..).unwrap_or_default();
+    // Skip every NUL after the path. The kernel pads the path (with its
+    // terminator) to a multiple of 8; NULs beyond that guess can only be
+    // empty argv entries (one NUL each), so a wrong guess never cuts data.
+    let nuls = rest.iter().skip(path_end).take_while(|b| **b == 0).count();
+    let empties = nuls.saturating_sub(8 - path_end % 8).min(argc).min(MAX_ENTRIES);
+    let rest = rest.get(path_end + nuls..).unwrap_or_default();
     let mut parts = rest.split(|b| *b == 0);
-    let argv = parts.by_ref().take(argc.min(MAX_ENTRIES)).map(os).collect();
+    let mut argv: Vec<OsString> = vec![OsString::new(); empties];
+    argv.extend(parts.by_ref().take(argc.min(MAX_ENTRIES) - empties).map(os));
     Some((argv, env_pairs(parts)))
 }
 
@@ -150,6 +156,20 @@ mod tests {
         env.extend(std::iter::repeat_n(&b"K=v\0"[..], MAX_ENTRIES + 10).flatten());
         assert_eq!(procargs2(&args2(0, &env)).unwrap().1.len(), MAX_ENTRIES);
         assert_eq!(cmdline(&many).len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn procargs2_never_cuts_data_on_a_wrong_padding_guess() {
+        // too many NULs after the path: the surplus are empty argv entries.
+        let (argv, _) = procargs2(&args2(4, b"/bin/x\0\0\0\0\0a\0")).unwrap();
+        assert_eq!(argv, vec![s(""), s(""), s(""), s("a")]);
+        // too few: nothing is lost either.
+        let (argv, _) = procargs2(&args2(1, b"/bin/x\0a\0")).unwrap();
+        assert_eq!(argv, vec![s("a")]);
+        // more empties than argc: capped, env still read.
+        let (argv, env) = procargs2(&args2(1, b"/x\0\0\0\0\0\0\0\0\0A=1\0")).unwrap();
+        assert_eq!(argv, vec![s("")]);
+        assert_eq!(env, vec![(s("A"), s("1"))]);
     }
 
     #[test]

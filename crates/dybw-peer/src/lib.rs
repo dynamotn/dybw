@@ -293,6 +293,30 @@ mod tests {
     }
 
     #[test]
+    fn argv_survives_every_path_length_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::env::current_exe().unwrap();
+        for n in 1..=8usize {
+            let copy = dir.path().join("a".repeat(n));
+            std::fs::copy(&me, &copy).unwrap();
+            for arg0 in ["zero", ""] {
+                let mut child = Command::new(&copy)
+                    .arg0(arg0)
+                    .args(["--exact", "tests::child_body"])
+                    .env(MARKER, "x=y")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let argv = Process::of(child.id()).unwrap().argv.unwrap();
+                child.kill().unwrap();
+                child.wait().unwrap();
+                assert_eq!(argv, [arg0, "--exact", "tests::child_body"], "name length {n}");
+            }
+        }
+    }
+
+    #[test]
     fn an_exited_child_is_gone_and_not_the_same() {
         let mut child = sleeper();
         let peer = sys::peer_of_pid(child.id()).unwrap();

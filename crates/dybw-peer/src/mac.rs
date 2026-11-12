@@ -67,9 +67,16 @@ fn version_matches(idversion: i32, version: u32) -> Result<(), Error> {
     if idversion as u32 == version { Ok(()) } else { Err(Error::Gone) }
 }
 
+/// The pidversion inside an [`image`]: bytes 8..12, after the unique id.
+fn image_version(image: &[u8]) -> Result<i32, Error> {
+    let bytes = image.get(8..).and_then(|b| b.first_chunk::<4>()).ok_or(Error::Malformed)?;
+    Ok(i32::from_ne_bytes(*bytes))
+}
+
 fn peer_from(pid: u32, uid: u32, version: u32) -> Result<Peer, Error> {
     version_matches(uniq(pid)?.p_idversion, version)?;
     let (_, start, image) = crate::stable_id(pid)?;
+    version_matches(image_version(&image)?, version)?;
     Ok(Peer { pid, uid, token: Token::new(version, start, image, None) })
 }
 
@@ -175,6 +182,14 @@ mod tests {
         assert_eq!(version_matches(current, current as u32), Ok(()));
         assert_eq!(peer_from(me, 0, current as u32 + 1).err(), Some(Error::Gone));
         assert!(peer_from(me, 0, current as u32).is_ok());
+    }
+
+    #[test]
+    fn the_image_carries_the_pidversion() {
+        let me = std::process::id();
+        assert_eq!(image_version(&image(me).unwrap()).unwrap(), uniq(me).unwrap().p_idversion);
+        assert_eq!(image_version(&[0; 11]), Err(Error::Malformed));
+        assert_eq!(image_version(&[]), Err(Error::Malformed));
     }
 
     #[test]
