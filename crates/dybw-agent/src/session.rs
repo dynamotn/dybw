@@ -185,8 +185,23 @@ pub(crate) async fn save_cache(ctx: &Ctx, sync: &Value) {
     }
 }
 
+/// The longest piece of server text that reaches the log.
+const LOG_SERVER_TEXT: usize = 200;
+
+/// An API error for the log: the server's own words are cut and have no control characters, so a hostile server
+/// cannot fill or forge log lines.
+fn describe(e: &ApiError) -> String {
+    match e {
+        ApiError::Http { status, message } => {
+            let cut: String = one_line(message).chars().take(LOG_SERVER_TEXT).collect();
+            format!("HTTP {status} (server says: {cut})")
+        }
+        other => one_line(&other.to_string()).chars().take(LOG_SERVER_TEXT).collect(),
+    }
+}
+
 fn map_api(e: &ApiError) -> AgentError {
-    tracing::warn!("server: {e}");
+    tracing::warn!("server: {}", describe(e));
     match e {
         ApiError::Network(_) => AgentError::Network,
         ApiError::Invalid(_) => AgentError::Config,
@@ -256,14 +271,34 @@ fn client<H: Host>(host: &H, ctx: &Ctx, urls: &ServerUrls) -> Result<Client<H::H
     Client::new(http, SystemClock, urls.clone(), device).map_err(|e| internal("device info", &e))
 }
 
+/// `user.<uuid>`: what Bitwarden gives as the client_id of a personal API key.
+fn is_client_id(s: &str) -> bool {
+    let id = s.strip_prefix("user.").unwrap_or_default();
+    id.len() == 36 && uuid::Uuid::parse_str(id).is_ok()
+}
+
+/// 20 to 64 ASCII letters and digits: a master password with a symbol or a space is not one.
+fn is_client_secret(s: &str) -> bool {
+    (20..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// Ask for the API key, check it against the server, and store it. Nothing is stored for a key the server refuses
 /// or when the server cannot be reached.
 pub async fn login<H: Host>(host: &H, ctx: &Ctx) -> Result<(), AgentError> {
     api_auth(ctx)?;
     let (origin, urls) = urls_of(ctx)?;
     let who = format!("dybw profile {} ({})", ctx.profile.name, one_line(&ctx.profile.server_url));
-    let client_id = ask(host, &format!("Log in to {who}: API key client_id"), None).await?;
-    let client_secret = ask(host, &format!("Log in to {who}: API key client_secret"), None).await?;
+    // The pinentry says "Master password:" whatever is asked, so the description must say what this is.
+    let notice = "This is the API key, NOT your master password.";
+    let client_id = ask(host, &format!("{notice} Log in to {who}: API key client_id (user.<uuid>)"), None).await?;
+    if !is_client_id(&client_id) {
+        return Err(AgentError::NotAnApiKey);
+    }
+    let desc = format!("{notice} Log in to {who}: API key client_secret (20 to 64 letters and digits)");
+    let client_secret = ask(host, &desc, None).await?;
+    if !is_client_secret(&client_secret) {
+        return Err(AgentError::NotAnApiKey);
+    }
     let creds = Credentials { identity_origin: origin, client_id: client_id.as_str().to_owned(), client_secret };
     drop(client_id);
     client(host, ctx, &urls)?.login(&key_of(&creds)).await.map_err(|e| map_api(&e))?;
@@ -279,6 +314,11 @@ enum Refused {
     Failed(AgentError),
 }
 
+fn refused_by(check: &str, e: &ProfileError) -> Refused {
+    tracing::warn!("unlock refused by the {check} check: {e}");
+    Refused::Failed(AgentError::Refused(check.into()))
+}
+
 fn refused(e: ProfileError) -> Refused {
     match e {
         ProfileError::WrongPassword => Refused::WrongPassword,
@@ -287,8 +327,11 @@ fn refused(e: ProfileError) -> Refused {
             tracing::warn!("unlock: {e}");
             Refused::Failed(AgentError::Internal)
         }
-        // The core refuses to unlock (weakened KDF, security downgrade, unusable unlock data): what the server
-        // offers is not accepted. The text names the problem, never a key.
+        // The downgrade checks: what the server offers is not accepted. Named, so the user knows which one.
+        ProfileError::KdfWeakened { .. } => refused_by("kdf-downgrade", &e),
+        ProfileError::SecurityDowngrade { .. } => refused_by("security-downgrade", &e),
+        ProfileError::KdfPinUnreadable => refused_by("kdf-pin-unreadable", &e),
+        // Unusable unlock data and the like. The text names the problem, never a key.
         e => {
             tracing::warn!("unlock refused: {e}");
             Refused::Failed(AgentError::Server)
@@ -419,5 +462,30 @@ mod tests {
         save_cache(&ctx, &serde_json::json!({"ciphers": []})).await;
         assert!(load_cache(&ctx).is_none());
         assert_eq!(ctx.last_sync(), None);
+    }
+
+    #[test]
+    fn server_text_is_cut_and_has_no_control_characters_in_the_log() {
+        let long = format!("{}\n\u{1b}[31mforged line", "x".repeat(500));
+        let shown = describe(&ApiError::Http { status: 400, message: long });
+        assert!(shown.starts_with("HTTP 400 (server says: xxx") && shown.chars().all(|c| !c.is_control()), "{shown:?}");
+        assert!(shown.chars().count() < 260 && !shown.contains("forged"));
+        let net = describe(&ApiError::Network(format!("a\nb{}", "y".repeat(500))));
+        assert!(net.chars().count() <= 200 && !net.contains('\n'));
+    }
+
+    #[test]
+    fn api_key_shapes() {
+        assert!(is_client_id("user.0b3b6d1e-6f3a-4a52-9f54-2f1c8f0c9a11"));
+        assert!(
+            !is_client_id("user.0b3b6d1e6f3a4a529f542f1c8f0c9a11")
+                && !is_client_id("0b3b6d1e-6f3a-4a52-9f54-2f1c8f0c9a11")
+        );
+        assert!(
+            is_client_secret(&"a1".repeat(10))
+                && !is_client_secret(&"a".repeat(19))
+                && !is_client_secret(&"a".repeat(65))
+        );
+        assert!(!is_client_secret("aaaaaaaaaaaaaaaaaaa!"));
     }
 }

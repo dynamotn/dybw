@@ -179,6 +179,12 @@ pub enum AgentError {
     Denied,
     #[error("the password prompt failed")]
     Prompt,
+    /// What was typed at the login prompt cannot be an API key (it may be the master password).
+    #[error("that is not an API key: client_id is user.<uuid>, client_secret is 20 to 64 letters and digits")]
+    NotAnApiKey,
+    /// A safety check of the unlock refused (named, never a value); the agent log has the detail.
+    #[error("the {0} check refused the unlock; see the agent log")]
+    Refused(String),
     #[error("the server could not be reached")]
     Network,
     #[error("the server refused the request")]
@@ -531,6 +537,11 @@ mod tests {
             (Ambiguous { candidates: vec![] }, "several items match"),
             (Denied, "the request was denied"),
             (Prompt, "the password prompt failed"),
+            (
+                NotAnApiKey,
+                "that is not an API key: client_id is user.<uuid>, client_secret is 20 to 64 letters and digits",
+            ),
+            (Refused(s("kdf-downgrade")), "the kdf-downgrade check refused the unlock; see the agent log"),
             (Network, "the server could not be reached"),
             (Server, "the server refused the request"),
             (Config, "the configuration is invalid"),

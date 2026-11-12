@@ -10,6 +10,9 @@ use crate::agent::Agent;
 use crate::agent::testing::{agent_world, seed_credentials, unlock};
 use crate::host::fake::{Answer, PASSWORD};
 
+const CID: &str = "user.0b3b6d1e-6f3a-4a52-9f54-2f1c8f0c9a11";
+const SECRET: &str = "abcdefghij0123456789XY";
+
 fn err(error: AgentError) -> Reply {
     Reply::Error { error }
 }
@@ -68,19 +71,19 @@ async fn until(ready: impl Fn() -> bool) {
 async fn login_asks_for_both_halves_checks_the_key_and_stores_it_privately() {
     let dir = tempfile::tempdir().unwrap();
     let (agent, _, host) = agent_world(dir.path());
-    host.answer(Answer::Text("user.abc"));
-    host.answer(Answer::Text("sec-ret-1"));
+    host.answer(Answer::Text(CID));
+    host.answer(Answer::Text(SECRET));
     assert_eq!(run(&agent, login("work")).await, Reply::Done);
 
     let file = state(dir.path(), "work", "credentials");
     assert_eq!(mode(&file), 0o600);
     let text = std::fs::read_to_string(&file).unwrap();
-    assert!(text.contains("identity_origin = \"https://w.example.org\"") && text.contains("user.abc"));
+    assert!(text.contains("identity_origin = \"https://w.example.org\"") && text.contains(CID));
     {
         let w = host.world();
         assert_eq!(w.asked.len(), 2);
         assert!(w.asked[0].0.contains("client_id") && w.asked[1].0.contains("client_secret"));
-        assert!(w.asked.iter().all(|(d, e)| !d.contains("sec-ret-1") && e.is_none()), "no secret in a question");
+        assert!(w.asked.iter().all(|(d, e)| !d.contains(SECRET) && e.is_none()), "no secret in a question");
         assert_eq!(w.device_names, ["dybw+on+testhost"]);
         assert_eq!(w.count("/identity/connect/token"), 1);
     }
@@ -105,16 +108,16 @@ async fn login_stores_nothing_unless_it_was_asked_for_and_the_server_took_the_ke
     assert_eq!(run(&agent, login("work")).await, err(AgentError::Denied), "a timeout is a no");
     tries(Answer::Fail, None);
     assert_eq!(run(&agent, login("work")).await, err(AgentError::Prompt));
-    tries(Answer::Text("user.abc"), Some(Answer::Cancel));
+    tries(Answer::Text(CID), Some(Answer::Cancel));
     assert_eq!(run(&agent, login("work")).await, err(AgentError::Denied), "cancel at the secret");
     assert_eq!(host.world().requests.len(), 0, "nothing was sent before the key was complete");
 
     host.world().token_status = 400;
-    tries(Answer::Text("user.abc"), Some(Answer::Text("wrong")));
+    tries(Answer::Text(CID), Some(Answer::Text(SECRET)));
     assert_eq!(run(&agent, login("work")).await, err(AgentError::Server), "a refused key");
     host.world().token_status = 200;
     host.world().online = false;
-    tries(Answer::Text("user.abc"), Some(Answer::Text("sec")));
+    tries(Answer::Text(CID), Some(Answer::Text(SECRET)));
     assert_eq!(run(&agent, login("work")).await, err(AgentError::Network));
     assert!(!file.exists());
 }
@@ -292,7 +295,7 @@ async fn a_weaker_kdf_than_the_pinned_one_and_a_broken_state_dir_refuse_the_unlo
     std::fs::write(&pin, format!(r#"{{"kdf":0,"iterations":1000000,"memory":0,"parallelism":0,"origin":"{origin}"}}"#))
         .unwrap();
     host.answer(Answer::Text(PASSWORD));
-    assert_eq!(run(&agent, unlock_op("work")).await, err(AgentError::Server));
+    assert_eq!(run(&agent, unlock_op("work")).await, err(AgentError::Refused("kdf-downgrade".into())));
     assert!(!status(&agent, "work").await.1);
 
     // The core cannot read its own state: an internal error, not a refusal by the server.
@@ -441,8 +444,8 @@ async fn a_broken_device_file_or_key_file_is_an_internal_error_not_a_crash() {
     // The key cannot be stored: a directory sits where the file goes. Nothing is claimed as stored.
     let file = state(dir.path(), "home", "credentials");
     std::fs::create_dir_all(&file).unwrap();
-    host.answer(Answer::Text("user.abc"));
-    host.answer(Answer::Text("sec"));
+    host.answer(Answer::Text(CID));
+    host.answer(Answer::Text(SECRET));
     assert_eq!(run(&agent, login("home")).await, err(AgentError::Internal));
 }
 
@@ -473,4 +476,92 @@ async fn a_sync_that_cannot_start_a_client_says_so_and_keeps_the_vault() {
     host.world().http_fails = true;
     assert_eq!(run(&agent, sync_op("work")).await, err(AgentError::Internal));
     assert!(status(&agent, "work").await.1);
+}
+
+#[tokio::test]
+async fn an_unreadable_pin_and_a_security_downgrade_are_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (agent, _, host) = agent_world(dir.path());
+    seed_credentials(&agent, "work");
+    let core = state(dir.path(), "work", "core");
+    std::fs::create_dir_all(&core).unwrap();
+    std::fs::write(core.join("kdf-pin"), "not json").unwrap();
+    host.answer(Answer::Text(PASSWORD));
+    assert_eq!(run(&agent, unlock_op("work")).await, err(AgentError::Refused("kdf-pin-unreadable".into())));
+    std::fs::remove_file(core.join("kdf-pin")).unwrap();
+    // This device saw security state version 99; a legacy key offers 0.
+    std::fs::write(core.join("security-version"), "99").unwrap();
+    host.answer(Answer::Text(PASSWORD));
+    assert_eq!(run(&agent, unlock_op("work")).await, err(AgentError::Refused("security-downgrade".into())));
+    let shown = AgentError::Refused("kdf-downgrade".into()).to_string();
+    assert!(shown.contains("kdf-downgrade") && shown.contains("agent log"));
+    assert!(!status(&agent, "work").await.1);
+}
+
+#[tokio::test]
+async fn input_that_cannot_be_an_api_key_is_refused_before_anything_is_sent_or_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let (agent, _, host) = agent_world(dir.path());
+    let file = state(dir.path(), "work", "credentials");
+    // The master password typed at the client_id question, then at the client_secret question.
+    host.answer(Answer::Text(PASSWORD));
+    assert_eq!(run(&agent, login("work")).await, err(AgentError::NotAnApiKey));
+    for bad in
+        ["with space and symbols!!", "short", "abcdefghij0123456789XYabcdefghij0123456789XYabcdefghij0123456789XYZ"]
+    {
+        host.answer(Answer::Text(CID));
+        host.answer(Answer::Text(bad));
+        assert_eq!(run(&agent, login("work")).await, err(AgentError::NotAnApiKey), "{bad}");
+    }
+    for bad_id in ["user.not-a-uuid", "0b3b6d1e-6f3a-4a52-9f54-2f1c8f0c9a11", "user.0b3b6d1e6f3a4a529f542f1c8f0c9a11"] {
+        host.answer(Answer::Text(bad_id));
+        assert_eq!(run(&agent, login("work")).await, err(AgentError::NotAnApiKey), "{bad_id}");
+    }
+    assert!(host.world().requests.is_empty(), "nothing was sent");
+    assert!(!file.exists(), "nothing was stored");
+    // Upper-case hex is a uuid too.
+    host.answer(Answer::Text("user.0B3B6D1E-6F3A-4A52-9F54-2F1C8F0C9A11"));
+    host.answer(Answer::Text(SECRET));
+    assert_eq!(run(&agent, login("work")).await, Reply::Done);
+    let w = host.world();
+    assert!(w.asked.iter().all(|(d, _)| d.contains("NOT your master password")), "every question says what it is");
+}
+
+#[tokio::test]
+async fn a_second_login_waits_for_the_first_and_never_opens_a_second_pinentry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (agent, _, host) = agent_world(dir.path());
+    host.answer(Answer::Hang);
+    let first = tokio::spawn({
+        let agent = agent.clone();
+        async move { run(&agent, login("work")).await }
+    });
+    until(|| host.world().asked.len() == 1).await;
+    let second = tokio::spawn({
+        let agent = agent.clone();
+        async move { run(&agent, login("work")).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(host.world().asked.len(), 1, "one question open, not two");
+    assert!(!second.is_finished());
+    run(&agent, lock_op("work")).await;
+    assert_eq!(first.await.unwrap(), err(AgentError::Locked));
+    assert_eq!(second.await.unwrap(), err(AgentError::Locked));
+}
+
+#[tokio::test]
+async fn unusable_unlock_data_is_a_server_refusal_with_the_reason_in_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let (agent, _, host) = agent_world(dir.path());
+    unlock(&agent, &host, "work").await;
+    run(&agent, lock_op("work")).await;
+    // An offline copy without its KDF cannot unlock an account that has no `masterPasswordUnlock`.
+    let file = cache(dir.path(), "work");
+    let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    saved["kdf"] = serde_json::Value::Null;
+    std::fs::write(&file, saved.to_string()).unwrap();
+    host.world().online = false;
+    host.answer(Answer::Text(PASSWORD));
+    assert_eq!(run(&agent, unlock_op("work")).await, err(AgentError::Server));
+    assert!(!status(&agent, "work").await.1);
 }

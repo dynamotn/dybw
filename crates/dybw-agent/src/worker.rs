@@ -157,7 +157,7 @@ fn run<H: Host>(host: H, ctx: Ctx, mut rx: mpsc::UnboundedReceiver<Msg>) {
                     }
                 }
                 _ = tick.tick() => {
-                    if !period.is_zero() {
+                    if periodic_due(&shared, period) {
                         spawn(&shared, &host, &ctx, Long::Sync, None);
                     }
                 }
@@ -165,6 +165,11 @@ fn run<H: Host>(host: H, ctx: Ctx, mut rx: mpsc::UnboundedReceiver<Msg>) {
         }
         lock(&shared);
     }));
+}
+
+/// A periodic sync is for an unlocked profile with an interval: a locked one has nothing to sync.
+fn periodic_due(shared: &Shared, period: Duration) -> bool {
+    !period.is_zero() && shared.state.borrow().slot.is_some()
 }
 
 /// Handle one message; true when the worker must end.
@@ -271,7 +276,11 @@ fn spawn<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, long: Long, 
 
 async fn run_long<H: Host>(shared: Rc<Shared>, host: Rc<H>, ctx: Rc<Ctx>, long: Long, wait: bool) -> Reply {
     match long {
-        Long::Login => outcome(session::login(&*host, &ctx).await),
+        Long::Login => {
+            // One pinentry at a time: a second login waits for the first.
+            let _op = shared.op.lock().await;
+            outcome(session::login(&*host, &ctx).await)
+        }
         Long::Unlock => unlock(&shared, &*host, &ctx).await,
         Long::Sync => sync(&shared, &*host, &ctx, wait).await,
         #[cfg(test)]
@@ -323,4 +332,16 @@ async fn sync<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, wait: bool) -> Repl
         session.vault.sync = sync;
     }
     Reply::Done
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_locked_profile_or_one_without_an_interval_has_no_periodic_sync() {
+        let shared = Shared::default();
+        assert!(!periodic_due(&shared, Duration::from_secs(300)), "locked");
+        assert!(!periodic_due(&shared, Duration::ZERO), "no interval");
+    }
 }

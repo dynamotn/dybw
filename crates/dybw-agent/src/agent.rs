@@ -79,6 +79,9 @@ pub struct Agent {
     pub(crate) read_timeout: Duration,
     pub(crate) drain_timeout: Duration,
     spawn: Spawn,
+    /// Test hook: the guard announces on `.0` that it reached the post-suspend lock, and waits for `.1` first.
+    #[cfg(test)]
+    pub(crate) lock_gate: Option<(Arc<Notify>, Arc<Notify>)>,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
     /// Held for a whole guard run, so a request that arrives while a suspend is being handled waits for the locks.
     last_tick: tokio::sync::Mutex<(SystemTime, Instant)>,
@@ -101,6 +104,8 @@ impl Agent {
             read_timeout: READ_TIMEOUT,
             drain_timeout: DRAIN_TIMEOUT,
             spawn,
+            #[cfg(test)]
+            lock_gate: None,
             workers: Mutex::default(),
             last_tick,
             stop: Notify::new(),
@@ -201,6 +206,11 @@ impl Agent {
         let mono_step = mono.saturating_duration_since(last_mono);
         if wall_step.saturating_sub(mono_step) > SLEEP_SLACK {
             tracing::info!("suspend detected, locking every profile");
+            #[cfg(test)]
+            if let Some((reached, release)) = &self.lock_gate {
+                reached.notify_one();
+                release.notified().await;
+            }
             self.each(|| Cmd::Lock).await;
         } else {
             self.each(|| Cmd::IdleCheck).await;
@@ -326,6 +336,7 @@ mod tests {
     use super::*;
     use crate::host::fake::FakeHost;
     use dybw_proto::ProfileStatus;
+    use tokio::sync::Notify;
 
     const MIN: Duration = Duration::from_secs(60);
 
@@ -469,22 +480,28 @@ mod tests {
         assert!(!unlocked(&agent, "home").await, "a profile that never idles locks on a suspend too");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn requests_racing_a_wake_all_find_the_profile_locked() {
+    #[tokio::test]
+    async fn a_request_arriving_while_a_wake_is_being_locked_waits_for_the_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let (agent, clock, host) = agent_world(dir.path());
+        let (mut agent, clock, host) = agent_world(dir.path());
+        let (reached, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        Arc::get_mut(&mut agent).unwrap().lock_gate = Some((reached.clone(), release.clone()));
         install(&agent, &host, "home").await;
         clock.advance(60 * MIN, Duration::from_secs(30));
-        // The guard that sees the jump is the only one that locks; the others must wait for it, not slip past.
-        let asks: Vec<_> = (0..8)
-            .map(|_| {
-                let agent = agent.clone();
-                tokio::spawn(async move { unlocked(&agent, "home").await })
-            })
-            .collect();
-        for ask in asks {
-            assert!(!ask.await.unwrap());
-        }
+        // A finds the jump and stops at the gate, before the lock is done; B comes in meanwhile.
+        let a = tokio::spawn({
+            let agent = agent.clone();
+            async move { unlocked(&agent, "home").await }
+        });
+        reached.notified().await;
+        let b = tokio::spawn({
+            let agent = agent.clone();
+            async move { unlocked(&agent, "home").await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!b.is_finished(), "B must wait for A's lock, not slip past and see the open vault");
+        release.notify_one();
+        assert!(!a.await.unwrap() && !b.await.unwrap());
     }
 
     #[tokio::test]
