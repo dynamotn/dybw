@@ -7,17 +7,25 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 docker build -t dybw-e2e -f tests/e2e/Dockerfile .
-docker rm -f dybw-bw-it > /dev/null 2>&1 || true
+docker rm -f dybw-bw-it &> /dev/null || true
 docker run -d --rm --name dybw-bw-it -e SIGNUPS_ALLOWED=true -e SIGNUPS_VERIFY=false \
   -e DISABLE_ICON_DOWNLOAD=true -e LOGIN_RATELIMIT_MAX_BURST=1000 \
   -e LOGIN_RATELIMIT_SECONDS=1 -e I_REALLY_WANT_VOLATILE_STORAGE=true \
   vaultwarden/server:1.37.4@sha256:efb3cde962015fcc036b2ea625242248611943b27212ebf4392841fb30fad055 > /dev/null
-trap 'docker rm -f dybw-bw-it > /dev/null 2>&1 || true' EXIT
+trap 'docker rm -f dybw-bw-it &> /dev/null || true' EXIT
 # Wait until Vaultwarden answers, from inside its own network namespace.
-for _ in $(seq 60); do
-  docker run --rm --network container:dybw-bw-it dybw-e2e python3 -c \
-    'import urllib.request as u; u.urlopen("http://127.0.0.1:80/alive")' 2> /dev/null && break
+alive=0
+for ((i = 0; i < 60; i++)); do
+  if docker run --rm --network container:dybw-bw-it dybw-e2e python3 -c \
+    'import urllib.request as u; u.urlopen("http://127.0.0.1:80/alive")' 2> /dev/null; then
+    alive=1
+    break
+  fi
   sleep 2
 done
+if ((alive == 0)); then
+  echo "e2e: Vaultwarden did not answer within 120 s" >&2
+  exit 1
+fi
 docker run --rm --network container:dybw-bw-it -e BW_E2E_URL=http://127.0.0.1:80 \
-  -v "$PWD":/src -v dybw-target:/target -v dybw-cargo:/usr/local/cargo/registry dybw-e2e
+  -v "${PWD}":/src -v dybw-target:/target -v dybw-cargo:/usr/local/cargo/registry dybw-e2e
