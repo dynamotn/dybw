@@ -28,18 +28,25 @@ impl ProfilePaths {
     /// The locations for an environment read through `var`. An XDG variable counts only when absolute; the
     /// default is under `home`.
     pub fn with(var: &dyn Fn(&str) -> Option<OsString>, home: &Path, profile: &Profile) -> Self {
-        let xdg = |name: &str, fallback: &str| {
-            var(name).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(fallback))
-        };
+        let xdg = |name: &str, fallback: &str| xdg_dir(var, home, name, fallback);
         let state = xdg("XDG_STATE_HOME", ".local/state").join("dybw/profiles").join(&profile.name);
         ProfilePaths {
-            config: xdg("XDG_CONFIG_HOME", ".config").join("dybw/config.toml"),
+            config: config_path(var, home),
             credentials: state.join("credentials"),
             device: state.join("devices/dybw"),
             cache: xdg("XDG_CACHE_HOME", ".cache").join("dybw/profiles").join(&profile.name),
             state,
         }
     }
+}
+
+fn xdg_dir(var: &dyn Fn(&str) -> Option<OsString>, home: &Path, name: &str, fallback: &str) -> PathBuf {
+    var(name).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(fallback))
+}
+
+/// `$XDG_CONFIG_HOME/dybw/config.toml`: the one file every profile shares, known before any profile is.
+pub fn config_path(var: &dyn Fn(&str) -> Option<OsString>, home: &Path) -> PathBuf {
+    xdg_dir(var, home, "XDG_CONFIG_HOME", ".config").join("dybw/config.toml")
 }
 
 #[cfg(test)]
