@@ -8,6 +8,7 @@ pub mod device;
 pub mod hardening;
 pub mod host;
 pub mod paths;
+pub mod policy;
 pub mod read;
 pub mod server;
 pub mod session;
@@ -17,6 +18,8 @@ pub mod worker;
 
 #[cfg(test)]
 mod flow_tests;
+#[cfg(test)]
+mod policy_tests;
 #[cfg(test)]
 mod read_tests;
 
@@ -51,7 +54,11 @@ pub fn run() -> anyhow::Result<()> {
     let user = trust.user.clone();
     // The lock file stays held until the process ends.
     let (listener, _lock) = socket::bind(&socket::socket_dir(&var, user.uid), user.uid)?;
-    let agent = Arc::new(agent::Agent::new(config, home, user, Box::new(var), real_spawn(trust)));
+    let harnesses = caller::Harnesses::load(&paths::harnesses_path(&var, &home));
+    let resolver = Arc::new(caller::Resolver::new(Arc::new(dybw_peer::Os), harnesses));
+    // TODO(P4.2 task 5): the audit log replaces `NoAudit`.
+    let audit = Arc::new(policy::NoAudit);
+    let agent = Arc::new(agent::Agent::new(config, home, user, Box::new(var), real_spawn(trust), resolver, audit));
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(server::serve(agent, listener, stop_signal())).map_err(anyhow::Error::from)
 }
@@ -100,7 +107,12 @@ mod tests {
         let paths = crate::paths::ProfilePaths::with(&|_| None, dir.path(), &profile);
         let user = User { uid: rustix::process::geteuid().as_raw(), groups: None };
         let trust = Trust { search: Some("/usr/bin:/bin".into()), user: user.clone(), exe: None, home: None };
-        let worker = super::real_spawn(trust)(crate::session::Ctx { profile, paths, user });
+        let worker = super::real_spawn(trust)(crate::session::Ctx {
+            profile,
+            paths,
+            user,
+            audit: std::sync::Arc::new(crate::policy::NoAudit),
+        });
         let status = worker.call(crate::worker::Cmd::Status, std::time::Instant::now()).await;
         assert!(matches!(status, Reply::Status { .. }));
         worker.stop(std::time::Instant::now()).await;

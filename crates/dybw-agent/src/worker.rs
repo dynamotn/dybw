@@ -19,11 +19,13 @@ use std::time::{Duration, Instant};
 
 use dybw_core::profile::UnlockedVault;
 use dybw_native::prompter::one_line;
-use dybw_proto::{AgentError, Field, ProfileStatus, Reply, Select};
+use dybw_proto::{AgentError, Field, PolicyAction, PolicyEntry, PolicyRule, ProfileStatus, Reply, Select};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
+use crate::caller::{Caller, hash_of};
 use crate::host::Host;
+use crate::policy::{self, Access, AuditEvent, Decision, Store, Verdict};
 use crate::read::{self, Found, Lookup};
 use crate::session::{self, Ctx, Session};
 
@@ -56,14 +58,21 @@ pub enum Cmd {
         folder: Option<String>,
         fields: Vec<Field>,
     },
-    /// A value of one item, after the user confirmed (names of custom fields need no confirmation).
+    /// A value of one item, once the caller policy allows it (a grant, or the user's yes).
     Get {
         find: Lookup,
         select: Select,
+        caller: Caller,
     },
-    /// The previous passwords of one item, after the user confirmed.
+    /// The previous passwords of one item, under the same rule.
     History {
         find: Lookup,
+        caller: Caller,
+    },
+    /// Show the caller policy, or change it (the user confirms, and an AI-class caller cannot).
+    Policy {
+        action: PolicyAction,
+        caller: Caller,
     },
     /// Lock and end the thread.
     Exit,
@@ -83,8 +92,9 @@ enum Long {
     Login,
     Unlock,
     Sync,
-    /// `Some` is a `get`, `None` the password history.
-    Read(Lookup, Option<Select>),
+    /// `Some` is a `get`, `None` the password history; whose request it is.
+    Read(Lookup, Option<Select>, Caller),
+    Policy(PolicyAction, Caller),
     #[cfg(test)]
     Panic,
 }
@@ -230,8 +240,9 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
             let search = |v: &UnlockedVault| Ok(read::list(v, &fields, folder.as_deref(), Some(&term)));
             return quick(reply, with_vault(shared, search).unwrap_or_else(error));
         }
-        Cmd::Get { find, select } => Long::Read(find, Some(select)),
-        Cmd::History { find } => Long::Read(find, None),
+        Cmd::Get { find, select, caller } => Long::Read(find, Some(select), caller),
+        Cmd::History { find, caller } => Long::Read(find, None, caller),
+        Cmd::Policy { action, caller } => Long::Policy(action, caller),
         #[cfg(test)]
         Cmd::Opens => {
             return quick(reply, Reply::Value { value: dybw_proto::Secret::new(read::OPENS.get().to_string()) });
@@ -328,7 +339,8 @@ async fn run_long<H: Host>(shared: Rc<Shared>, host: Rc<H>, ctx: Rc<Ctx>, long: 
         }
         Long::Unlock => unlock(&shared, &*host, &ctx).await,
         Long::Sync => sync(&shared, &*host, &ctx, wait).await,
-        Long::Read(find, select) => get(&shared, &*host, &ctx, find, select).await,
+        Long::Read(find, select, caller) => get(&shared, &*host, &ctx, &caller, find, select).await,
+        Long::Policy(action, caller) => change_policy(&shared, &*host, &ctx, &caller, action).await,
         #[cfg(test)]
         Long::Panic => panic!("task panic for a test"),
     }
@@ -340,24 +352,99 @@ fn with_vault<T>(shared: &Shared, f: impl FnOnce(&UnlockedVault) -> Result<T, Ag
     f(&st.slot.as_ref().ok_or(AgentError::Locked)?.vault)
 }
 
-/// What the confirmation says is asked: the profile, the item's name and what is read, each on one line.
-fn ask_text(ctx: &Ctx, found: &Found, select: Option<&Select>) -> String {
+/// What the confirmation says: the profile, who asks and by which command, what is read of which item, each on one
+/// line.
+fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, select: Option<&Select>) -> String {
     let tidy = |s: &str| one_line(s).chars().take(80).collect::<String>();
-    let what = match select {
-        Some(Select::Field(name)) => format!("its field \"{}\"", tidy(name)),
-        Some(Select::Full) => "the full item (every value)".to_owned(),
-        Some(Select::Raw) => "the raw item as JSON".to_owned(),
-        Some(Select::ListFields) => "the field names".to_owned(),
-        Some(_) => "its main value (password, notes, number or public key)".to_owned(),
-        None => "its password history".to_owned(),
+    let (command, what) = match select {
+        Some(Select::Field(name)) => ("get", format!("its field \"{}\"", tidy(name))),
+        Some(Select::Full) => ("get", "the full item (every value)".to_owned()),
+        Some(Select::Raw) => ("get", "the raw item as JSON".to_owned()),
+        Some(Select::ListFields) => ("get", "the field names".to_owned()),
+        Some(_) => ("get", "its main value (password, notes, number or public key)".to_owned()),
+        None => ("history", "its password history".to_owned()),
     };
-    format!("dybw profile {}: allow reading {what} of the item \"{}\"?", ctx.profile.name, tidy(&found.name))
+    format!(
+        "dybw profile {}: allow {} (dybw {command}) to read {what} of the item \"{}\"?",
+        ctx.profile.name,
+        policy::who(caller),
+        tidy(&found.name)
+    )
 }
 
-/// `get` and `history`: find the item from its summary (a missing or ambiguous one ends here, with no prompt), get
-/// the user's yes (the value gate: a no or a timeout is `Denied`, and nothing was opened), check the item is still
-/// the one asked about, and only then open it, build the reply and drop it. A lock during the wait cancels this task.
-async fn get<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, find: Lookup, select: Option<Select>) -> Reply {
+fn audit(ctx: &Ctx, caller: &Caller, op: &'static str, item: Option<&str>, verdict: Verdict) {
+    tracing::info!(profile = %ctx.profile.name, op, item, ?verdict, "caller policy");
+    ctx.audit.record(AuditEvent {
+        time: std::time::SystemTime::now(),
+        profile: ctx.profile.name.clone(),
+        caller: caller.clone(),
+        op,
+        item: item.map(str::to_owned),
+        verdict,
+    });
+}
+
+/// The policy's answer for a value request, and the user's when it is asked. One question on the screen at a time
+/// (`asking`), each naming its own caller: nothing the user says to one is reused for another. The entries are read
+/// again once this request has the screen, so a grant made while it waited counts, and a request never prompts for
+/// what is already allowed or denied.
+async fn gate<H: Host>(
+    shared: &Shared,
+    host: &H,
+    ctx: &Ctx,
+    caller: &Caller,
+    found: &Found,
+    select: Option<&Select>,
+) -> Result<(), AgentError> {
+    let op = if select.is_some() { "get" } else { "history" };
+    let store = Store::new(&ctx.paths.policy, ctx.user.uid);
+    let mut decision = policy::decide(caller, &store.load(), Access::Value);
+    let _screen = if matches!(decision, Decision::Confirm { .. }) {
+        let screen = shared.asking.lock().await;
+        decision = policy::decide(caller, &store.load(), Access::Value);
+        Some(screen)
+    } else {
+        None
+    };
+    let (verdict, result) = match decision {
+        Decision::Allow => (Verdict::Granted, Ok(())),
+        Decision::Deny => (Verdict::Denied, Err(AgentError::Denied)),
+        Decision::Confirm { rememberable } => {
+            match session::confirm(host, &ask_text(ctx, caller, found, select), rememberable).await {
+                Ok(true) if rememberable => (remember(ctx, &store, caller), Ok(())),
+                Ok(_) => (Verdict::Confirmed, Ok(())),
+                Err(e) => (Verdict::Declined, Err(e)),
+            }
+        }
+    };
+    audit(ctx, caller, op, Some(&found.id), verdict);
+    result
+}
+
+/// Store the grant "always" asks for. A failed write still lets this one request through (the user said yes), and
+/// is logged.
+fn remember(ctx: &Ctx, store: &Store, caller: &Caller) -> Verdict {
+    let nothing = || std::io::Error::other("this caller cannot be remembered");
+    match policy::grant_for(caller).map_or_else(|| Err(nothing()), |entry| store.set(entry)) {
+        Ok(()) => Verdict::Remembered,
+        Err(e) => {
+            tracing::warn!(profile = %ctx.profile.name, "the grant was not saved: {e}");
+            Verdict::Confirmed
+        }
+    }
+}
+
+/// `get` and `history`: find the item from its summary (a missing or ambiguous one ends here, with no prompt), pass
+/// the caller policy (a no or a timeout is `Denied`, and nothing was opened), check the item is still the one asked
+/// about, and only then open it, build the reply and drop it. A lock during the wait cancels this task.
+async fn get<H: Host>(
+    shared: &Shared,
+    host: &H,
+    ctx: &Ctx,
+    caller: &Caller,
+    find: Lookup,
+    select: Option<Select>,
+) -> Reply {
     let found = match with_vault(shared, |v| read::find(v, &find)) {
         Ok(found) => found,
         Err(e) => return error(e),
@@ -365,17 +452,15 @@ async fn get<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, find: Lookup, select
     // TODO(core): field_names, a names-only decrypt; until then `--list-fields` opens the whole item, so it is a
     // value request like any other.
     if found.reprompt {
-        // Until P4.3 can ask for the master password again, a reprompt item gives no value and no question.
+        // Until P4.3 can ask for the master password again, a reprompt item gives no value and no question, and
+        // no grant satisfies it.
         tracing::warn!(profile = %ctx.profile.name, id = %found.id, "value request denied: the item needs a reprompt (P4.3)");
+        let op = if select.is_some() { "get" } else { "history" };
+        audit(ctx, caller, op, Some(&found.id), Verdict::Denied);
         return error(AgentError::Denied);
     }
-    {
-        let _one_at_a_time = shared.asking.lock().await;
-        let answer = session::confirm(host, &ask_text(ctx, &found, select.as_ref()), false).await;
-        tracing::info!(profile = %ctx.profile.name, id = %found.id, allowed = answer.is_ok(), "value request");
-        if let Err(e) = answer {
-            return error(e);
-        }
+    if let Err(e) = gate(shared, host, ctx, caller, &found, select.as_ref()).await {
+        return error(e);
     }
     let read = |v: &UnlockedVault| {
         // The user answered about this item: it must still be the same one (a sync may have run meanwhile).
@@ -390,6 +475,112 @@ async fn get<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, find: Lookup, select
         }
     };
     with_vault(shared, read).unwrap_or_else(error)
+}
+
+/// An absolute path as the policy keys it: canonical when the file exists.
+fn policy_path(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    let key =
+        if path.is_absolute() { std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned()) } else { return None };
+    key.to_str().map(str::to_owned)
+}
+
+/// A change of the policy, planned before the user is asked.
+enum Change {
+    Set(PolicyEntry),
+    Forget(String),
+}
+
+impl Change {
+    /// What the question says is done, on one line.
+    fn sentence(&self) -> String {
+        let tidy = |s: &str| one_line(s).chars().take(120).collect::<String>();
+        let target = |e: &PolicyEntry| match &e.script {
+            Some(script) => format!("{} running {}", tidy(&e.exe), tidy(script)),
+            None => tidy(&e.exe),
+        };
+        match self {
+            Change::Set(e) if e.rule == PolicyRule::Allow => format!("always allow reading values for {}", target(e)),
+            Change::Set(e) => format!("always refuse reading values for {}", target(e)),
+            Change::Forget(invoker) => format!("forget what is remembered for {}", tidy(invoker)),
+        }
+    }
+}
+
+/// What a change asks for, before its paths are looked at.
+enum Asked {
+    Set { invoker: String, script: Option<String>, rule: PolicyRule },
+    Forget(String),
+}
+
+fn plan(asked: Asked) -> Result<Change, AgentError> {
+    let bad = |why: &str| {
+        tracing::warn!("policy: {why}");
+        AgentError::Config
+    };
+    match asked {
+        Asked::Set { invoker, script, rule } => {
+            let exe = policy_path(&invoker).ok_or_else(|| bad("the executable must be an absolute path"))?;
+            let script = script.map(|s| policy_path(&s).ok_or_else(|| bad("the script must be an absolute path")));
+            let script = script.transpose()?;
+            // A deny is by path; an allow is for the program as it is now.
+            let hash = match rule {
+                PolicyRule::Allow => {
+                    hash_of(std::path::Path::new(script.as_deref().unwrap_or(&exe))).map_err(|w| bad(&w))?
+                }
+                PolicyRule::Deny => String::new(),
+            };
+            Ok(Change::Set(PolicyEntry { exe, script, hash, rule }))
+        }
+        Asked::Forget(invoker) => Ok(Change::Forget(policy_path(&invoker).unwrap_or(invoker))),
+    }
+}
+
+/// `dybw policy`. `show` names no secret and is open to every class. A change is refused for an AI-class or an
+/// unknown caller, and needs the user's yes in the pinentry like any value.
+async fn change_policy<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, action: PolicyAction) -> Reply {
+    let store = Store::new(&ctx.paths.policy, ctx.user.uid);
+    let (op, asked) = match action {
+        PolicyAction::Show => return Reply::Policy { entries: store.load() },
+        PolicyAction::Allow { invoker, script } => {
+            ("policy-allow", Asked::Set { invoker, script, rule: PolicyRule::Allow })
+        }
+        PolicyAction::Deny { invoker, script } => {
+            ("policy-deny", Asked::Set { invoker, script, rule: PolicyRule::Deny })
+        }
+        PolicyAction::Forget { invoker } => ("policy-forget", Asked::Forget(invoker)),
+    };
+    if !matches!(caller, Caller::Invoker { .. }) {
+        audit(ctx, caller, op, None, Verdict::Denied);
+        return error(AgentError::Denied);
+    }
+    let change = match plan(asked) {
+        Ok(change) => change,
+        Err(e) => return error(e),
+    };
+    let _screen = shared.asking.lock().await;
+    let text = format!(
+        "dybw profile {}: {} asks to {} (dybw policy). Do it?",
+        ctx.profile.name,
+        policy::who(caller),
+        change.sentence()
+    );
+    if let Err(e) = session::confirm(host, &text, false).await {
+        audit(ctx, caller, op, None, Verdict::Declined);
+        return error(e);
+    }
+    let done = match &change {
+        Change::Set(entry) => store.set(entry.clone()),
+        Change::Forget(invoker) => store.forget(invoker).map(|_| ()),
+    };
+    audit(ctx, caller, op, None, Verdict::Confirmed);
+    done.map_or_else(
+        |e| {
+            tracing::warn!(profile = %ctx.profile.name, "the policy was not saved: {e}");
+            internal()
+        },
+        |()| Reply::Done,
+    )
 }
 
 async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx) -> Reply {

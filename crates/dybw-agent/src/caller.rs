@@ -192,6 +192,12 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// Test only: a caller taken as given, held to `peer` alone.
+    #[cfg(test)]
+    pub(crate) fn fixed(caller: Caller, peer: Peer) -> Self {
+        Self { caller, peer, chain: Vec::new() }
+    }
+
     fn unknown(peer: Peer, why: &str) -> Self {
         Self { caller: Caller::Unknown { why: why.into() }, peer, chain: Vec::new() }
     }
@@ -405,7 +411,16 @@ fn hash_file(path: &Path, started: Option<SystemTime>) -> Result<String, String>
     if changed(&md).is_none_or(|t| t > started + TICK) {
         return Err("the invoker's file changed after it started".into());
     }
-    let bytes = read_capped(file, MAX_HASH_BYTES).map_err(unreadable)?;
+    sha256_hex(file)
+}
+
+/// SHA-256 (hex) of a file the user names (`dybw policy allow`): the start-time rule is for a running process.
+pub fn hash_of(path: &Path) -> Result<String, String> {
+    sha256_hex(std::fs::File::open(path).map_err(|_| "the file cannot be read".to_owned())?)
+}
+
+fn sha256_hex(file: std::fs::File) -> Result<String, String> {
+    let bytes = read_capped(file, MAX_HASH_BYTES).map_err(|_| "the invoker's file cannot be read".to_owned())?;
     Ok(Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect())
 }
 

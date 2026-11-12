@@ -13,6 +13,8 @@ pub struct ProfilePaths {
     pub state: PathBuf,
     /// `<state>/credentials`.
     pub credentials: PathBuf,
+    /// `<state>/policy.json`: the remembered invokers.
+    pub policy: PathBuf,
     /// `<state>/devices/dybw`.
     pub device: PathBuf,
     /// `$XDG_CACHE_HOME/dybw/profiles/<p>`.
@@ -34,6 +36,7 @@ impl ProfilePaths {
         ProfilePaths {
             config: config_path(var, home),
             credentials: state.join("credentials"),
+            policy: state.join("policy.json"),
             device: state.join("devices/dybw"),
             cache: xdg("XDG_CACHE_HOME", ".cache").join("dybw/profiles").join(&profile.name),
             state,
@@ -43,6 +46,11 @@ impl ProfilePaths {
 
 fn xdg_dir(var: &dyn Fn(&str) -> Option<OsString>, home: &Path, name: &str, fallback: &str) -> PathBuf {
     var(name).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(fallback))
+}
+
+/// `$XDG_STATE_HOME/dybw/harnesses.toml`: harnesses to add to the built-in table.
+pub fn harnesses_path(var: &dyn Fn(&str) -> Option<OsString>, home: &Path) -> PathBuf {
+    xdg_dir(var, home, "XDG_STATE_HOME", ".local/state").join("dybw/harnesses.toml")
 }
 
 /// `$XDG_CONFIG_HOME/dybw/config.toml`: the one file every profile shares, known before any profile is.
@@ -79,6 +87,8 @@ mod tests {
         assert_eq!(p.config, Path::new("/c/dybw/config.toml"));
         assert_eq!(p.state, Path::new("/s/dybw/profiles/w"));
         assert_eq!(p.credentials, Path::new("/s/dybw/profiles/w/credentials"));
+        assert_eq!(p.policy, Path::new("/s/dybw/profiles/w/policy.json"));
+        assert_eq!(harnesses_path(&env(&vars), Path::new("/h")), Path::new("/s/dybw/harnesses.toml"));
         assert_eq!(p.device, Path::new("/s/dybw/profiles/w/devices/dybw"));
         assert_eq!(p.cache, Path::new("/k/dybw/profiles/w"));
     }

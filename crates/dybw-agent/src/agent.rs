@@ -12,8 +12,10 @@ use dybw_proto::{AgentError, Op, Reply, Target};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
+use crate::caller::{Resolved, Resolver};
 use crate::config::{Config, Profile};
 use crate::paths::ProfilePaths;
+use crate::policy::{Audit, AuditEvent, Verdict};
 use crate::read::Lookup;
 use crate::session::Ctx;
 use crate::worker::{Cmd, Worker};
@@ -50,6 +52,7 @@ fn kind(op: &Op) -> &'static str {
         Op::Search { .. } => "search",
         Op::Get { .. } => "get",
         Op::History { .. } => "history",
+        Op::Policy { .. } => "policy",
         Op::StopAgent => "stop_agent",
         _ => "other",
     }
@@ -80,6 +83,9 @@ pub struct Agent {
     pub(crate) read_timeout: Duration,
     pub(crate) drain_timeout: Duration,
     spawn: Spawn,
+    /// Who is asking: the peer's invoker, an AI class or nobody we can name.
+    pub(crate) resolver: Arc<Resolver>,
+    audit: Arc<dyn Audit>,
     /// Test hook: the guard announces on `.0` that it reached the post-suspend lock, and waits for `.1` first.
     #[cfg(test)]
     pub(crate) lock_gate: Option<(Arc<Notify>, Arc<Notify>)>,
@@ -92,7 +98,15 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(config: Config, home: PathBuf, user: User, var: EnvFn, spawn: Spawn) -> Agent {
+    pub fn new(
+        config: Config,
+        home: PathBuf,
+        user: User,
+        var: EnvFn,
+        spawn: Spawn,
+        resolver: Arc<Resolver>,
+        audit: Arc<dyn Audit>,
+    ) -> Agent {
         let clock = Arc::new(SystemClock);
         let last_tick = tokio::sync::Mutex::new((clock.wall(), clock.mono()));
         Agent {
@@ -105,6 +119,8 @@ impl Agent {
             read_timeout: READ_TIMEOUT,
             drain_timeout: DRAIN_TIMEOUT,
             spawn,
+            resolver,
+            audit,
             #[cfg(test)]
             lock_gate: None,
             workers: Mutex::default(),
@@ -131,7 +147,12 @@ impl Agent {
             return Some(w.clone());
         }
         let paths = ProfilePaths::with(&*self.var, &self.home, profile);
-        let w = Arc::new((self.spawn)(Ctx { profile: profile.clone(), paths, user: self.user.clone() }));
+        let w = Arc::new((self.spawn)(Ctx {
+            profile: profile.clone(),
+            paths,
+            user: self.user.clone(),
+            audit: self.audit.clone(),
+        }));
         workers.insert(profile.name.clone(), w.clone());
         Some(w)
     }
@@ -141,12 +162,61 @@ impl Agent {
         self.workers.lock().map(|w| w.len()).unwrap_or_default()
     }
 
-    /// Answer one request. Anything not yet served answers `Internal`. `StopAgent` only answers `Done`: the
+    /// Answer one request from `who`. Anything not yet served answers `Internal`. `StopAgent` only answers `Done`: the
     /// connection handler notifies the stop once that reply is written.
-    pub async fn dispatch(&self, op: Op) -> Reply {
+    ///
+    /// A request that reads a value or touches the policy is checked twice against the peer's identity taken at
+    /// connect time: before anything is asked, and again once the reply exists (a pid reused while the user was
+    /// being asked must not receive what was granted to the first program).
+    pub async fn dispatch_for(&self, op: Op, who: &Resolved) -> Reply {
         // Do not wait for the tick: a request right after a wake or past the idle timeout finds the profile locked.
         self.guard().await;
         tracing::info!(op = kind(&op), "request");
+        let sensitive = match &op {
+            Op::Get { profile, .. } | Op::History { profile, .. } | Op::Policy { profile, .. } => {
+                Some((kind(&op), profile.clone()))
+            }
+            _ => None,
+        };
+        let changed = |(op, profile): (&'static str, Option<String>)| {
+            tracing::warn!(op, "the caller changed while it was being served: denied");
+            let profile = self.config.profile(profile.as_deref()).map(|p| p.name).unwrap_or_default();
+            let event = AuditEvent {
+                time: SystemTime::now(),
+                profile,
+                caller: who.caller.clone(),
+                op,
+                item: None,
+                verdict: Verdict::Denied,
+            };
+            self.audit.record(event);
+            Reply::Error { error: AgentError::Denied }
+        };
+        if let Some(s) = sensitive.clone()
+            && !self.resolver.recheck(who)
+        {
+            return changed(s);
+        }
+        let reply = self.serve(op, who).await;
+        let holds_value = matches!(
+            reply,
+            Reply::Value { .. }
+                | Reply::Full { .. }
+                | Reply::Raw { .. }
+                | Reply::FieldNames { .. }
+                | Reply::History { .. }
+        );
+        if let Some(s) = sensitive
+            && holds_value
+            && !self.resolver.recheck(who)
+        {
+            return changed(s);
+        }
+        reply
+    }
+
+    async fn serve(&self, op: Op, who: &Resolved) -> Reply {
+        let caller = || who.caller.clone();
         match op {
             Op::StopAgent => Reply::Done,
             Op::Status { profile } => self.on_profile(profile.as_deref(), Cmd::Status).await,
@@ -167,14 +237,30 @@ impl Agent {
             }
             Op::Get { profile, needle, user, folder, ignorecase, select } => {
                 let find = Lookup { needle, user, folder, ignorecase };
-                self.on_unlocked(profile.as_deref(), Cmd::Get { find, select }).await
+                self.on_unlocked(profile.as_deref(), Cmd::Get { find, select, caller: caller() }).await
             }
             Op::History { profile, needle, user, folder } => {
                 let find = Lookup { needle, user, folder, ignorecase: false };
-                self.on_unlocked(profile.as_deref(), Cmd::History { find }).await
+                self.on_unlocked(profile.as_deref(), Cmd::History { find, caller: caller() }).await
+            }
+            // The policy needs no unlocked vault.
+            Op::Policy { profile, action } => {
+                self.on_profile(profile.as_deref(), Cmd::Policy { action, caller: caller() }).await
             }
             _ => Reply::Error { error: AgentError::Internal },
         }
+    }
+
+    /// Test only: a request from the stock invoker ([`testing::invoker`]).
+    #[cfg(test)]
+    pub(crate) async fn dispatch(&self, op: Op) -> Reply {
+        self.dispatch_as(op, testing::invoker()).await
+    }
+
+    /// Test only: a request from `caller`, whose peer is the fake tree's.
+    #[cfg(test)]
+    pub(crate) async fn dispatch_as(&self, op: Op, caller: crate::caller::Caller) -> Reply {
+        self.dispatch_for(op, &Resolved::fixed(caller, testing::peer())).await
     }
 
     /// Test only: how many items the profile's worker has opened.
@@ -275,6 +361,7 @@ pub(crate) mod testing {
     use super::*;
     use crate::credentials::Credentials;
     use crate::host::fake::{Answer, FakeHost, PASSWORD};
+    use crate::policy::Audit;
     use crate::worker::Worker;
     use zeroize::Zeroizing;
 
@@ -316,8 +403,49 @@ pub(crate) mod testing {
         rustix::process::geteuid().as_raw()
     }
 
-    /// An agent over [`CONFIG`], with the fake clock, the scripted host, and every path under `dir`.
-    pub fn agent_world(dir: &std::path::Path) -> (Arc<Agent>, Arc<FakeClock>, FakeHost) {
+    /// The stock caller: a named script run by a named program, so it can be remembered.
+    pub fn invoker() -> crate::caller::Caller {
+        crate::caller::Caller::Invoker {
+            exe: "/usr/local/bin/mytool".into(),
+            script: Some("/opt/scripts/backup.sh".into()),
+            hash: "h1".into(),
+            relative: false,
+        }
+    }
+
+    /// The `dybw` process every fake connection comes from.
+    pub fn peer() -> dybw_peer::Peer {
+        dybw_peer::Peer { pid: 100, uid: me(), token: dybw_peer::Token::plain(0, 100) }
+    }
+
+    /// Records every decision.
+    #[derive(Default)]
+    pub struct Recorder(Mutex<Vec<AuditEvent>>);
+
+    impl Recorder {
+        pub fn events(&self) -> Vec<AuditEvent> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Audit for Recorder {
+        fn record(&self, event: AuditEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    pub struct Rig {
+        pub agent: Arc<Agent>,
+        pub clock: Arc<FakeClock>,
+        pub host: FakeHost,
+        /// The process table the resolver reads: `peer()` is in it.
+        pub tree: Arc<dybw_peer::Fake>,
+        pub audit: Arc<Recorder>,
+    }
+
+    /// An agent over [`CONFIG`], with the fake clock, the scripted host, a fake process table and every path under
+    /// `dir`.
+    pub fn rig(dir: &std::path::Path) -> Rig {
         let file = dir.join("config.toml");
         std::fs::write(&file, CONFIG).unwrap();
         let state = dir.join("state");
@@ -332,11 +460,36 @@ pub(crate) mod testing {
             let host = host.clone();
             move |ctx| Worker::spawn(host.clone(), ctx)
         });
+        let tree = Arc::new(dybw_peer::Fake::default());
+        tree.set_peer(peer());
+        tree.add(100, process(100));
+        let resolver = Arc::new(Resolver::new(tree.clone(), crate::caller::Harnesses::default()));
+        let audit = Arc::new(Recorder::default());
         let user = User { uid: me(), groups: None };
-        let mut agent = Agent::new(Config::load(&file).unwrap(), dir.to_owned(), user, var, spawn);
+        let config = Config::load(&file).unwrap();
+        let mut agent = Agent::new(config, dir.to_owned(), user, var, spawn, resolver, audit.clone());
         let clock = Arc::new(FakeClock(Mutex::new((SystemTime::now(), Instant::now()))));
         agent.clock = clock.clone();
-        (Arc::new(agent), clock, host)
+        Rig { agent: Arc::new(agent), clock, host, tree, audit }
+    }
+
+    /// The process `peer()` names, started as `start`.
+    pub fn process(start: u64) -> dybw_peer::Process {
+        dybw_peer::Process {
+            exe: "/usr/local/bin/dybw".into(),
+            ppid: 1,
+            start,
+            image: Vec::new(),
+            argv: None,
+            env: None,
+            cwd: None,
+            started: None,
+        }
+    }
+
+    pub fn agent_world(dir: &std::path::Path) -> (Arc<Agent>, Arc<FakeClock>, FakeHost) {
+        let Rig { agent, clock, host, .. } = rig(dir);
+        (agent, clock, host)
     }
 
     pub fn agent(dir: &std::path::Path) -> (Arc<Agent>, Arc<FakeClock>) {

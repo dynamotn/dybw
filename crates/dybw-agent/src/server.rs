@@ -87,13 +87,15 @@ pub async fn handle(agent: Arc<Agent>, mut stream: UnixStream) -> bool {
     // The peer is captured before anything is read, while its pid still names it; the policy re-checks it before a
     // reply. One that cannot be identified, or is another user, is refused.
     let peer = dybw_peer::peer_of_stream(&stream).ok().filter(|p| p.uid == agent.uid);
-    let Some(_peer) = peer else {
+    let Some(peer) = peer else {
         tracing::warn!("refused a connection from another user or an unidentifiable peer");
         return false;
     };
+    // Who is on the other end is worked out now, while the peer is what it was at connect.
+    let who = agent.resolver.clone().resolve_async(peer).await;
     let Some(request) = read_request(&mut stream, agent.read_timeout).await else { return false };
     let stop = request.op == Op::StopAgent;
-    let reply = agent.dispatch(request.op).await;
+    let reply = agent.dispatch_for(request.op, &who).await;
     respond(&mut stream, reply, agent.read_timeout).await;
     stop
 }

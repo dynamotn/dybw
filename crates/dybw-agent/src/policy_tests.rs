@@ -1,0 +1,437 @@
+//! The caller policy through the agent: what each class of caller gets, remembered grants, the peer check around
+//! the reply, one question at a time, and `dybw policy`. The scripted host plays the pinentry; the process table is
+//! the fake one of `agent::testing::rig`.
+#![expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
+
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use dybw_proto::{AgentError, Field, Op, PolicyAction, PolicyEntry, PolicyRule, Reply, Select};
+use serde_json::{Value, json};
+
+use crate::agent::testing::{Rig, process, rig, unlock};
+use crate::caller::{Caller, Via, hash_of};
+use crate::host::fake::Answer;
+use crate::policy::Verdict;
+use crate::read_tests::{VAULT, err, get_op, history_op, items, text, until};
+
+const NOTE: &str = "n1";
+
+async fn setup(edit: impl FnOnce(&mut Value)) -> (tempfile::TempDir, Rig) {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(dir.path());
+    let mut vault: Value = serde_json::from_str(VAULT).unwrap();
+    vault["ciphers"].as_array_mut().unwrap().iter_mut().for_each(|c| c["reprompt"] = json!(0));
+    edit(&mut vault);
+    rig.host.vault(&vault.to_string());
+    unlock(&rig.agent, &rig.host, "work").await;
+    (dir, rig)
+}
+
+fn policy_file(dir: &tempfile::TempDir) -> PathBuf {
+    dir.path().join("state/dybw/profiles/work/policy.json")
+}
+
+fn tool(script: &str, hash: &str) -> Caller {
+    Caller::Invoker {
+        exe: "/usr/local/bin/mytool".into(),
+        script: Some(script.into()),
+        hash: hash.into(),
+        relative: false,
+    }
+}
+
+fn ai() -> Caller {
+    Caller::Ai { harness: "claude".into(), via: Via::Ancestry }
+}
+
+fn unknown() -> Caller {
+    Caller::Unknown { why: "orphan".into() }
+}
+
+fn bare_shell() -> Caller {
+    Caller::Invoker { exe: "/bin/bash".into(), script: None, hash: "h".into(), relative: false }
+}
+
+fn relative_script() -> Caller {
+    Caller::Invoker { exe: "/bin/bash".into(), script: Some("run.sh".into()), hash: "h".into(), relative: true }
+}
+
+fn password(rig: &Rig, caller: Caller) -> impl Future<Output = Reply> + use<> {
+    let agent = rig.agent.clone();
+    async move { agent.dispatch_as(get_op(NOTE, Select::Password), caller).await }
+}
+
+fn policy_op(action: PolicyAction) -> Op {
+    Op::Policy { profile: Some("work".into()), action }
+}
+
+fn verdicts(rig: &Rig) -> Vec<Verdict> {
+    rig.audit.events().iter().map(|e| e.verdict).collect()
+}
+
+fn entries(reply: Reply) -> Vec<PolicyEntry> {
+    match reply {
+        Reply::Policy { entries } => entries,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_ai_class_caller_gets_no_value_and_no_question_but_still_lists() {
+    let (_dir, rig) = setup(|_| {}).await;
+    let agent = &rig.agent;
+    for select in [Select::Password, Select::Field("user".into()), Select::Full, Select::Raw, Select::ListFields] {
+        rig.host.allow();
+        assert_eq!(agent.dispatch_as(get_op(NOTE, select), ai()).await, err(AgentError::Denied));
+    }
+    rig.host.allow();
+    assert_eq!(agent.dispatch_as(history_op(NOTE), ai()).await, err(AgentError::Denied));
+    assert!(rig.host.world().confirmed.is_empty(), "nobody is asked on behalf of an AI agent");
+    assert_eq!(agent.opens("work").await, 0);
+    assert_eq!(verdicts(&rig), vec![Verdict::Denied; 6]);
+    assert!(
+        rig.audit.events().iter().all(|e| e.item.as_deref() == Some(NOTE) && matches!(e.caller, Caller::Ai { .. }))
+    );
+    // Names are for every class.
+    let list = Op::List { profile: Some("work".into()), fields: vec![Field::Name], folder: None };
+    let search =
+        Op::Search { profile: Some("work".into()), term: "mail".into(), folder: None, fields: vec![Field::Name] };
+    assert!(!items(agent.dispatch_as(list, ai()).await).is_empty());
+    assert!(!items(agent.dispatch_as(search, ai()).await).is_empty());
+    let status = agent.dispatch_as(Op::Status { profile: Some("work".into()) }, ai()).await;
+    assert!(format!("{status:?}").contains("unlocked: true"));
+}
+
+#[tokio::test]
+async fn an_unknown_caller_is_asked_every_time_with_a_warning_and_never_remembered() {
+    let (dir, rig) = setup(|_| {}).await;
+    for _ in 0..2 {
+        rig.host.allow_always();
+        assert_eq!(text(password(&rig, unknown()).await), "the note's text");
+    }
+    let w = rig.host.world();
+    assert_eq!(w.confirmed.len(), 2, "asked every time");
+    assert!(w.confirmed[0].contains("detached or unknown caller — possibly an AI agent"), "{}", w.confirmed[0]);
+    assert_eq!(w.offered, [false, false], "always is not even offered");
+    drop(w);
+    assert!(!policy_file(&dir).exists());
+    assert_eq!(verdicts(&rig), [Verdict::Confirmed, Verdict::Confirmed]);
+}
+
+#[tokio::test]
+async fn an_always_is_remembered_for_that_program_and_script_until_the_content_changes() {
+    let (dir, rig) = setup(|_| {}).await;
+    let a = || tool("/opt/a.sh", "h1");
+    rig.host.allow_always();
+    assert_eq!(text(password(&rig, a()).await), "the note's text");
+    assert_eq!(rig.host.world().offered, [true]);
+    let stored: Value = serde_json::from_slice(&std::fs::read(policy_file(&dir)).unwrap()).unwrap();
+    assert_eq!(stored["entries"][0]["hash"], "h1");
+    assert_eq!(std::fs::metadata(policy_file(&dir)).unwrap().permissions().mode() & 0o777, 0o600);
+
+    // The same invoker is let through without a question, for any value and the history.
+    assert_eq!(text(password(&rig, a()).await), "the note's text");
+    let history = rig.agent.dispatch_as(history_op(NOTE), a()).await;
+    assert_eq!(history, Reply::History { entries: vec![] });
+    assert_eq!(rig.host.world().confirmed.len(), 1, "no second question");
+
+    // The script was edited: the grant is revoked, and the question comes back.
+    rig.host.allow();
+    assert_eq!(text(password(&rig, tool("/opt/a.sh", "h2")).await), "the note's text");
+    assert_eq!(rig.host.world().confirmed.len(), 2);
+    // Another script run by the same program is another invoker.
+    rig.host.allow();
+    password(&rig, tool("/opt/b.sh", "h1")).await;
+    assert_eq!(rig.host.world().confirmed.len(), 3);
+    // What was granted for the old content still names only that content.
+    assert_eq!(text(password(&rig, a()).await), "the note's text");
+    assert_eq!(rig.host.world().confirmed.len(), 3);
+    assert_eq!(
+        verdicts(&rig),
+        [
+            Verdict::Remembered,
+            Verdict::Granted,
+            Verdict::Granted,
+            Verdict::Confirmed,
+            Verdict::Confirmed,
+            Verdict::Granted
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_caller_that_cannot_be_named_stably_is_never_offered_always() {
+    let (dir, rig) = setup(|_| {}).await;
+    for caller in [relative_script(), bare_shell()] {
+        for _ in 0..2 {
+            rig.host.allow_always();
+            assert_eq!(text(password(&rig, caller.clone()).await), "the note's text");
+        }
+    }
+    assert_eq!(rig.host.world().offered, [false; 4]);
+    assert_eq!(rig.host.world().confirmed.len(), 4, "asked every time");
+    assert!(!policy_file(&dir).exists());
+}
+
+#[tokio::test]
+async fn a_grant_never_satisfies_a_reprompt() {
+    let (_dir, rig) = setup(|v| {
+        for c in v["ciphers"].as_array_mut().unwrap() {
+            if c["id"] == "c1" {
+                c["reprompt"] = json!(1);
+            }
+        }
+    })
+    .await;
+    rig.host.allow_always();
+    assert_eq!(text(password(&rig, tool("/opt/a.sh", "h1")).await), "the note's text");
+    let before = rig.host.world().confirmed.len();
+    let opens = rig.agent.opens("work").await;
+    let reply = rig.agent.dispatch_as(get_op("c1", Select::Password), tool("/opt/a.sh", "h1")).await;
+    assert_eq!(reply, err(AgentError::Denied));
+    let reply = rig.agent.dispatch_as(history_op("c1"), tool("/opt/a.sh", "h1")).await;
+    assert_eq!(reply, err(AgentError::Denied));
+    assert_eq!(rig.host.world().confirmed.len(), before, "not even asked");
+    assert_eq!(rig.agent.opens("work").await, opens, "not opened");
+    assert_eq!(verdicts(&rig)[1..], [Verdict::Denied, Verdict::Denied]);
+}
+
+#[tokio::test]
+async fn a_policy_file_that_cannot_be_trusted_never_allows() {
+    let (dir, rig) = setup(|_| {}).await;
+    rig.host.allow_always();
+    password(&rig, tool("/opt/a.sh", "h1")).await;
+    let file = policy_file(&dir);
+    // Anyone could have written a file others can read.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    rig.host.allow();
+    password(&rig, tool("/opt/a.sh", "h1")).await;
+    assert_eq!(rig.host.world().confirmed.len(), 2, "asked again");
+    // So can a link, and text that is not a policy.
+    std::fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink("/dev/null", &file).unwrap();
+    rig.host.allow();
+    password(&rig, tool("/opt/a.sh", "h1")).await;
+    std::fs::remove_file(&file).unwrap();
+    std::fs::write(&file, "allow everything").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    rig.host.allow();
+    password(&rig, tool("/opt/a.sh", "h1")).await;
+    assert_eq!(rig.host.world().confirmed.len(), 4);
+}
+
+#[tokio::test]
+async fn a_grant_that_cannot_be_written_still_serves_this_request_once() {
+    let (dir, rig) = setup(|_| {}).await;
+    std::fs::create_dir(policy_file(&dir)).unwrap();
+    rig.host.allow_always();
+    assert_eq!(text(password(&rig, tool("/opt/a.sh", "h1")).await), "the note's text");
+    assert_eq!(verdicts(&rig), [Verdict::Confirmed]);
+}
+
+#[tokio::test]
+async fn a_peer_that_changes_before_or_while_the_user_is_asked_gets_nothing() {
+    let (_dir, rig) = setup(|_| {}).await;
+    // Replaced before the request is served: refused, and no question about a program that is gone.
+    rig.tree.add(100, process(101));
+    assert_eq!(password(&rig, tool("/opt/a.sh", "h1")).await, err(AgentError::Denied));
+    assert!(rig.host.world().confirmed.is_empty());
+    let event = &rig.audit.events()[0];
+    assert_eq!((event.op, event.verdict, event.profile.as_str()), ("get", Verdict::Denied, "work"));
+    // Names are not held to it.
+    let list = Op::List { profile: Some("work".into()), fields: vec![Field::Name], folder: None };
+    assert!(!items(rig.agent.dispatch_as(list, tool("/opt/a.sh", "h1")).await).is_empty());
+
+    // Replaced after the user said yes, before the reply: the value is not delivered.
+    rig.tree.add(100, process(100));
+    rig.host.world().confirms.push_back(Answer::Held);
+    let pending = tokio::spawn(password(&rig, tool("/opt/a.sh", "h1")));
+    until(|| rig.host.world().confirmed.len() == 1).await;
+    rig.tree.add(100, process(102));
+    rig.host.world().release.notify_one();
+    assert_eq!(pending.await.unwrap(), err(AgentError::Denied));
+    assert_eq!(verdicts(&rig), [Verdict::Denied, Verdict::Confirmed, Verdict::Denied]);
+}
+
+#[tokio::test]
+async fn a_request_for_another_invoker_waits_for_the_screen_and_gets_its_own_question() {
+    let (_dir, rig) = setup(|_| {}).await;
+    rig.host.world().confirms.push_back(Answer::Held);
+    let first = tokio::spawn(password(&rig, tool("/opt/a.sh", "h1")));
+    until(|| rig.host.world().confirmed.len() == 1).await;
+    // B comes in while A's question is open, and the user will say no to it.
+    let second = tokio::spawn(password(&rig, tool("/opt/b.sh", "h9")));
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(rig.host.world().confirmed.len(), 1, "one question on the screen at a time");
+    rig.host.world().release.notify_one();
+    assert_eq!(text(first.await.unwrap()), "the note's text");
+    // A's yes is not B's: B has a question of its own, which names B.
+    assert_eq!(second.await.unwrap(), err(AgentError::Denied));
+    let w = rig.host.world();
+    assert_eq!(w.confirmed.len(), 2);
+    assert!(w.confirmed[0].contains("/opt/a.sh") && !w.confirmed[0].contains("/opt/b.sh"));
+    assert!(w.confirmed[1].contains("/opt/b.sh") && !w.confirmed[1].contains("/opt/a.sh"));
+}
+
+#[tokio::test]
+async fn a_request_of_the_same_invoker_that_waited_finds_the_grant_made_meanwhile() {
+    let (_dir, rig) = setup(|_| {}).await;
+    rig.host.world().confirms.push_back(Answer::HeldAlways);
+    let first = tokio::spawn(password(&rig, tool("/opt/a.sh", "h1")));
+    until(|| rig.host.world().confirmed.len() == 1).await;
+    let second = tokio::spawn(password(&rig, tool("/opt/a.sh", "h1")));
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    rig.host.world().release.notify_one();
+    assert_eq!(text(first.await.unwrap()), "the note's text");
+    assert_eq!(text(second.await.unwrap()), "the note's text");
+    assert_eq!(rig.host.world().confirmed.len(), 1, "the second was not asked again");
+    assert_eq!(verdicts(&rig), [Verdict::Remembered, Verdict::Granted]);
+}
+
+#[tokio::test]
+async fn policy_show_is_open_to_every_class_and_changes_need_a_named_invoker() {
+    let (dir, rig) = setup(|_| {}).await;
+    let agent = &rig.agent;
+    for caller in [ai(), unknown(), tool("/opt/a.sh", "h1")] {
+        assert!(entries(agent.dispatch_as(policy_op(PolicyAction::Show), caller).await).is_empty());
+    }
+    let changes = [
+        PolicyAction::Allow { invoker: "/usr/bin/x".into(), script: None },
+        PolicyAction::Deny { invoker: "/usr/bin/x".into(), script: None },
+        PolicyAction::Forget { invoker: "/usr/bin/x".into() },
+    ];
+    for caller in [ai(), unknown()] {
+        for change in &changes {
+            rig.host.allow();
+            assert_eq!(agent.dispatch_as(policy_op(change.clone()), caller.clone()).await, err(AgentError::Denied));
+        }
+    }
+    assert!(rig.host.world().confirmed.is_empty(), "no question is put for them");
+    assert_eq!(verdicts(&rig), vec![Verdict::Denied; 6]);
+    assert_eq!(rig.audit.events()[0].op, "policy-allow");
+    assert!(!policy_file(&dir).exists());
+}
+
+#[tokio::test]
+async fn allow_deny_and_forget_ask_the_user_and_change_what_the_next_request_gets() {
+    let (dir, rig) = setup(|_| {}).await;
+    let script = dir.path().join("job.sh");
+    std::fs::write(&script, "echo job").unwrap();
+    let script = std::fs::canonicalize(script).unwrap();
+    let hash = hash_of(&script).unwrap();
+    let allow = || PolicyAction::Allow {
+        invoker: "/usr/local/bin/mytool".into(),
+        script: Some(script.to_string_lossy().into_owned()),
+    };
+    let job = || tool(script.to_str().unwrap(), &hash);
+
+    // The user says no: nothing changes.
+    assert_eq!(rig.agent.dispatch(policy_op(allow())).await, err(AgentError::Denied));
+    assert!(!policy_file(&dir).exists());
+    // Yes: the invoker is let through from now on, without a question, as long as the file is what it was.
+    rig.host.allow();
+    assert_eq!(rig.agent.dispatch(policy_op(allow())).await, Reply::Done);
+    let shown = entries(rig.agent.dispatch(policy_op(PolicyAction::Show)).await);
+    let want = PolicyEntry {
+        exe: "/usr/local/bin/mytool".into(),
+        script: Some(script.to_string_lossy().into_owned()),
+        hash: hash.clone(),
+        rule: PolicyRule::Allow,
+    };
+    assert_eq!(shown, [want]);
+    let asked = rig.host.world().confirmed.clone();
+    assert!(asked[1].contains("always allow reading values for /usr/local/bin/mytool running"), "{}", asked[1]);
+    assert_eq!(text(password(&rig, job()).await), "the note's text");
+    assert_eq!(rig.host.world().confirmed.len(), 2, "no question for the value");
+    std::fs::write(&script, "echo edited").unwrap();
+    rig.host.allow();
+    password(&rig, tool(script.to_str().unwrap(), &hash_of(&script).unwrap())).await;
+    assert_eq!(rig.host.world().confirmed.len(), 3, "an edited script is asked about again");
+
+    // A deny is by path and holds whatever the content.
+    rig.host.allow();
+    let deny = PolicyAction::Deny {
+        invoker: "/usr/local/bin/mytool".into(),
+        script: Some(script.to_string_lossy().into_owned()),
+    };
+    assert_eq!(rig.agent.dispatch(policy_op(deny)).await, Reply::Done);
+    assert_eq!(password(&rig, job()).await, err(AgentError::Denied));
+    assert_eq!(rig.host.world().confirmed.len(), 4, "refused without a question");
+    assert!(rig.host.world().confirmed[3].contains("always refuse reading values for"));
+
+    // Forget: the question comes back.
+    rig.host.allow();
+    let forget = PolicyAction::Forget { invoker: script.to_string_lossy().into_owned() };
+    assert_eq!(rig.agent.dispatch(policy_op(forget)).await, Reply::Done);
+    assert!(rig.host.world().confirmed[4].contains("forget what is remembered for"));
+    assert!(entries(rig.agent.dispatch(policy_op(PolicyAction::Show)).await).is_empty());
+    rig.host.allow();
+    assert_eq!(text(password(&rig, job()).await), "the note's text");
+    assert_eq!(
+        rig.audit.events().iter().filter(|e| e.item.is_none()).map(|e| (e.op, e.verdict)).collect::<Vec<_>>(),
+        [
+            ("policy-allow", Verdict::Declined),
+            ("policy-allow", Verdict::Confirmed),
+            ("policy-deny", Verdict::Confirmed),
+            ("policy-forget", Verdict::Confirmed)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_policy_change_that_cannot_be_planned_or_saved_is_refused_after_no_question_or_says_so() {
+    let (dir, rig) = setup(|_| {}).await;
+    let agent = &rig.agent;
+    let not_a_path = |action| async move { agent.dispatch(policy_op(action)).await };
+    rig.host.allow();
+    let relative = PolicyAction::Allow { invoker: "tool".into(), script: None };
+    assert_eq!(not_a_path(relative).await, err(AgentError::Config));
+    let relative_script = PolicyAction::Deny { invoker: "/usr/bin/x".into(), script: Some("run.sh".into()) };
+    assert_eq!(not_a_path(relative_script).await, err(AgentError::Config));
+    let missing = PolicyAction::Allow { invoker: "/usr/bin/x".into(), script: Some("/no/such/script".into()) };
+    assert_eq!(not_a_path(missing).await, err(AgentError::Config));
+    assert!(rig.host.world().confirmed.is_empty(), "nothing was asked about a change that cannot be made");
+    // Forget takes a name that is not a path too (it only matches nothing).
+    rig.host.allow();
+    assert_eq!(not_a_path(PolicyAction::Forget { invoker: "tool".into() }).await, Reply::Done);
+    // The file cannot be written.
+    std::fs::create_dir(policy_file(&dir)).unwrap();
+    rig.host.allow();
+    let deny = PolicyAction::Deny { invoker: "/usr/bin/x".into(), script: None };
+    assert_eq!(not_a_path(deny).await, err(AgentError::Internal));
+}
+
+#[tokio::test]
+async fn a_policy_change_waits_for_a_peer_that_is_still_the_one_that_asked() {
+    let (dir, rig) = setup(|_| {}).await;
+    rig.tree.add(100, process(101));
+    rig.host.allow();
+    let deny = PolicyAction::Deny { invoker: "/usr/bin/x".into(), script: None };
+    assert_eq!(rig.agent.dispatch(policy_op(deny)).await, err(AgentError::Denied));
+    assert!(rig.host.world().confirmed.is_empty() && !policy_file(&dir).exists());
+}
+
+#[tokio::test]
+async fn a_request_over_a_socket_is_resolved_at_accept_and_an_orphan_is_asked_about() {
+    use dybw_proto::{Request, decode_response, encode};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (_dir, rig) = setup(|_| {}).await;
+    let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+    // The process table knows the test process (its real start and image) as a `dybw` with no parent: an orphan.
+    let me = dybw_peer::peer_of_stream(&client).unwrap();
+    let mut proc = process(me.token.start);
+    proc.image = me.token.image.clone();
+    rig.tree.add(me.pid, proc);
+    let task = tokio::spawn(crate::server::handle(Arc::clone(&rig.agent), server));
+    rig.host.allow_always();
+    client.write_all(&encode(&Request::new(get_op(NOTE, Select::Password))).unwrap()).await.unwrap();
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    assert!(!task.await.unwrap());
+    let reply = decode_response(&out).unwrap().unwrap().0.reply;
+    assert_eq!(text(reply), "the note's text");
+    assert!(rig.host.world().confirmed[0].contains("detached or unknown caller"));
+    assert!(matches!(rig.audit.events()[0].caller, Caller::Unknown { .. }));
+}

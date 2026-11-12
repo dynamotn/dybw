@@ -13,11 +13,13 @@ use crate::agent::Agent;
 use crate::agent::testing::{agent_world, seed_credentials, unlock};
 use crate::host::fake::{Answer, FakeHost};
 
-const VAULT: &str = include_str!("../tests/fixtures/vault.json");
-const MAIL: &str = "Mail ünï 😀";
+pub(crate) const VAULT: &str = include_str!("../tests/fixtures/vault.json");
+pub(crate) const MAIL: &str = "Mail ünï 😀";
+/// How every question starts: the profile and the stock caller of the tests.
+pub(crate) const WHO: &str = "dybw profile work: allow /usr/local/bin/mytool running /opt/scripts/backup.sh";
 
 /// A vault of the fixture (after `edit`), unlocked on profile `work`.
-async fn setup(edit: impl FnOnce(&mut Value)) -> (tempfile::TempDir, Arc<Agent>, FakeHost) {
+pub(crate) async fn setup(edit: impl FnOnce(&mut Value)) -> (tempfile::TempDir, Arc<Agent>, FakeHost) {
     let dir = tempfile::tempdir().unwrap();
     let (agent, _, host) = agent_world(dir.path());
     let mut vault: Value = serde_json::from_str(VAULT).unwrap();
@@ -44,15 +46,15 @@ fn cipher(vault: &Value, id: &str) -> Value {
     vault["ciphers"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap().clone()
 }
 
-fn err(error: AgentError) -> Reply {
+pub(crate) fn err(error: AgentError) -> Reply {
     Reply::Error { error }
 }
 
-fn get_op(needle: &str, select: Select) -> Op {
+pub(crate) fn get_op(needle: &str, select: Select) -> Op {
     Op::Get { profile: Some("work".into()), needle: needle.into(), user: None, folder: None, ignorecase: false, select }
 }
 
-fn history_op(needle: &str) -> Op {
+pub(crate) fn history_op(needle: &str) -> Op {
     Op::History { profile: Some("work".into()), needle: needle.into(), user: None, folder: None }
 }
 
@@ -91,14 +93,14 @@ async fn value_of(agent: &Agent, host: &FakeHost, needle: &str, select: Select) 
     allowed(agent, host, get_op(needle, select)).await
 }
 
-fn text(reply: Reply) -> String {
+pub(crate) fn text(reply: Reply) -> String {
     match reply {
         Reply::Value { value } => value.expose().to_owned(),
         other => panic!("{other:?}"),
     }
 }
 
-fn items(reply: Reply) -> Vec<dybw_proto::ItemSummary> {
+pub(crate) fn items(reply: Reply) -> Vec<dybw_proto::ItemSummary> {
     match reply {
         Reply::Items { items } => items,
         other => panic!("{other:?}"),
@@ -106,7 +108,7 @@ fn items(reply: Reply) -> Vec<dybw_proto::ItemSummary> {
 }
 
 /// Wait for `ready`, at most 5 s: the worker runs on its own thread.
-async fn until(ready: impl Fn() -> bool) {
+pub(crate) async fn until(ready: impl Fn() -> bool) {
     for _ in 0..500 {
         if ready() {
             return;
@@ -376,10 +378,7 @@ async fn list_fields_names_the_custom_fields_after_a_confirmation_like_any_value
     assert_eq!(agent.opens("work").await, 0, "a no opens nothing");
     let reply = allowed(&agent, &host, get_op("c1", Select::ListFields)).await;
     assert_eq!(reply, Reply::FieldNames { names: ["text", "hidden", "flag", "linked", ""].map(String::from).to_vec() });
-    assert_eq!(
-        host.world().confirmed[1],
-        format!("dybw profile work: allow reading the field names of the item \"{MAIL}\"?")
-    );
+    assert_eq!(host.world().confirmed[1], format!("{WHO} (dybw get) to read the field names of the item \"{MAIL}\"?"));
     assert_eq!(agent.opens("work").await, 1);
     assert_eq!(allowed(&agent, &host, get_op("c2", Select::ListFields)).await, Reply::FieldNames { names: vec![] });
 }
@@ -416,7 +415,7 @@ async fn history_lists_the_old_passwords_newest_first_after_a_confirmation() {
     assert_eq!(got, [("2025-02-01T00:00:00Z", "old-2"), ("unknown", "old-1")]);
     assert_eq!(allowed(&agent, &host, history_op("n1")).await, Reply::History { entries: vec![] });
     let asked = host.world().confirmed.clone();
-    assert_eq!(asked[0], format!("dybw profile work: allow reading its password history of the item \"{MAIL}\"?"));
+    assert_eq!(asked[0], format!("{WHO} (dybw history) to read its password history of the item \"{MAIL}\"?"));
     // No confirmation, no history.
     assert_eq!(agent.dispatch(history_op("c1")).await, err(AgentError::Denied));
 }
@@ -429,7 +428,7 @@ async fn every_value_request_is_confirmed_first_naming_the_profile_the_item_and_
     value_of(&agent, &host, "c1", Select::Full).await;
     value_of(&agent, &host, "c1", Select::Raw).await;
     let asked = host.world().confirmed.clone();
-    let lead = "dybw profile work: allow reading ";
+    let lead = format!("{WHO} (dybw get) to read ");
     let tail = format!(" of the item \"{MAIL}\"?");
     let what = [
         "its main value (password, notes, number or public key)",

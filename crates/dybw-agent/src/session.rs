@@ -24,6 +24,7 @@ use crate::credentials::Credentials;
 use crate::device::device_id_for;
 use crate::host::Host;
 use crate::paths::ProfilePaths;
+use crate::policy::Audit;
 
 /// The server's `DeviceType`: macOS desktop, else Linux desktop.
 #[cfg(target_os = "macos")]
@@ -39,6 +40,8 @@ pub struct Ctx {
     pub profile: Profile,
     pub paths: ProfilePaths,
     pub user: User,
+    /// Where policy decisions are recorded.
+    pub audit: std::sync::Arc<dyn Audit>,
 }
 
 impl Ctx {
@@ -439,10 +442,16 @@ mod tests {
             config: dir.join("config.toml"),
             state: dir.join("state"),
             credentials: dir.join("state/credentials"),
+            policy: dir.join("state/policy.json"),
             device: dir.join("state/devices/dybw"),
             cache: dir.join("cache"),
         };
-        Ctx { profile, paths, user: User { uid: rustix::process::geteuid().as_raw(), groups: None } }
+        Ctx {
+            profile,
+            paths,
+            user: User { uid: rustix::process::geteuid().as_raw(), groups: None },
+            audit: std::sync::Arc::new(crate::policy::NoAudit),
+        }
     }
 
     #[tokio::test]

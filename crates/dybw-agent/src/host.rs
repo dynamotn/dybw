@@ -102,6 +102,10 @@ pub(crate) mod fake {
         Hang,
         /// A confirmation that says yes once `World::release` is notified.
         Held,
+        /// A confirmation that says yes and "always".
+        Always,
+        /// `Held`, then "always".
+        HeldAlways,
     }
 
     pub struct World {
@@ -191,6 +195,11 @@ pub(crate) mod fake {
 
         pub fn allow(&self) {
             self.world().confirms.push_back(Answer::Text("yes"));
+        }
+
+        /// The user says yes and ticks "always" (which only counts when it was offered).
+        pub fn allow_always(&self) {
+            self.world().confirms.push_back(Answer::Always);
         }
 
         /// The `ciphers` and `folders` of `/sync`, from a `{ciphers, folders}` JSON text.
@@ -286,7 +295,7 @@ pub(crate) mod fake {
                 Answer::Timeout => Err(PromptError::Timeout),
                 Answer::Hang => std::future::pending().await,
                 // The user types the right password once the test lets them.
-                Answer::Held => {
+                Answer::Held | Answer::Always | Answer::HeldAlways => {
                     release.notified().await;
                     Ok(Some(Zeroizing::new(PASSWORD.to_owned())))
                 }
@@ -303,13 +312,19 @@ pub(crate) mod fake {
             };
             match answer {
                 Answer::Text(_) => Ok(Confirm::Once),
+                // The pinentry only returns "always" when it was offered.
+                Answer::Always => Ok(if offer_always { Confirm::Always } else { Confirm::Once }),
                 Answer::Cancel => Ok(Confirm::Deny),
                 Answer::Fail => Err(PromptError::Protocol("scripted".into())),
                 Answer::Timeout => Err(PromptError::Timeout),
                 Answer::Hang => std::future::pending().await,
-                Answer::Held => {
+                Answer::Held | Answer::HeldAlways => {
                     release.notified().await;
-                    Ok(Confirm::Once)
+                    Ok(if matches!(answer, Answer::HeldAlways) && offer_always {
+                        Confirm::Always
+                    } else {
+                        Confirm::Once
+                    })
                 }
             }
         }
