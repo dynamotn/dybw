@@ -387,7 +387,7 @@ fn error_replies_become_messages_and_exit_1() {
         (AgentError::NotLoggedIn, "dybw: the profile is not logged in (run `dybw login`)\n"),
         (AgentError::NotFound, "dybw: no item matches\n"),
         (AgentError::NoSuchField(s("pin")), "dybw: the item has no field named \"pin\"\n"),
-        (AgentError::Denied, "dybw: denied\n"),
+        (AgentError::Denied, "dybw: denied (see the agent log)\n"),
         (AgentError::Prompt, "dybw: the confirmation prompt could not be shown (pinentry)\n"),
         (
             AgentError::Refused(s("kdf-downgrade")),
@@ -395,7 +395,7 @@ fn error_replies_become_messages_and_exit_1() {
         ),
         (AgentError::Network, "dybw: the server could not be reached\n"),
         (AgentError::Server, "dybw: the server refused the request\n"),
-        (AgentError::Config, "dybw: the configuration is invalid\n"),
+        (AgentError::Config, "dybw: the configuration is invalid (see the agent log)\n"),
         (AgentError::Internal, "dybw: internal agent error\n"),
     ];
     for (error, text) in cases {

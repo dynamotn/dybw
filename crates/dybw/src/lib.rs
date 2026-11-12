@@ -134,6 +134,9 @@ enum Fail {
     /// A safety check refused the unlock; `log` names the log of the agent this command started.
     #[error("the {check} check refused the unlock; see {}", .log.as_ref().map_or("the agent log".into(), |p| p.display().to_string()))]
     Refused { check: String, log: Option<std::path::PathBuf> },
+    /// An error whose reason is only in the agent log (a denial, a bad configuration).
+    #[error("{what} (see {})", .log.as_ref().map_or("the agent log".into(), |p| p.display().to_string()))]
+    Logged { what: &'static str, log: Option<std::path::PathBuf> },
     #[error("the agent sent a reply that does not fit the request")]
     Unexpected,
     #[error("cannot write the output: {0}")]
@@ -143,7 +146,6 @@ enum Fail {
 fn agent_text(e: &AgentError) -> String {
     match e {
         AgentError::Prompt => "the confirmation prompt could not be shown (pinentry)".into(),
-        AgentError::Denied => "denied".into(),
         AgentError::Locked => "the vault is locked (run `dybw unlock`)".into(),
         AgentError::NotLoggedIn => "the profile is not logged in (run `dybw login`)".into(),
         other => other.to_string(),
@@ -155,6 +157,10 @@ fn ask(env: &Env, op: Op, autostart: bool) -> Result<Option<Reply>, Fail> {
     match client::call(env, op, autostart)? {
         Some(Reply::Error { error: AgentError::Refused(check) }) => {
             Err(Fail::Refused { check, log: env.started_log.borrow().clone() })
+        }
+        Some(Reply::Error { error: e @ (AgentError::Denied | AgentError::Config) }) => {
+            let what = if e == AgentError::Denied { "denied" } else { "the configuration is invalid" };
+            Err(Fail::Logged { what, log: env.started_log.borrow().clone() })
         }
         Some(Reply::Error { error }) => Err(Fail::Agent(error)),
         other => Ok(other),
@@ -250,7 +256,9 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
         Cmd::History { item, user, folder } => {
             match ask_started(env, Op::History { profile, needle: item, user, folder })? {
                 Reply::History { entries } => {
-                    entries.iter().try_for_each(|e| writeln!(out, "{}: {}", e.last_used, e.password.expose()))?;
+                    entries
+                        .iter()
+                        .try_for_each(|e| writeln!(out, "{}: {}", escape(&e.last_used), e.password.expose()))?;
                     Ok(0)
                 }
                 _ => Err(Fail::Unexpected),
