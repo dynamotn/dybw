@@ -489,6 +489,13 @@ name = "dybw"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dybw-agent",
+ "dybw-proto",
+ "rustix",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "zeroize",
 ]
 
 [[package]]
