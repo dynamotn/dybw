@@ -615,3 +615,23 @@ fn the_doctor_can_ask_what_this_process_would_be_taken_for() {
     // The real table, whatever this test runs under.
     let _ = this_process(&tree.dir.path().join("no-harnesses.toml"));
 }
+
+#[test]
+fn versioned_and_newer_interpreters_follow_the_strict_script_rule() {
+    let t = Tree::new();
+    let script = t.file("tool", "x");
+    t.dybw(50);
+    for name in ["perl5.36", "ruby3.3", "nodejs", "php8.3", "lua5.4", "tclsh8.6", "bun", "deno", "pwsh"] {
+        let exe = t.file(name, "elf");
+        t.add(50, &exe, 1, Some(&[name, &script.to_string_lossy()]), Some(&[]));
+        assert!(matches!(t.caller(), Caller::Invoker { script: Some(s), .. } if s == script), "{name}");
+        // Inline code, or any flag at all, hides the script.
+        for flag in ["-e", "-c", "-x"] {
+            t.add(50, &exe, 1, Some(&[name, flag, &script.to_string_lossy()]), Some(&[]));
+            assert!(matches!(t.caller(), Caller::Unknown { .. }), "{name} {flag}");
+        }
+        // Bare: an interpreter that cannot be remembered.
+        t.add(50, &exe, 1, Some(&[name]), Some(&[]));
+        assert!(!t.caller().rememberable(), "{name}");
+    }
+}

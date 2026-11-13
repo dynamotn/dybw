@@ -23,7 +23,10 @@ const CLI_NAMES: [&str; 2] = ["dybw", "rbw"];
 const SUBREAPERS: [&str; 5] = ["systemd", "init", "launchd", "tini", "dumb-init"];
 /// Privilege wrappers: anything run through them is not named by its invoker.
 const ELEVATORS: [&str; 5] = ["sudo", "doas", "su", "run0", "pkexec"];
-const INTERPRETERS: [&str; 4] = ["node", "perl", "ruby", "osascript"];
+/// Interpreters matched by name prefix (`perl5.36`, `ruby3.3`, `nodejs`); python has its own flags.
+const INTERPRETER_PREFIXES: [&str; 6] = ["node", "perl", "ruby", "php", "lua", "tclsh"];
+/// Interpreters matched by exact name.
+const INTERPRETERS: [&str; 4] = ["osascript", "bun", "deno", "pwsh"];
 /// Environment variables a harness sets (profiles §4); they only ever tighten.
 const MARKERS: [(&str, &str); 8] = [
     ("CLAUDECODE", "claude"),
@@ -342,7 +345,7 @@ fn flag_letters(exe: &Path) -> Option<&'static [char]> {
         Some(&['e', 'x', 'u', 'l', 'i'])
     } else if name.starts_with("python") {
         Some(&['u', 'B', 'E', 'I', 's'])
-    } else if INTERPRETERS.contains(&name.as_str()) {
+    } else if INTERPRETERS.contains(&name.as_str()) || INTERPRETER_PREFIXES.iter().any(|p| name.starts_with(p)) {
         Some(&[])
     } else {
         None
