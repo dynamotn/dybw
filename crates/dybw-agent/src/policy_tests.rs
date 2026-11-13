@@ -30,7 +30,7 @@ async fn setup(edit: impl FnOnce(&mut Value)) -> (tempfile::TempDir, Rig) {
 }
 
 fn policy_file(dir: &tempfile::TempDir) -> PathBuf {
-    dir.path().join("state/dybw/profiles/work/policy.json")
+    dir.path().join(".local/state/dybw/profiles/work/policy.json")
 }
 
 fn tool(script: &str, hash: &str) -> Caller {
@@ -91,9 +91,8 @@ async fn an_ai_class_caller_gets_no_value_and_no_question_but_still_lists() {
     assert!(rig.host.world().confirmed.is_empty(), "nobody is asked on behalf of an AI agent");
     assert_eq!(agent.opens("work").await, 0);
     assert_eq!(verdicts(&rig), vec![Verdict::Denied; 6]);
-    assert!(
-        rig.audit.events().iter().all(|e| e.item.as_deref() == Some(NOTE) && matches!(e.caller, Caller::Ai { .. }))
-    );
+    // Refused before the vault is opened, so there is no item to name.
+    assert!(rig.audit.events().iter().all(|e| e.item.is_none() && matches!(e.caller, Caller::Ai { .. })));
     // Names are for every class.
     let list = Op::List { profile: Some("work".into()), fields: vec![Field::Name], folder: None };
     let search =
@@ -102,6 +101,18 @@ async fn an_ai_class_caller_gets_no_value_and_no_question_but_still_lists() {
     assert!(!items(agent.dispatch_as(search, ai()).await).is_empty());
     let status = agent.dispatch_as(Op::Status { profile: Some("work".into()) }, ai()).await;
     assert!(format!("{status:?}").contains("unlocked: true"));
+}
+
+#[tokio::test]
+async fn an_ai_request_for_a_value_never_unlocks_a_locked_profile() {
+    let (_dir, rig) = setup(|_| {}).await;
+    let agent = &rig.agent;
+    assert_eq!(agent.dispatch(Op::Lock { target: dybw_proto::Target::Profile("work".into()) }).await, Reply::Done);
+    let asked = rig.host.world().asked.len();
+    rig.host.allow();
+    assert_eq!(agent.dispatch_as(get_op(NOTE, Select::Password), ai()).await, err(AgentError::Denied));
+    assert_eq!(rig.host.world().asked.len(), asked, "no master-password prompt on behalf of an AI agent");
+    assert_eq!(verdicts(&rig), [Verdict::Denied]);
 }
 
 #[tokio::test]
@@ -513,14 +524,16 @@ async fn every_read_of_an_ai_or_unknown_caller_is_logged_also_when_it_never_reac
     for caller in [ai(), unknown()] {
         items(agent.dispatch_as(list(), caller.clone()).await);
         items(agent.dispatch_as(search(), caller.clone()).await);
-        // No such item: failed before any decision, and the needle is nowhere in the line.
+        // No such item: an AI caller is refused up front, an unknown one fails before any decision; the needle is
+        // nowhere in the line.
         let missing = agent.dispatch_as(get_op("no-such-item", Select::Full), caller.clone()).await;
         assert!(matches!(missing, Reply::Error { .. }));
         let missing = agent.dispatch_as(history_op("no-such-item"), caller).await;
         assert!(matches!(missing, Reply::Error { .. }));
     }
     let events = rig.audit.events();
-    assert_eq!(verdicts(&rig), [Verdict::Listed, Verdict::Listed, Verdict::Failed, Verdict::Failed].repeat(2));
+    let want = |miss| [Verdict::Listed, Verdict::Listed, miss, miss];
+    assert_eq!(verdicts(&rig), [want(Verdict::Denied), want(Verdict::Failed)].concat());
     let ops: Vec<_> = events.iter().take(4).map(|e| (e.op, e.kind)).collect();
     assert_eq!(ops, [("list", None), ("search", None), ("get", Some("full")), ("history", None)]);
     assert!(events.iter().all(|e| e.item.is_none() && e.profile == "work"));

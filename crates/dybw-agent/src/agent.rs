@@ -178,32 +178,21 @@ impl Agent {
             Op::History { profile, .. } | Op::Policy { profile, .. } => Some((kind(&op), None, profile.clone())),
             _ => None,
         };
-        let logged = match &op {
-            Op::Get { profile, select, .. } => Some((kind(&op), op_of(Some(select)).1, profile.clone())),
-            Op::History { profile, .. } | Op::List { profile, .. } | Op::Search { profile, .. } => {
-                Some((kind(&op), None, profile.clone()))
-            }
+        let logged = sensitive.clone().filter(|_| !matches!(op, Op::Policy { .. })).or_else(|| match &op {
+            Op::List { profile, .. } | Op::Search { profile, .. } => Some((kind(&op), None, profile.clone())),
             _ => None,
-        };
-        let changed = |(op, what, profile): (&'static str, Option<&'static str>, Option<String>)| {
-            tracing::warn!(op, "the caller changed while it was being served: denied");
-            let profile = self.config.profile(profile.as_deref()).map(|p| p.name).unwrap_or_default();
-            let event = AuditEvent {
-                time: SystemTime::now(),
-                profile,
-                caller: who.caller.clone(),
-                op,
-                kind: what,
-                item: None,
-                verdict: Verdict::Denied,
-            };
-            self.audit.record(event);
-            Reply::Error { error: AgentError::Denied }
-        };
+        });
+        // An AI-class caller is never given a value: refuse before any unlock, so it cannot raise a password prompt.
+        if let Some(s) = sensitive.clone()
+            && matches!(who.caller, Caller::Ai { .. })
+            && matches!(op, Op::Get { .. } | Op::History { .. })
+        {
+            return self.deny(who, s, "an AI-class caller asked for a value: denied");
+        }
         if let Some(s) = sensitive.clone()
             && !self.resolver.recheck(who)
         {
-            return changed(s);
+            return self.deny(who, s, "the caller changed while it was being served: denied");
         }
         // The worker checks the peer again once the user has answered, right before it opens anything; and once more
         // here, right before a value is handed back to be written.
@@ -220,10 +209,31 @@ impl Agent {
             && holds_value
             && !self.resolver.recheck(who)
         {
-            return changed(s);
+            return self.deny(who, s, "the caller changed while it was being served: denied");
         }
         self.log_unvetted(who, logged, &reply);
         reply
+    }
+
+    /// Audit and answer `Denied` for a sensitive request.
+    fn deny(
+        &self,
+        who: &Resolved,
+        (op, what, profile): (&'static str, Option<&'static str>, Option<String>),
+        why: &str,
+    ) -> Reply {
+        tracing::warn!(op, "{why}");
+        let profile = self.config.profile(profile.as_deref()).map(|p| p.name).unwrap_or_default();
+        self.audit.record(AuditEvent {
+            time: SystemTime::now(),
+            profile,
+            caller: who.caller.clone(),
+            op,
+            kind: what,
+            item: None,
+            verdict: Verdict::Denied,
+        });
+        Reply::Error { error: AgentError::Denied }
     }
 
     /// Every read request of an AI-class or unknown caller leaves a line, also the ones that never reach a decision
@@ -504,11 +514,9 @@ pub(crate) mod testing {
     ) -> Rig {
         let file = dir.join("config.toml");
         std::fs::write(&file, CONFIG).unwrap();
-        let state = dir.join("state");
-        let cache = dir.join("cache");
-        let var = Box::new(move |name: &str| match name {
-            "XDG_STATE_HOME" => Some(state.clone().into_os_string()),
-            "XDG_CACHE_HOME" => Some(cache.clone().into_os_string()),
+        // State and cache land under the home, which is `dir`; an inherited XDG variable must not move them.
+        let var = Box::new(|name: &str| match name {
+            "XDG_STATE_HOME" | "XDG_CACHE_HOME" => Some("/nonexistent/xdg".into()),
             _ => None,
         });
         let host = FakeHost::new();
