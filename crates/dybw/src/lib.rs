@@ -201,6 +201,11 @@ fn agent_text(e: &AgentError) -> String {
     }
 }
 
+/// A pinentry as the agent would resolve it, or why it would not.
+fn pinentry_text(p: &str) -> Result<String, String> {
+    dybw_agent::trust::pinentry_of(p).map_err(|e| format!("{e:#}"))
+}
+
 /// Send `op`; an error reply becomes a failure.
 fn ask(env: &Env, op: Op, autostart: bool) -> Result<Option<Reply>, Fail> {
     match client::call(env, op, autostart)? {
@@ -347,8 +352,7 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
         Cmd::Doctor => {
             let me = doctor::home_of(env)
                 .and_then(|home| dybw_agent::caller::this_process(&dybw_agent::paths::harnesses_path(&home)));
-            let pinentry = |p: &str| dybw_agent::trust::pinentry_of(p).map_err(|e| format!("{e:#}"));
-            Ok(doctor::run(env, profile.as_deref(), me, &pinentry, out)?)
+            Ok(doctor::run(env, profile.as_deref(), me, &pinentry_text, out)?)
         }
         // Nothing to stop when no agent runs, and none is started to be stopped.
         Cmd::Agent { command: AgentCmd::Stop } => done(ask(env, Op::StopAgent, false)?.unwrap_or(Reply::Done)),

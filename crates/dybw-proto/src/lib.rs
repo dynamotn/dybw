@@ -343,10 +343,9 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Zeroizing<Vec<u8>>, FrameError>
     if len > MAX_FRAME {
         return Err(FrameError::TooLarge(len));
     }
-    // The length fits: it is at most MAX_FRAME.
-    if let Some(header) = frame.first_chunk_mut::<4>() {
-        *header = (len as u32).to_be_bytes();
-    }
+    // The length fits: it is at most MAX_FRAME. Four bytes for four, so the buffer is not reallocated (nothing
+    // unzeroed is left behind).
+    frame.splice(..4, (len as u32).to_be_bytes());
     Ok(frame)
 }
 

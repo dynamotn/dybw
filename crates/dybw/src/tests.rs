@@ -361,11 +361,28 @@ fn a_closed_output_is_a_failure() {
             Ok(())
         }
     }
-    let f = fake(vec![Act::Reply(Reply::Value { value: secret("v") })]);
+    let entry = HistoryEntry { last_used: s("2026-01-02T03:04:05Z"), password: secret("new") };
+    let f = fake(vec![
+        Act::Reply(Reply::Value { value: secret("v") }),
+        Act::Reply(Reply::History { entries: vec![entry] }),
+    ]);
     let mut err = vec![];
     let env = env_in(f.base.path(), None, None);
     assert_eq!(run(["dybw", "get", "n"], &env, &mut Broken, &mut err), 1);
     assert!(String::from_utf8(err).unwrap().contains("cannot write the output"));
+    let mut err = vec![];
+    assert_eq!(run(["dybw", "history", "n"], &env, &mut Broken, &mut err), 1);
+    assert!(String::from_utf8(err).unwrap().contains("cannot write the output"));
+    // The doctor's report is output too.
+    let mut err = vec![];
+    assert_eq!(run(["dybw", "doctor"], &env, &mut Broken, &mut err), 1);
+    assert!(String::from_utf8(err).unwrap().contains("cannot write the output"));
+}
+
+#[test]
+fn a_pinentry_that_does_not_resolve_says_why() {
+    // Whether a real pinentry is installed depends on the machine; a missing program never resolves.
+    assert!(!pinentry_text("dybw-no-such-pinentry").unwrap_err().is_empty());
 }
 
 // exit codes and error texts
@@ -1077,4 +1094,11 @@ fn the_audit_log_is_under_home_whatever_xdg_state_home_says() {
     });
     let (code, out, _) = run_in(&env, &["audit"]);
     assert_eq!((code, out.lines().count()), (0, 3));
+}
+
+#[test]
+fn a_logged_failure_names_the_log_when_there_is_one() {
+    let log = Some(std::path::PathBuf::from("/x/agent.log"));
+    assert_eq!(Fail::Logged { what: "denied", log }.to_string(), "denied (see /x/agent.log)");
+    assert_eq!(Fail::Logged { what: "denied", log: None }.to_string(), "denied (see the agent log)");
 }

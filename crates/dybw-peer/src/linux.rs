@@ -70,7 +70,11 @@ fn pidfd_names(fd: &OwnedFd, pid: u32) -> Result<(), Error> {
 fn peer_pidfd(fd: libc::c_int) -> Option<OwnedFd> {
     let mut buf = [0u8; 4];
     let n = getsockopt(fd, libc::SOL_SOCKET, SO_PEERPIDFD?, &mut buf).ok()?;
-    let raw = i32::from_ne_bytes(buf);
+    adopt(n, i32::from_ne_bytes(buf))
+}
+
+/// Take ownership of the descriptor `SO_PEERPIDFD` returned (`n` bytes, value `raw`).
+fn adopt(n: usize, raw: i32) -> Option<OwnedFd> {
     // 0, 1 and 2 would be the standard streams, not a fresh descriptor.
     if n != 4 || raw <= 2 {
         return None;
@@ -147,7 +151,11 @@ pub(crate) fn args(pid: u32) -> Result<(Option<Vec<OsString>>, Option<Env>), Err
 }
 
 fn list<T>(pid: u32, file: &str, f: fn(&[u8]) -> T) -> Result<Option<T>, Error> {
-    match read(pid, file) {
+    unreadable_is_none(read(pid, file), f)
+}
+
+fn unreadable_is_none<T>(read: Result<Vec<u8>, Error>, f: fn(&[u8]) -> T) -> Result<Option<T>, Error> {
+    match read {
         Ok(buf) => Ok(Some(f(&buf))),
         Err(Error::Os(e)) if e == libc::EACCES || e == libc::EPERM => Ok(None),
         Err(e) => Err(e),
@@ -165,7 +173,11 @@ pub(crate) fn started(start: u64) -> Option<std::time::SystemTime> {
 
 /// The working directory; another user's (EACCES/EPERM) is `None`.
 pub(crate) fn cwd(pid: u32) -> Result<Option<PathBuf>, Error> {
-    match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+    cwd_of(std::fs::read_link(format!("/proc/{pid}/cwd")))
+}
+
+fn cwd_of(link: std::io::Result<PathBuf>) -> Result<Option<PathBuf>, Error> {
+    match link {
         Ok(p) => Ok(Some(p)),
         Err(e) if matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM | libc::EINVAL)) => Ok(None),
         Err(e) => Err(io_err(e)),
@@ -175,4 +187,49 @@ pub(crate) fn cwd(pid: u32) -> Result<Option<PathBuf>, Error> {
 /// `PR_SET_DUMPABLE` is part of the agent's hardening, not this crate.
 pub(crate) fn deny_attach() -> Result<(), Error> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn os(e: i32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(e)
+    }
+
+    #[test]
+    fn a_descriptor_that_could_be_a_standard_stream_is_not_adopted() {
+        assert!(adopt(4, 2).is_none());
+        assert!(adopt(4, -1).is_none());
+        assert!(adopt(3, 10).is_none());
+    }
+
+    #[test]
+    fn io_errors_map_to_gone_or_the_os_error() {
+        assert_eq!(io_err(std::io::ErrorKind::NotFound.into()), Error::Gone);
+        assert_eq!(io_err(os(libc::EIO)), Error::Os(libc::EIO));
+        // No OS error in it: the thread's errno stands in.
+        assert!(matches!(io_err(std::io::Error::other("x")), Error::Os(_)));
+    }
+
+    #[test]
+    fn another_users_arguments_are_withheld_other_failures_are_not() {
+        let len = |b: &[u8]| b.len();
+        assert_eq!(unreadable_is_none(Ok(vec![1, 2]), len), Ok(Some(2)));
+        for e in [libc::EACCES, libc::EPERM] {
+            assert_eq!(unreadable_is_none(Err(Error::Os(e)), len), Ok(None));
+        }
+        assert_eq!(unreadable_is_none(Err(Error::Gone), len), Err(Error::Gone));
+        assert_eq!(unreadable_is_none(Err(Error::Os(libc::EIO)), len), Err(Error::Os(libc::EIO)));
+    }
+
+    #[test]
+    fn another_users_cwd_is_withheld_other_failures_are_not() {
+        assert_eq!(cwd_of(Ok("/x".into())), Ok(Some("/x".into())));
+        for e in [libc::EACCES, libc::EPERM, libc::EINVAL] {
+            assert_eq!(cwd_of(Err(os(e))), Ok(None));
+        }
+        assert_eq!(cwd_of(Err(std::io::ErrorKind::NotFound.into())), Err(Error::Gone));
+        assert_eq!(cwd_of(Err(os(libc::EIO))), Err(Error::Os(libc::EIO)));
+    }
 }

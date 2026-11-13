@@ -730,9 +730,8 @@ async fn sync<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, wait: bool) -> Repl
         }
     };
     session::save_cache(ctx, &sync).await;
-    if let Some(session) = shared.state.borrow_mut().slot.as_mut() {
-        session.vault.sync = sync;
-    }
+    // A lock cancels this task, so the slot is there; if it is not, there is no vault to show the copy to.
+    shared.state.borrow_mut().slot.as_mut().map(|session| session.vault.sync = sync).unwrap_or_default();
     Reply::Done
 }
 
