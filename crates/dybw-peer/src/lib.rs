@@ -290,14 +290,34 @@ mod tests {
     /// macOS withholds the environment of platform binaries (`/bin/sleep`),
     /// so the child is this test binary re-run on `child_body`.
     fn spawn_child(arg0: &str) -> Child {
-        Command::new(std::env::current_exe().unwrap())
-            .arg0(arg0)
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.arg0(arg0)
             .args(["--exact", "tests::child_body"])
             .env(MARKER, "x=y")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap()
+            .stdout(Stdio::null());
+        spawn(&mut cmd)
+    }
+
+    /// Linux refuses to exec a file some process still holds open for writing (ETXTBSY), and a fork in another test
+    /// thread inherits the copy's write descriptor until its own exec: so no test forks while another copies.
+    static FORK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn spawn(cmd: &mut Command) -> Child {
+        let _one = FORK.lock().unwrap();
+        cmd.spawn().unwrap()
+    }
+
+    /// Right after the exec the kernel may not have set the new arguments up yet (an empty or briefly withheld cmdline, Linux): read the
+    /// process again until its argv is there, for up to 5 s.
+    fn process_of(child: &Child) -> Process {
+        let read = |_| {
+            std::thread::sleep(Duration::from_millis(1));
+            Process::of(child.id()).unwrap()
+        };
+        // Withheld (EACCES) is also seen while the exec is in flight; Unreadable (oversized) is final.
+        let settled = |p: &Process| p.args == Args::Unreadable || p.argv.as_ref().is_some_and(|a| !a.is_empty());
+        (0..5000).map(read).find(settled).unwrap() // settled within 5 s
     }
 
     fn sleeper() -> Child {
@@ -335,7 +355,7 @@ mod tests {
     #[test]
     fn a_child_reads_back_exe_argv_env_and_ppid() {
         let mut child = sleeper();
-        let p = Process::of(child.id()).unwrap();
+        let p = process_of(&child);
         assert_eq!(p.ppid, std::process::id());
         assert_eq!(p.exe, std::env::current_exe().unwrap().canonicalize().unwrap());
         assert_eq!(p.argv.unwrap().last().unwrap(), "tests::child_body");
@@ -350,7 +370,7 @@ mod tests {
     #[test]
     fn an_empty_argv0_stays_an_argv_entry() {
         let mut child = spawn_child("");
-        let argv = Process::of(child.id()).unwrap().argv.unwrap();
+        let argv = process_of(&child).argv.unwrap();
         assert_eq!(argv.first().unwrap(), "");
         assert_eq!(argv.get(1).unwrap(), "--exact");
         child.kill().unwrap();
@@ -363,17 +383,20 @@ mod tests {
         let me = std::env::current_exe().unwrap();
         for n in 1..=8usize {
             let copy = dir.path().join("a".repeat(n));
-            std::fs::copy(&me, &copy).unwrap();
+            {
+                let _one = FORK.lock().unwrap();
+                std::fs::copy(&me, &copy).unwrap();
+            }
             for arg0 in ["zero", ""] {
-                let mut child = Command::new(&copy)
-                    .arg0(arg0)
-                    .args(["--exact", "tests::child_body"])
-                    .env(MARKER, "x=y")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .spawn()
-                    .unwrap();
-                let argv = Process::of(child.id()).unwrap().argv.unwrap();
+                let mut child = spawn(
+                    Command::new(&copy)
+                        .arg0(arg0)
+                        .args(["--exact", "tests::child_body"])
+                        .env(MARKER, "x=y")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null()),
+                );
+                let argv = process_of(&child).argv.unwrap();
                 child.kill().unwrap();
                 child.wait().unwrap();
                 assert_eq!(argv, [arg0, "--exact", "tests::child_body"], "name length {n}");
@@ -460,15 +483,7 @@ mod tests {
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
-        // Right after the exec the kernel may not have set the new arguments up yet (empty cmdline): wait for them.
-        let begun = Instant::now();
-        let p = loop {
-            let p = Process::of(child.id()).unwrap();
-            if p.argv.as_ref().is_none_or(|a| !a.is_empty()) || begun.elapsed() > Duration::from_secs(5) {
-                break p;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let p = process_of(&child);
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(p.ppid, std::process::id());
