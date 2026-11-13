@@ -96,6 +96,8 @@ pub async fn handle(agent: Arc<Agent>, mut stream: UnixStream) -> bool {
     let Some(request) = read_request(&mut stream, agent.read_timeout).await else { return false };
     let stop = request.op == Op::StopAgent;
     let reply = agent.dispatch_for(request.op, &who).await;
+    // A refused stop (an AI-class caller) stops nothing.
+    let stop = stop && reply == Reply::Done;
     respond(&mut stream, reply, agent.read_timeout).await;
     stop
 }

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use dybw_native::fsutil::User;
-use dybw_proto::{AgentError, Op, Reply, Target};
+use dybw_proto::{AgentError, Op, PolicyAction, Reply, Target};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
@@ -55,6 +55,16 @@ fn kind(op: &Op) -> &'static str {
         Op::Policy { .. } => "policy",
         Op::StopAgent => "stop_agent",
         _ => "other",
+    }
+}
+
+/// The audit name of a `dybw policy` request.
+fn policy_op(action: &PolicyAction) -> &'static str {
+    match action {
+        PolicyAction::Show => "policy-show",
+        PolicyAction::Allow { .. } => "policy-allow",
+        PolicyAction::Deny { .. } => "policy-deny",
+        PolicyAction::Forget { .. } => "policy-forget",
     }
 }
 
@@ -175,12 +185,19 @@ impl Agent {
             Op::List { profile, .. } | Op::Search { profile, .. } => Some((kind(&op), None, profile.clone())),
             _ => None,
         });
-        // An AI-class caller is never given a value: refuse before any unlock, so it cannot raise a password prompt.
-        if let Some(s) = sensitive.clone()
+        // An AI-class caller reads names and status only: no value, no unlock or login (no prompt is raised on its
+        // behalf), no policy, no stop (it could restart the agent under its own environment). Refused before anything.
+        let refused = match &op {
+            Op::Get { .. } | Op::History { .. } => sensitive.clone(),
+            Op::StopAgent => Some((kind(&op), None, None)),
+            Op::Unlock { profile } | Op::Login { profile } => Some((kind(&op), None, profile.clone())),
+            Op::Policy { profile, action } => Some((policy_op(action), None, profile.clone())),
+            _ => None,
+        };
+        if let Some(s) = refused
             && matches!(who.caller, Caller::Ai { .. })
-            && matches!(op, Op::Get { .. } | Op::History { .. })
         {
-            return self.deny(who, s, "an AI-class caller asked for a value: denied");
+            return self.deny(who, s, "an AI-class caller asked for a value, a prompt, the policy or a stop: denied");
         }
         if let Some(s) = sensitive.clone()
             && !self.resolver.recheck(who)
@@ -261,6 +278,7 @@ impl Agent {
 
     async fn serve(&self, op: Op, who: &Resolved) -> Reply {
         let caller = || who.caller.clone();
+        let ai = matches!(who.caller, Caller::Ai { .. });
         let (resolver, resolved) = (self.resolver.clone(), who.clone());
         let still = || {
             Recheck::new({
@@ -273,7 +291,7 @@ impl Agent {
             Op::Status { profile } => self.on_profile(profile.as_deref(), Cmd::Status).await,
             Op::Login { profile } => self.on_profile(profile.as_deref(), Cmd::Login).await,
             Op::Unlock { profile } => self.on_profile(profile.as_deref(), Cmd::Unlock).await,
-            Op::Sync { target: Target::Profile(name) } => self.on_unlocked(Some(&name), Cmd::Sync).await,
+            Op::Sync { target: Target::Profile(name) } => self.on_unlocked(Some(&name), Cmd::Sync, ai).await,
             Op::Sync { target: Target::All } => self.sync_all().await,
             Op::Lock { target: Target::Profile(name) } => self.on_profile(Some(&name), Cmd::Lock).await,
             Op::Lock { target: Target::All } => {
@@ -281,18 +299,19 @@ impl Agent {
                 Reply::Done
             }
             Op::List { profile, fields, folder } => {
-                self.on_unlocked(profile.as_deref(), Cmd::List { fields, folder }).await
+                self.on_unlocked(profile.as_deref(), Cmd::List { fields, folder }, ai).await
             }
             Op::Search { profile, term, folder, fields } => {
-                self.on_unlocked(profile.as_deref(), Cmd::Search { term, folder, fields }).await
+                self.on_unlocked(profile.as_deref(), Cmd::Search { term, folder, fields }, ai).await
             }
             Op::Get { profile, needle, user, folder, ignorecase, select } => {
                 let find = Lookup { needle, user, folder, ignorecase };
-                self.on_unlocked(profile.as_deref(), Cmd::Get { find, select, caller: caller(), still: still() }).await
+                let cmd = Cmd::Get { find, select, caller: caller(), still: still() };
+                self.on_unlocked(profile.as_deref(), cmd, ai).await
             }
             Op::History { profile, needle, user, folder } => {
                 let find = Lookup { needle, user, folder, ignorecase: false };
-                self.on_unlocked(profile.as_deref(), Cmd::History { find, caller: caller(), still: still() }).await
+                self.on_unlocked(profile.as_deref(), Cmd::History { find, caller: caller(), still: still() }, ai).await
             }
             // The policy needs no unlocked vault.
             Op::Policy { profile, action } => {
@@ -336,8 +355,12 @@ impl Agent {
     }
 
     /// Unlock on first need (profiles.md section 4): the same flow as `dybw unlock`, then `cmd`. A failed or cancelled
-    /// unlock is the answer, so nothing after it (lookup, confirmation, opening) runs.
-    async fn on_unlocked(&self, name: Option<&str>, cmd: Cmd) -> Reply {
+    /// unlock is the answer, so nothing after it (lookup, confirmation, opening) runs. Never for an AI-class caller
+    /// (`ai`): no master-password prompt is raised on its behalf, a locked profile answers `Locked`.
+    async fn on_unlocked(&self, name: Option<&str>, cmd: Cmd, ai: bool) -> Reply {
+        if ai {
+            return self.on_profile(name, cmd).await;
+        }
         match self.on_profile(name, Cmd::Unlock).await {
             Reply::Done => self.on_profile(name, cmd).await,
             failed => failed,
@@ -461,6 +484,7 @@ pub(crate) mod testing {
             script: Some("/opt/scripts/backup.sh".into()),
             hash: "h1".into(),
             relative: false,
+            at: crate::caller::At::default(),
         }
     }
 

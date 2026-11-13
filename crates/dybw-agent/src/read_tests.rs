@@ -16,7 +16,8 @@ use crate::host::fake::{Answer, FakeHost};
 pub(crate) const VAULT: &str = include_str!("../tests/fixtures/vault.json");
 pub(crate) const MAIL: &str = "Mail ünï 😀";
 /// How every question starts: the profile and the stock caller of the tests.
-pub(crate) const WHO: &str = "dybw profile work: allow /usr/local/bin/mytool running /opt/scripts/backup.sh";
+pub(crate) const WHO: &str =
+    "dybw profile work: allow /usr/local/bin/mytool which claims to run /opt/scripts/backup.sh";
 
 /// A vault of the fixture (after `edit`), unlocked on profile `work`.
 pub(crate) async fn setup(edit: impl FnOnce(&mut Value)) -> (tempfile::TempDir, Arc<Agent>, FakeHost) {

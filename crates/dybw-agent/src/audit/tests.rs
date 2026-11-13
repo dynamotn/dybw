@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use super::*;
-use crate::caller::Via;
+use crate::caller::{At, Via};
 
 fn me() -> u32 {
     rustix::process::geteuid().as_raw()
@@ -28,6 +28,7 @@ fn tool() -> Caller {
         script: Some("/opt/a.sh".into()),
         hash: "secret-hash".into(),
         relative: false,
+        at: At::default(),
     }
 }
 
@@ -50,14 +51,15 @@ fn a_decision_is_one_json_line_without_a_value_or_a_name() {
     let audit = log_in(dir.path());
     audit.record(event(tool(), Verdict::Remembered));
     audit.record(event(Caller::Ai { harness: "claude".into(), via: Via::Ancestry }, Verdict::Denied));
-    audit.record(event(Caller::Unknown { why: "orphan".into() }, Verdict::Declined));
+    let peer = Some("/tmp/x/dybw".into());
+    audit.record(event(Caller::Unknown { why: "no process above dybw (orphan)".into(), peer }, Verdict::Declined));
     for verdict in [Verdict::Granted, Verdict::Confirmed, Verdict::Failed, Verdict::Listed] {
         audit.record(event(tool(), verdict));
     }
     let path = dir.path().join("state/dybw/audit.log");
     let text = std::fs::read_to_string(&path).unwrap();
     assert_eq!(text.lines().count(), 7);
-    assert!(!text.contains("secret-hash") && !text.contains("orphan"), "no hash, no reason: {text}");
+    assert!(!text.contains("secret-hash"), "no hash: {text}");
     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     let log = read(&path, me()).unwrap();
     assert_eq!(log.skipped, 0);
@@ -76,10 +78,24 @@ fn a_decision_is_one_json_line_without_a_value_or_a_name() {
             kind: Some("field".into()),
             item: Some("5f0c-id".into()),
             verdict: "remembered".into(),
+            why: None,
+            peer: None,
         }
     );
     assert_eq!((log.entries[1].class.as_str(), log.entries[1].harness.as_deref()), ("ai", Some("claude")));
     assert_eq!((log.entries[2].class.as_str(), log.entries[2].exe.as_deref()), ("unknown", None));
+    // An unknown caller's line says why, and which program was on the socket.
+    assert_eq!(log.entries[2].why.as_deref(), Some("no process above dybw (orphan)"));
+    assert_eq!(log.entries[2].peer.as_deref(), Some("/tmp/x/dybw"));
+    // So does a named one's when its `dybw` is not the agent's companion.
+    let elsewhere = At { peer: Some("/opt/other/dybw".into()), ..At::default() };
+    let Caller::Invoker { exe, script, hash, relative, .. } = tool() else { unreachable!() };
+    audit.record(event(Caller::Invoker { exe, script, hash, relative, at: elsewhere }, Verdict::Granted));
+    let log = read(&path, me()).unwrap();
+    assert_eq!(log.entries.last().unwrap().peer.as_deref(), Some("/opt/other/dybw"));
+    // A line written before these fields existed still reads.
+    let old = r#"{"time":"t","profile":"p","class":"ai","exe":null,"script":null,"harness":"h","op":"get","kind":null,"item":null,"verdict":"denied"}"#;
+    assert!(serde_json::from_str::<Entry>(old).unwrap().why.is_none());
 }
 
 #[test]
@@ -91,6 +107,7 @@ fn strings_that_are_not_ours_are_cleaned_and_cut() {
         script: None,
         hash: "h".into(),
         relative: false,
+        at: At::default(),
     };
     let mut e = event(forged, Verdict::Denied);
     e.item = Some("i".repeat(500));

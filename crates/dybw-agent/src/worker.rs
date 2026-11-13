@@ -23,7 +23,7 @@ use dybw_proto::{AgentError, Field, PolicyAction, PolicyEntry, PolicyRule, Profi
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
-use crate::caller::{Caller, hash_of};
+use crate::caller::{Caller, Scope, hash_of, interpreter, launcher};
 use crate::host::Host;
 use crate::policy::{self, Access, AuditEvent, Decision, Store, Verdict};
 use crate::read::{self, Found, Lookup};
@@ -138,7 +138,14 @@ struct State {
     next_id: u64,
     /// The long commands running now, cancelled by a lock.
     inflight: HashMap<u64, AbortHandle>,
+    /// Per-process grants ([`Scope::Process`]): callers, with their process identity, the user said "always" for.
+    /// Memory only, dropped by a lock. A grant whose process exited can never match again (a new process has
+    /// another start time or image); shortcut: it stays until the lock, at most [`MAX_HELD`] of them.
+    held: Vec<Caller>,
 }
+
+/// Most per-process grants kept; the oldest goes first.
+const MAX_HELD: usize = 64;
 
 #[derive(Default)]
 struct Shared {
@@ -323,6 +330,7 @@ fn lock(shared: &Shared) {
         task.abort();
     }
     st.slot = None;
+    st.held.clear();
 }
 
 /// Run a long command in a task of its own, and answer from a second one. `reply` is `None` for the periodic
@@ -376,8 +384,8 @@ fn with_vault<T>(shared: &Shared, f: impl FnOnce(&UnlockedVault) -> Result<T, Ag
 }
 
 /// What the confirmation says: the profile, who asks and by which command, what is read of which item, each on one
-/// line.
-fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, select: Option<&Select>) -> String {
+/// line; and when "always" is for this process only, that.
+fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, select: Option<&Select>, remember: Scope) -> String {
     let tidy = |s: &str| one_line(s).chars().take(80).collect::<String>();
     let (command, what) = match select {
         Some(Select::Field(name)) => ("get", format!("its field \"{}\"", tidy(name))),
@@ -387,12 +395,21 @@ fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, select: Option<&Select>) 
         Some(_) => ("get", "its main value (password, notes, number or public key)".to_owned()),
         None => ("history", "its password history".to_owned()),
     };
+    let scope = if remember == Scope::Process { " [always (this process only)]" } else { "" };
     format!(
-        "dybw profile {}: allow {} (dybw {command}) to read {what} of the item \"{}\"?",
+        "dybw profile {}: allow {} (dybw {command}) to read {what} of the item \"{}\"?{scope}",
         ctx.profile.name,
         policy::who(caller),
         tidy(&found.name)
     )
+}
+
+/// What a request reads: the whole item, its raw JSON and the history are never covered by a grant.
+fn access_of(select: Option<&Select>) -> Access {
+    match select {
+        None | Some(Select::Full | Select::Raw) => Access::Whole,
+        Some(_) => Access::Value,
+    }
 }
 
 /// The op, and for `get` what was selected: the kind only, never a field name.
@@ -440,10 +457,14 @@ async fn gate<H: Host>(
 ) -> Result<(), AgentError> {
     let op = op_of(select);
     let store = Store::new(&ctx.paths.policy, ctx.user.uid);
-    let mut decision = policy::decide(caller, &store.load(), Access::Value);
+    let decide = || {
+        let held = shared.state.borrow().held.clone();
+        policy::decide(caller, &store.load(), &held, access_of(select))
+    };
+    let mut decision = decide();
     let _screen = if matches!(decision, Decision::Confirm { .. }) {
         let screen = shared.asking.lock().await;
-        decision = policy::decide(caller, &store.load(), Access::Value);
+        decision = decide();
         Some(screen)
     } else {
         None
@@ -451,9 +472,10 @@ async fn gate<H: Host>(
     let (verdict, result) = match decision {
         Decision::Allow => (Verdict::Granted, Ok(())),
         Decision::Deny => (Verdict::Denied, Err(AgentError::Denied)),
-        Decision::Confirm { rememberable } => {
-            match session::confirm(host, &ask_text(ctx, caller, found, select), rememberable).await {
-                Ok(true) => (remember(ctx, &store, caller), Ok(())),
+        Decision::Confirm { remember: scope } => {
+            let text = ask_text(ctx, caller, found, select, scope);
+            match session::confirm(host, &text, scope != Scope::Never).await {
+                Ok(true) => (remember(shared, ctx, &store, caller, scope), Ok(())),
                 Ok(false) => (Verdict::Confirmed, Ok(())),
                 Err(e) => (Verdict::Declined, Err(e)),
             }
@@ -463,9 +485,17 @@ async fn gate<H: Host>(
     result
 }
 
-/// Store the grant "always" asks for. A failed write still lets this one request through (the user said yes), and
-/// is logged.
-fn remember(ctx: &Ctx, store: &Store, caller: &Caller) -> Verdict {
+/// Keep the grant "always" asks for: in memory for this process, or in the policy file. A failed write still lets
+/// this one request through (the user said yes), and is logged.
+fn remember(shared: &Shared, ctx: &Ctx, store: &Store, caller: &Caller, scope: Scope) -> Verdict {
+    if scope == Scope::Process {
+        let held = &mut shared.state.borrow_mut().held;
+        if held.len() >= MAX_HELD {
+            held.remove(0);
+        }
+        held.push(caller.clone());
+        return Verdict::Remembered;
+    }
     // "Always" is only offered for a caller that has a grant; for any other it is just a yes.
     let Some(entry) = policy::grant_for(caller) else { return Verdict::Confirmed };
     match store.set(entry) {
@@ -546,9 +576,10 @@ impl Change {
     /// What the question says is done, on one line.
     fn sentence(&self) -> String {
         let tidy = |s: &str| policy::shown(s, 120);
-        let target = |e: &PolicyEntry| match &e.script {
-            Some(script) => format!("{} running {}", tidy(&e.exe), tidy(script)),
-            None => tidy(&e.exe),
+        let target = |e: &PolicyEntry| match (&e.script, e.detached) {
+            (Some(script), _) => format!("{} running {}", tidy(&e.exe), tidy(script)),
+            (None, true) => format!("{} when run detached (parent exited)", tidy(&e.exe)),
+            (None, false) => tidy(&e.exe),
         };
         match self {
             Change::Set(e) if e.rule == PolicyRule::Allow => format!("always allow reading values for {}", target(e)),
@@ -560,7 +591,7 @@ impl Change {
 
 /// What a change asks for, before its paths are looked at.
 enum Asked {
-    Set { invoker: String, script: Option<String>, rule: PolicyRule },
+    Set { invoker: String, script: Option<String>, rule: PolicyRule, detached: bool },
     Forget(String),
 }
 
@@ -570,29 +601,27 @@ fn plan(asked: Asked) -> Result<Change, AgentError> {
         AgentError::Config
     };
     match asked {
-        Asked::Set { invoker, script, rule } => {
+        Asked::Set { invoker, script, rule, detached } => {
             let exe = policy_path(&invoker).ok_or_else(|| bad("the executable must be an absolute path"))?;
             let script = script.map(|s| policy_path(&s).ok_or_else(|| bad("the script must be an absolute path")));
             let script = script.transpose()?;
+            // An allow that could never match, or would cover what a launcher runs, is refused, not stored (a deny of
+            // the same target is fine). A script's grant lasts for its process only, so none is ever written.
+            if rule == PolicyRule::Allow {
+                let path = std::path::Path::new(&exe);
+                if script.is_some() || interpreter(path) {
+                    return Err(bad("an interpreter or shell, or a script, is remembered per process only"));
+                }
+                if launcher(path) {
+                    return Err(bad("a launcher, multiplexer or terminal runs anything: it cannot be remembered"));
+                }
+            }
             // A deny is by path; an allow is for the program as it is now.
             let hash = match rule {
-                PolicyRule::Allow => {
-                    hash_of(std::path::Path::new(script.as_deref().unwrap_or(&exe))).map_err(|w| bad(&w))?
-                }
+                PolicyRule::Allow => hash_of(std::path::Path::new(&exe)).map_err(|w| bad(&w))?,
                 PolicyRule::Deny => String::new(),
             };
-            let entry = PolicyEntry { exe, script, hash, rule };
-            // An allow that could never match is refused, not stored (a deny of the same target is fine).
-            let target = Caller::Invoker {
-                exe: entry.exe.clone().into(),
-                script: entry.script.clone().map(Into::into),
-                hash: String::new(),
-                relative: false,
-            };
-            if rule == PolicyRule::Allow && !target.rememberable() {
-                return Err(bad("a bare interpreter or shell cannot be remembered: name its script with --script"));
-            }
-            Ok(Change::Set(entry))
+            Ok(Change::Set(PolicyEntry { exe, script, hash, rule, detached: detached && rule == PolicyRule::Allow }))
         }
         Asked::Forget(invoker) => Ok(Change::Forget(policy_path(&invoker).unwrap_or(invoker))),
     }
@@ -611,11 +640,11 @@ async fn change_policy<H: Host>(
     let store = Store::new(&ctx.paths.policy, ctx.user.uid);
     let (op, asked) = match action {
         PolicyAction::Show => return Reply::Policy { entries: store.load() },
-        PolicyAction::Allow { invoker, script } => {
-            ("policy-allow", Asked::Set { invoker, script, rule: PolicyRule::Allow })
+        PolicyAction::Allow { invoker, script, detached } => {
+            ("policy-allow", Asked::Set { invoker, script, rule: PolicyRule::Allow, detached })
         }
         PolicyAction::Deny { invoker, script } => {
-            ("policy-deny", Asked::Set { invoker, script, rule: PolicyRule::Deny })
+            ("policy-deny", Asked::Set { invoker, script, rule: PolicyRule::Deny, detached: false })
         }
         PolicyAction::Forget { invoker } => ("policy-forget", Asked::Forget(invoker)),
     };

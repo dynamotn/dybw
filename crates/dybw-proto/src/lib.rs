@@ -74,14 +74,17 @@ pub enum PolicyRule {
     Deny,
 }
 
-/// One invoker of a profile's caller policy: its executable, the script it runs if any, and the SHA-256 (hex) of
-/// the script (else the executable) that an `allow` was given for.
+/// One invoker of a profile's caller policy: its executable, the script it runs if any (a deny only: an allow is
+/// for a plain executable, and one with a script is ignored), the SHA-256 (hex) of the executable that an `allow`
+/// was given for, and whether that allow is for the program run detached (its parent exited).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyEntry {
     pub exe: String,
     pub script: Option<String>,
     pub hash: String,
     pub rule: PolicyRule,
+    #[serde(default)]
+    pub detached: bool,
 }
 
 /// What `dybw policy` does. `invoker` is an executable path, `script` the file an interpreter runs.
@@ -89,9 +92,12 @@ pub struct PolicyEntry {
 #[serde(rename_all = "snake_case")]
 pub enum PolicyAction {
     Show,
+    /// `detached`: the grant is for the program when its parent has exited (and only then).
     Allow {
         invoker: String,
         script: Option<String>,
+        #[serde(default)]
+        detached: bool,
     },
     Deny {
         invoker: String,
@@ -519,7 +525,7 @@ mod tests {
             Op::Policy { profile: p(), action: PolicyAction::Show },
             Op::Policy {
                 profile: None,
-                action: PolicyAction::Allow { invoker: s("/bin/sh"), script: Some(s("/a.sh")) },
+                action: PolicyAction::Allow { invoker: s("/bin/sh"), script: Some(s("/a.sh")), detached: true },
             },
             Op::Policy { profile: None, action: PolicyAction::Deny { invoker: s("/bin/sh"), script: None } },
             Op::Policy { profile: None, action: PolicyAction::Forget { invoker: s("/bin/sh") } },
@@ -539,6 +545,12 @@ mod tests {
         let mut frame = (body.len() as u32).to_be_bytes().to_vec();
         frame.extend_from_slice(body);
         assert_eq!(decode_request(&frame).unwrap().unwrap().0.op, Op::Status { profile: None });
+        // An entry or an allow from before `detached` existed is not detached.
+        let entry: PolicyEntry =
+            serde_json::from_str(r#"{"exe":"/x","script":null,"hash":"h","rule":"allow"}"#).unwrap();
+        assert!(!entry.detached);
+        let allow: PolicyAction = serde_json::from_str(r#"{"allow":{"invoker":"/x","script":null}}"#).unwrap();
+        assert_eq!(allow, PolicyAction::Allow { invoker: s("/x"), script: None, detached: false });
     }
 
     #[test]
@@ -569,7 +581,13 @@ mod tests {
             Reply::FieldNames { names: vec![s("totp")] },
             Reply::History { entries: vec![HistoryEntry { last_used: s("d"), password: Secret::new(s("old")) }] },
             Reply::Policy {
-                entries: vec![PolicyEntry { exe: s("/bin/sh"), script: None, hash: s("ab"), rule: PolicyRule::Deny }],
+                entries: vec![PolicyEntry {
+                    exe: s("/bin/sh"),
+                    script: None,
+                    hash: s("ab"),
+                    rule: PolicyRule::Deny,
+                    detached: false,
+                }],
             },
             Reply::Error {
                 error: AgentError::Ambiguous { candidates: vec![Candidate { id: s("i"), name: s("n"), user: None }] },

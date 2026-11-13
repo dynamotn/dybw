@@ -50,11 +50,10 @@ pub(crate) fn home_of(uid: u32, start: usize) -> Option<PathBuf> {
             size *= 2;
             continue;
         }
-        if rc != 0 || out.is_null() {
-            return None;
-        }
-        // SAFETY: on success `out` points at `pwd`, which the call filled in.
-        let dir = unsafe { (*out).pw_dir };
+        let found = rc == 0 && !out.is_null();
+        // SAFETY: when found, `out` points at `pwd`, which the call filled in.
+        let dir = if found { unsafe { (*out).pw_dir } } else { std::ptr::null_mut() };
+        // No entry, an error, or an entry without a home.
         if dir.is_null() {
             return None;
         }

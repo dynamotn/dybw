@@ -25,8 +25,10 @@ enum Act {
     Raw(Vec<u8>),
 }
 
+/// `base` is the runtime directory, `HOME` and the home of the password database.
 fn env_in(base: &Path, profile: Option<&'static str>, exe_dir: Option<PathBuf>) -> Env {
     let base = base.to_owned();
+    let base_home = base.clone();
     Env {
         var: Box::new(move |name| match name {
             "XDG_RUNTIME_DIR" => Some(base.clone().into()),
@@ -35,6 +37,7 @@ fn env_in(base: &Path, profile: Option<&'static str>, exe_dir: Option<PathBuf>) 
             _ => None,
         }),
         uid: euid(),
+        home: Some(base_home),
         exe_dir,
         start_wait: Duration::from_secs(3),
         started_log: Default::default(),
@@ -727,12 +730,20 @@ fn field_names_are_escaped_but_their_values_are_not() {
 #[test]
 fn policy_show_prints_one_escaped_row_per_entry() {
     let entries = vec![
-        PolicyEntry { exe: s("/bin/sh"), script: Some(s("/opt/a\nb.sh")), hash: s("ab12"), rule: PolicyRule::Allow },
-        PolicyEntry { exe: s("/usr/bin/x"), script: None, hash: s(""), rule: PolicyRule::Deny },
+        PolicyEntry {
+            exe: s("/bin/sh"),
+            script: Some(s("/opt/a\nb.sh")),
+            hash: s("ab12"),
+            rule: PolicyRule::Allow,
+            detached: false,
+        },
+        PolicyEntry { exe: s("/usr/bin/x"), script: None, hash: s(""), rule: PolicyRule::Deny, detached: false },
+        PolicyEntry { exe: s("/usr/bin/y"), script: None, hash: s("cd"), rule: PolicyRule::Allow, detached: true },
     ];
     let ((code, out, _), op) = one(&["policy", "show"], Reply::Policy { entries });
     assert_eq!(code, 0);
-    assert_eq!(out, "allow\t/bin/sh\t/opt/a\\x0ab.sh\tab12\ndeny\t/usr/bin/x\t\t\n");
+    let want = "allow\t/bin/sh\t/opt/a\\x0ab.sh\tab12\ndeny\t/usr/bin/x\t\t\nallow-detached\t/usr/bin/y\t\tcd\n";
+    assert_eq!(out, want);
     assert_eq!(op, Op::Policy { profile: None, action: PolicyAction::Show });
 }
 
@@ -745,10 +756,14 @@ fn policy_changes_send_their_action_and_succeed_on_done() {
         std::fs::write(f, "x").unwrap();
     }
     let p = |f: &Path| f.to_string_lossy().into_owned();
-    let cases: [(Vec<String>, PolicyAction); 3] = [
+    let cases: [(Vec<String>, PolicyAction); 4] = [
         (
-            vec![s("policy"), s("allow"), p(&sh), s("--script"), p(&script)],
-            PolicyAction::Allow { invoker: p(&sh), script: Some(p(&script)) },
+            vec![s("policy"), s("allow"), p(&tool), s("--detached")],
+            PolicyAction::Allow { invoker: p(&tool), script: None, detached: true },
+        ),
+        (
+            vec![s("-p"), s("home"), s("policy"), s("deny"), p(&sh), s("--script"), p(&script)],
+            PolicyAction::Deny { invoker: p(&sh), script: Some(p(&script)) },
         ),
         (
             vec![s("-p"), s("home"), s("policy"), s("deny"), p(&tool)],
@@ -773,11 +788,13 @@ fn policy_allow_sends_canonical_paths_and_a_missing_file_is_a_cli_error() {
     let link = dir.path().join("link.sh");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let (link, real) = (link.to_string_lossy().into_owned(), real.to_string_lossy().into_owned());
-    let ((code, _, _), op) = one(&["policy", "allow", "/bin/sh", "--script", &link], Reply::Done);
+    let ((code, _, _), op) = one(&["policy", "allow", &link], Reply::Done);
     assert_eq!(code, 0);
-    let Op::Policy { action: PolicyAction::Allow { invoker, script }, .. } = op else { panic!("{op:?}") };
-    assert!(Path::new(&invoker).is_absolute());
-    assert_eq!(script, Some(real));
+    let Op::Policy { action: PolicyAction::Allow { invoker, script, detached }, .. } = op else { panic!("{op:?}") };
+    assert_eq!((invoker, script, detached), (real, None, false));
+    // A script is never remembered on disk: `allow` has no --script.
+    let (code, _, err) = run_in(&env_in(base().path(), None, None), &["policy", "allow", "/bin/sh", "--script", "x"]);
+    assert!(code == 1 && err.contains("--script"), "{err}");
     // No agent is running: the command must fail before it looks for one.
     let base = base();
     for args in [["policy", "allow", "no/such/prog"], ["policy", "deny", "no/such/prog"]] {
@@ -786,7 +803,7 @@ fn policy_allow_sends_canonical_paths_and_a_missing_file_is_a_cli_error() {
         assert!(err.contains("cannot find no/such/prog"), "{err}");
     }
     let (code, _, err) =
-        run_in(&env_in(base.path(), None, None), &["policy", "allow", "/bin/sh", "--script", "gone.sh"]);
+        run_in(&env_in(base.path(), None, None), &["policy", "deny", "/bin/sh", "--script", "gone.sh"]);
     assert!((code, err.contains("cannot find gone.sh")) == (1, true), "{err}");
 }
 
@@ -833,10 +850,11 @@ fn write_audit(base: &Path) {
         script: Some("/opt/a.sh".into()),
         hash: s("h"),
         relative: false,
+        at: dybw_agent::caller::At::default(),
     };
     log.record(audit_event(tool, Verdict::Confirmed));
     log.record(audit_event(Caller::Ai { harness: s("claude"), via: Via::Ancestry }, Verdict::Denied));
-    log.record(audit_event(Caller::Unknown { why: s("orphan") }, Verdict::Declined));
+    log.record(audit_event(Caller::Unknown { why: s("orphan"), peer: None }, Verdict::Declined));
 }
 
 #[test]
@@ -859,9 +877,10 @@ fn audit_can_show_only_ai_callers_and_only_the_latest_lines() {
     let base = base();
     write_audit(base.path());
     let env = env_in(base.path(), None, None);
+    // AI-class and unknown callers: an unknown one may be an AI agent too.
     let (_, out, _) = run_in(&env, &["audit", "--ai"]);
-    assert_eq!(out.lines().count(), 1);
-    assert!(out.contains("\tai\tclaude\t"));
+    assert_eq!(out.lines().count(), 2);
+    assert!(out.contains("\tai\tclaude\t") && out.contains("\tunknown\t"));
     let (_, out, _) = run_in(&env, &["audit", "-n", "1"]);
     assert_eq!(out.lines().count(), 1);
     assert!(out.contains("declined"));
@@ -880,10 +899,10 @@ fn audit_without_a_log_is_empty_and_an_untrusted_or_homeless_one_fails() {
     assert_eq!((code, out.as_str()), (1, ""));
     assert!(err.contains("cannot read the audit log") && err.contains("chmod 600"), "{err}");
     let mut homeless = env_in(base.path(), None, None);
-    homeless.var = Box::new(|_| None);
+    homeless.home = None;
     let (code, _, err) = run_in(&homeless, &["audit"]);
     assert_eq!(code, 1);
-    assert!(err.contains("HOME"), "{err}");
+    assert!(err.contains("password database"), "{err}");
 }
 
 // doctor
@@ -936,7 +955,7 @@ fn doctor_warns_under_an_ai_harness_but_a_healthy_machine_still_passes() {
     assert_eq!(code, 0, "{out}");
     assert!(out.starts_with("[warning] caller: this runs under the AI harness claude"), "{out}");
     // Any other caller is not remarked on.
-    let other = dybw_agent::caller::Caller::Unknown { why: s("x") };
+    let other = dybw_agent::caller::Caller::Unknown { why: s("x"), peer: None };
     assert!(!doctor_with(&env_in(base.path(), None, None), Some(other), true).1.contains("warning"));
 }
 
@@ -983,11 +1002,16 @@ fn doctor_flags_a_socket_directory_others_can_reach() {
 fn doctor_flags_a_missing_home_a_bad_config_a_bad_profile_and_a_bad_pinentry() {
     let base = base();
     let mut homeless = env_in(base.path(), None, None);
-    homeless.var = Box::new(|_| None);
-    homeless.uid = euid();
+    homeless.home = None;
     let (code, out) = doctor_with(&homeless, None, true);
     assert_eq!(code, 1);
-    assert!(out.contains("[problem] home: HOME is not set"), "{out}");
+    assert!(out.contains("[problem] home: this user has no home directory in the password database"), "{out}");
+    // A HOME that is not the user's home: the agent would refuse to start.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let mut moved = env_in(base.path(), None, None);
+    moved.home = Some(elsewhere.path().to_owned());
+    let (code, out) = doctor_with(&moved, None, true);
+    assert!(code == 1 && out.contains("[problem] home: HOME ") && out.contains("the agent will not start"), "{out}");
 
     let env = env_in(base.path(), None, None);
     let file = base.path().join(".config/dybw/config.toml");

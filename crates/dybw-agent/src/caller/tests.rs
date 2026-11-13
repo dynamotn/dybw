@@ -1,4 +1,4 @@
-#![expect(clippy::unwrap_used, reason = "tests")]
+#![expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 
 use super::*;
 use dybw_peer::{Fake, Token};
@@ -11,6 +11,12 @@ struct Tree {
 }
 
 const PEER: u32 = 100;
+const DYBW: &str = "/usr/local/bin/dybw";
+
+/// Where the invoker `pid` (start time `pid`, as [`Tree::add`] makes it) was found.
+fn at(pid: u32, detached: bool) -> At {
+    At { pid, start: u64::from(pid), image: Vec::new(), detached, peer: None }
+}
 
 fn os(s: &str) -> OsString {
     s.into()
@@ -49,11 +55,12 @@ impl Tree {
 
     /// The `dybw` peer (pid 100) under `ppid`.
     fn dybw(&self, ppid: u32) {
-        self.add(PEER, Path::new("/usr/local/bin/dybw"), ppid, Some(&["dybw", "get"]), Some(&[]));
+        self.add(PEER, Path::new(DYBW), ppid, Some(&["dybw", "get"]), Some(&[]));
     }
 
+    /// The companion is the `dybw` of [`Tree::dybw`].
     fn resolver(&self) -> Resolver {
-        Resolver::new(self.fake.clone(), Harnesses::default())
+        Resolver::new(self.fake.clone(), Harnesses::default()).with_companion(Some(DYBW.into()))
     }
 
     fn resolve(&self) -> Resolved {
@@ -73,7 +80,7 @@ fn sha(content: &str) -> String {
 
 fn unknown(c: &Caller) -> &str {
     match c {
-        Caller::Unknown { why } => why,
+        Caller::Unknown { why, .. } => why,
         other => panic!("expected unknown, got {other:?}"),
     }
 }
@@ -85,7 +92,8 @@ fn the_invoker_is_the_parent_of_dybw_hashed_by_its_executable() {
     t.dybw(50);
     t.add(50, &app, 10, Some(&["app"]), Some(&[]));
     t.add(10, Path::new("/usr/bin/login"), 1, Some(&["login"]), Some(&[]));
-    assert_eq!(t.caller(), Caller::Invoker { exe: app, script: None, hash: sha("binary"), relative: false });
+    let at = at(50, false);
+    assert_eq!(t.caller(), Caller::Invoker { exe: app, script: None, hash: sha("binary"), relative: false, at });
 }
 
 #[test]
@@ -96,7 +104,8 @@ fn an_interpreter_is_looked_through_to_its_script() {
     t.dybw(50);
     t.add(50, &bash, 1, Some(&["bash", "-e", &script.to_string_lossy()]), Some(&[]));
     // `-e` is errexit for a shell, not inline code.
-    assert_eq!(t.caller(), Caller::Invoker { exe: bash, script: Some(script), hash: sha("echo hi"), relative: false });
+    let (script, at) = (Some(script), at(50, true));
+    assert_eq!(t.caller(), Caller::Invoker { exe: bash, script, hash: sha("echo hi"), relative: false, at });
 }
 
 #[test]
@@ -119,7 +128,8 @@ fn an_interactive_shell_is_the_shell_itself() {
     let fish = t.file("fish", "elf");
     t.dybw(50);
     t.add(50, &fish, 1, Some(&["-fish"]), Some(&[]));
-    assert_eq!(t.caller(), Caller::Invoker { exe: fish, script: None, hash: sha("elf"), relative: false });
+    let at = at(50, true);
+    assert_eq!(t.caller(), Caller::Invoker { exe: fish, script: None, hash: sha("elf"), relative: false, at });
 }
 
 #[test]
@@ -500,9 +510,103 @@ fn reading_is_capped() {
     let t = Tree::new();
     let f = t.file("big", "12345");
     let open = || std::fs::File::open(&f).unwrap();
-    assert_eq!(read_capped(open(), 5).unwrap(), b"12345");
-    assert!(read_capped(open(), 4).is_err());
-    assert!(hash_file(Path::new("/no/such"), None).is_err());
+    assert_eq!(read_capped(&open(), 5).unwrap(), b"12345");
+    assert!(read_capped(&open(), 4).is_err());
+    assert!(hash_file(open(), None, None, &|| {}).is_err(), "no start time");
+}
+
+#[test]
+fn a_file_that_changes_while_it_is_hashed_is_refused() {
+    let t = Tree::new();
+    let f = t.file("tool", "v1");
+    let later = Some(SystemTime::now() + Duration::from_secs(3600));
+    let open = || std::fs::File::open(&f).unwrap();
+    assert_eq!(hash_file(open(), later, None, &|| {}).unwrap(), sha("v1"));
+    let rewrite = || std::fs::write(&f, "v2 longer").unwrap();
+    assert!(hash_file(open(), later, None, &rewrite).unwrap_err().contains("changed while it was read"));
+    // Too large to hash: unreadable.
+    std::fs::OpenOptions::new().write(true).open(&f).unwrap().set_len(MAX_HASH_BYTES + 1).unwrap();
+    assert!(hash_file(open(), later, None, &|| {}).unwrap_err().contains("cannot be read"));
+}
+
+/// A thin 64-bit Mach-O image: a header with two load commands, a dummy one and `LC_UUID`.
+fn macho(uuid: [u8; 16]) -> Vec<u8> {
+    let mut b = vec![0xcf, 0xfa, 0xed, 0xfe];
+    b.extend([0u8; 12]);
+    b.extend(2u32.to_le_bytes()); // ncmds
+    b.extend([0u8; 12]);
+    b.extend(0x19u32.to_le_bytes());
+    b.extend(16u32.to_le_bytes());
+    b.extend([0u8; 8]);
+    b.extend(LC_UUID.to_le_bytes());
+    b.extend(24u32.to_le_bytes());
+    b.extend(uuid);
+    b
+}
+
+/// A universal file of `slices`, 32- or 64-bit headers.
+fn fat(slices: &[Vec<u8>], wide: bool) -> Vec<u8> {
+    let mut b = (if wide { 0xcafe_babf_u32 } else { 0xcafe_babe }).to_be_bytes().to_vec();
+    b.extend((slices.len() as u32).to_be_bytes());
+    let mut offset = 8 + slices.len() * if wide { 32 } else { 20 };
+    for s in slices {
+        b.extend([0u8; 8]);
+        if wide {
+            b.extend((offset as u64).to_be_bytes());
+            b.extend((s.len() as u64).to_be_bytes());
+            b.extend([0u8; 8]);
+        } else {
+            b.extend((offset as u32).to_be_bytes());
+            b.extend((s.len() as u32).to_be_bytes());
+            b.extend([0u8; 4]);
+        }
+        offset += s.len();
+    }
+    slices.iter().for_each(|s| b.extend(s));
+    b
+}
+
+#[test]
+fn mach_o_uuids_are_found_in_thin_and_universal_files() {
+    let (a, b) = ([1; 16], [2; 16]);
+    assert_eq!(macho_uuids(&macho(a)), [a]);
+    assert_eq!(macho_uuids(&fat(&[macho(a), macho(b)], false)), [a, b]);
+    assert_eq!(macho_uuids(&fat(&[macho(a), macho(b)], true)), [a, b]);
+    let mut thirty_two = macho(a);
+    thirty_two[0] = 0xce;
+    thirty_two.drain(28..32);
+    assert_eq!(macho_uuids(&thirty_two), [a]);
+    // Not Mach-O, cut short, a load command of a bad size, or no LC_UUID at all: none.
+    assert!(macho_uuids(b"#!/bin/sh\n").is_empty());
+    assert!(macho_uuids(&macho(a)[..40]).is_empty());
+    let mut bad = macho(a);
+    bad[36] = 0;
+    assert!(macho_uuids(&bad).is_empty());
+    let mut none = macho(a);
+    none[16] = 1;
+    assert!(macho_uuids(&none).is_empty());
+    assert!(macho_uuids(&fat(&[b"junk".to_vec()], false)).is_empty());
+}
+
+#[test]
+fn an_executable_that_is_not_the_running_image_is_refused() {
+    let t = Tree::new();
+    let later = Some(SystemTime::now() + Duration::from_secs(3600));
+    let f = t.dir.path().join("prog");
+    std::fs::write(&f, macho([1; 16])).unwrap();
+    let open = || std::fs::File::open(&f).unwrap();
+    assert!(hash_file(open(), later, Some([1; 16]), &|| {}).is_ok());
+    let e = hash_file(open(), later, Some([2; 16]), &|| {}).unwrap_err();
+    assert!(e.contains("not the program it runs"), "{e}");
+    // A file with no UUID keeps the path hash.
+    std::fs::write(&f, "#!/bin/sh\n").unwrap();
+    assert!(hash_file(open(), later, Some([2; 16]), &|| {}).is_ok());
+    // The live check: this test binary on disk carries the UUID the kernel reports for it (macOS; it is too large
+    // to hash, so it is parsed directly).
+    let me = dybw_peer::Process::of(std::process::id()).unwrap();
+    if let Some(uuid) = me.exe_uuid {
+        assert!(macho_uuids(&std::fs::read(&me.exe).unwrap()).contains(&uuid));
+    }
 }
 
 #[test]
@@ -563,7 +667,7 @@ fn this_process_resolves_to_a_plausible_invoker() {
             assert_eq!(hash.len(), 64);
         }
         Caller::Ai { harness, .. } => assert!(!harness.is_empty()),
-        Caller::Unknown { why } => assert!(!why.is_empty()),
+        Caller::Unknown { why, .. } => assert!(!why.is_empty()),
     }
     assert!(resolver.recheck(&resolved));
 }
@@ -576,15 +680,17 @@ fn only_a_named_absolute_invoker_is_rememberable() {
     let script = t.file("s.sh", "x");
     t.dybw(50);
     let remember = |t: &Tree| t.caller().rememberable();
-    t.add(50, &app, 1, Some(&["app"]), Some(&[]));
-    assert!(remember(&t));
-    t.add(50, &sh, 1, Some(&["sh", &script.to_string_lossy()]), Some(&[]));
-    assert!(remember(&t));
+    let scope = |t: &Tree| t.caller().scope();
+    t.add(10, Path::new("/usr/bin/login"), 1, Some(&["login"]), Some(&[]));
+    t.add(50, &app, 10, Some(&["app"]), Some(&[]));
+    assert!(remember(&t) && scope(&t) == Scope::Device);
+    t.add(50, &sh, 10, Some(&["sh", &script.to_string_lossy()]), Some(&[]));
+    assert!(remember(&t) && scope(&t) == Scope::Process, "a script: for its process only");
     // A bare interpreter: every script it runs would share the grant.
-    t.add(50, &sh, 1, Some(&["sh"]), Some(&[]));
+    t.add(50, &sh, 10, Some(&["sh"]), Some(&[]));
     assert!(!remember(&t));
     // A relative script: the cwd may change under it.
-    t.add(50, &sh, 1, Some(&["sh", "s.sh"]), Some(&[]));
+    t.add(50, &sh, 10, Some(&["sh", "s.sh"]), Some(&[]));
     t.fake.add(50, Process { cwd: Some(t.dir.path().to_path_buf()), ..t.fake.process(50).unwrap() });
     assert!(matches!(t.caller(), Caller::Invoker { relative: true, .. }));
     assert!(!remember(&t));
@@ -637,4 +743,104 @@ fn versioned_and_newer_interpreters_follow_the_strict_script_rule() {
         t.add(50, &exe, 1, Some(&[name]), Some(&[]));
         assert!(!t.caller().rememberable(), "{name}");
     }
+}
+
+#[test]
+fn a_deep_ancestry_is_walked_to_the_top_and_a_loop_is_unknown() {
+    let t = Tree::new();
+    let app = t.file("app", "binary");
+    t.dybw(50);
+    t.add(50, &app, 1000, Some(&["app"]), Some(&[]));
+    for pid in 1000..1100 {
+        t.add(pid, Path::new("/bin/launcher-of-sorts"), if pid == 1099 { 1 } else { pid + 1 }, None, None);
+    }
+    assert!(matches!(t.caller(), Caller::Invoker { exe, .. } if exe == app));
+    // A parent loop never reaches the top: unknown, and the walk ends.
+    t.add(1099, Path::new("/bin/launcher-of-sorts"), 1000, None, None);
+    unknown(&t.caller());
+}
+
+#[test]
+fn launchers_multiplexers_and_terminals_are_never_remembered() {
+    let t = Tree::new();
+    t.dybw(50);
+    for name in [
+        "xargs",
+        "timeout",
+        "env",
+        "nohup",
+        "setsid",
+        "make",
+        "git",
+        "parallel",
+        "watch",
+        "zellij",
+        "tmux",
+        "screen",
+        "kitty",
+        "alacritty",
+        "wezterm",
+        "wezterm-gui",
+        "iTerm2",
+        "Terminal",
+        "ghostty",
+        "launchctl",
+        "open",
+        "osascript",
+        "ssh",
+        "sshd",
+        "cron",
+        "at",
+    ] {
+        let exe = t.file(name, "elf");
+        t.add(50, &exe, 10, Some(&[name]), Some(&[]));
+        t.add(10, Path::new("/usr/bin/login"), 1, Some(&["login"]), Some(&[]));
+        assert!(!t.caller().rememberable(), "{name}");
+    }
+}
+
+#[test]
+fn an_invoker_whose_parent_exited_or_is_a_subreaper_is_detached_and_never_offered_always() {
+    let t = Tree::new();
+    let app = t.file("app", "binary");
+    t.dybw(50);
+    t.add(50, &app, 10, Some(&["app"]), Some(&[]));
+    t.add(10, Path::new("/usr/bin/login"), 1, Some(&["login"]), Some(&[]));
+    assert!(t.caller().rememberable());
+    for parent in ["launchd", "systemd", "tini", "dumb-init", "init", "containerd-shim-runc-v2"] {
+        t.add(10, &Path::new("/sbin").join(parent), 1, Some(&[parent]), Some(&[]));
+        assert!(!t.caller().rememberable(), "{parent}");
+    }
+    // Reparented to pid 1 itself.
+    t.add(50, &app, 1, Some(&["app"]), Some(&[]));
+    assert!(!t.caller().rememberable());
+}
+
+#[test]
+fn a_dybw_other_than_the_companion_is_named_for_the_audit() {
+    let t = Tree::new();
+    let app = t.file("app", "binary");
+    t.dybw(50);
+    t.add(50, &app, 10, Some(&["app"]), Some(&[]));
+    t.add(10, Path::new("/usr/bin/login"), 1, Some(&["login"]), Some(&[]));
+    assert!(matches!(t.caller(), Caller::Invoker { at, .. } if at.peer.is_none()));
+    t.add(PEER, Path::new("/tmp/elsewhere/rbw"), 50, Some(&["rbw", "get"]), Some(&[]));
+    assert!(matches!(t.caller(), Caller::Invoker { at, .. } if at.peer == Some("/tmp/elsewhere/rbw".into())));
+    // An unknown caller names its peer too.
+    t.add(PEER, Path::new("/tmp/elsewhere/rbw"), 1, Some(&["rbw", "get"]), Some(&[]));
+    assert!(matches!(t.caller(), Caller::Unknown { peer: Some(p), .. } if p == Path::new("/tmp/elsewhere/rbw")));
+}
+
+#[test]
+fn the_grant_scope_follows_the_invoker() {
+    let t = Tree::new();
+    t.dybw(50);
+    t.add(10, Path::new("/usr/bin/login"), 1, Some(&["login"]), Some(&[]));
+    let script = t.file("s.sh", "x");
+    let bash = t.file("bash", "elf");
+    t.add(50, &bash, 10, Some(&["bash", &script.to_string_lossy()]), Some(&[]));
+    let c = t.caller();
+    assert_eq!((c.scope(), c.rememberable(), c.detached()), (Scope::Process, true, false));
+    assert!(matches!(c, Caller::Invoker { at, .. } if at == super::tests::at(50, false)));
+    assert_eq!(Caller::Ai { harness: "x".into(), via: Via::Marker }.scope(), Scope::Never);
 }

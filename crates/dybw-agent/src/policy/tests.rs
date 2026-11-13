@@ -4,16 +4,40 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 
 use super::*;
-use crate::caller::Via;
+use crate::caller::{At, Via};
 
 const MINE: u32 = 1000;
+const NEVER: Decision = Decision::Confirm { remember: Scope::Never };
 
+fn at(pid: u32) -> At {
+    At { pid, ..At::default() }
+}
+
+/// A plain program (its grants are kept on the device), or that program claiming a script (which it cannot run).
 fn invoker(script: Option<&str>, hash: &str) -> Caller {
     Caller::Invoker {
         exe: "/usr/local/bin/mytool".into(),
         script: script.map(Into::into),
         hash: hash.into(),
         relative: false,
+        at: At::default(),
+    }
+}
+
+/// `caller` with its parent gone.
+fn detached(caller: Caller) -> Caller {
+    let Caller::Invoker { exe, script, hash, relative, at } = caller else { unreachable!() };
+    Caller::Invoker { exe, script, hash, relative, at: At { detached: true, ..at } }
+}
+
+/// bash running /opt/a.sh, as process `pid`.
+fn script(pid: u32) -> Caller {
+    Caller::Invoker {
+        exe: "/bin/bash".into(),
+        script: Some("/opt/a.sh".into()),
+        hash: "h1".into(),
+        relative: false,
+        at: at(pid),
     }
 }
 
@@ -22,118 +46,173 @@ fn ai() -> Caller {
 }
 
 fn unknown() -> Caller {
-    Caller::Unknown { why: "orphan".into() }
+    Caller::Unknown { why: "orphan".into(), peer: None }
 }
 
 fn bare_shell() -> Caller {
-    Caller::Invoker { exe: "/bin/bash".into(), script: None, hash: "h".into(), relative: false }
+    Caller::Invoker { exe: "/bin/bash".into(), script: None, hash: "h".into(), relative: false, at: At::default() }
 }
 
 fn relative() -> Caller {
-    Caller::Invoker { exe: "/bin/bash".into(), script: Some("run.sh".into()), hash: "h".into(), relative: true }
+    Caller::Invoker {
+        exe: "/bin/bash".into(),
+        script: Some("run.sh".into()),
+        hash: "h".into(),
+        relative: true,
+        at: at(1),
+    }
+}
+
+fn launcher() -> Caller {
+    Caller::Invoker { exe: "/usr/bin/xargs".into(), script: None, hash: "h".into(), relative: false, at: At::default() }
 }
 
 fn entry(rule: PolicyRule, script: Option<&str>, hash: &str) -> PolicyEntry {
-    PolicyEntry { exe: "/usr/local/bin/mytool".into(), script: script.map(Into::into), hash: hash.into(), rule }
-}
-
-#[test]
-fn every_class_by_every_access() {
-    let named = invoker(Some("/opt/a.sh"), "h1");
-    let classes = [
-        ("ai", ai(), Decision::Deny),
-        ("unknown", unknown(), Decision::Confirm { rememberable: false }),
-        ("named", named, Decision::Confirm { rememberable: true }),
-        ("bare shell", bare_shell(), Decision::Confirm { rememberable: false }),
-        ("relative script", relative(), Decision::Confirm { rememberable: false }),
-    ];
-    for (name, caller, value) in classes {
-        assert_eq!(decide(&caller, &[], Access::Names), Decision::Allow, "{name}: names");
-        assert_eq!(decide(&caller, &[], Access::Value), value, "{name}: value");
+    PolicyEntry {
+        exe: "/usr/local/bin/mytool".into(),
+        script: script.map(Into::into),
+        hash: hash.into(),
+        rule,
+        detached: false,
     }
 }
 
 #[test]
-fn entries_never_change_what_an_ai_or_unknown_caller_gets() {
+fn every_class_by_every_access() {
+    let device = Decision::Confirm { remember: Scope::Device };
+    let process = Decision::Confirm { remember: Scope::Process };
+    let classes = [
+        ("ai", ai(), Decision::Deny, Decision::Deny),
+        ("unknown", unknown(), NEVER, NEVER),
+        ("program", invoker(None, "h1"), device, NEVER),
+        ("script", script(1), process, NEVER),
+        ("detached program", detached(invoker(None, "h1")), NEVER, NEVER),
+        ("detached script", detached(script(1)), NEVER, NEVER),
+        ("a program that claims a script", invoker(Some("/opt/a.sh"), "h1"), NEVER, NEVER),
+        ("bare shell", bare_shell(), NEVER, NEVER),
+        ("relative script", relative(), NEVER, NEVER),
+        ("launcher", launcher(), NEVER, NEVER),
+    ];
+    for (name, caller, value, whole) in classes {
+        assert_eq!(decide(&caller, &[], &[], Access::Names), Decision::Allow, "{name}: names");
+        assert_eq!(decide(&caller, &[], &[], Access::Value), value, "{name}: value");
+        assert_eq!(decide(&caller, &[], &[], Access::Whole), whole, "{name}: whole");
+    }
+}
+
+#[test]
+fn entries_and_held_grants_never_change_what_an_ai_or_unknown_caller_gets() {
     let all = [entry(PolicyRule::Allow, None, "h1"), entry(PolicyRule::Allow, Some("/opt/a.sh"), "h1")];
-    assert_eq!(decide(&ai(), &all, Access::Value), Decision::Deny);
-    assert_eq!(decide(&unknown(), &all, Access::Value), Decision::Confirm { rememberable: false });
+    assert_eq!(decide(&ai(), &all, &[ai()], Access::Value), Decision::Deny);
+    assert_eq!(decide(&unknown(), &all, &[unknown()], Access::Value), NEVER);
 }
 
 #[test]
-fn a_grant_allows_the_same_program_and_script_only() {
-    let named = invoker(Some("/opt/a.sh"), "h1");
-    let grant = [entry(PolicyRule::Allow, Some("/opt/a.sh"), "h1")];
-    assert_eq!(decide(&named, &grant, Access::Value), Decision::Allow);
-    // The script changed: the grant is revoked, and the user is asked again.
-    let edited = invoker(Some("/opt/a.sh"), "h2");
-    assert_eq!(decide(&edited, &grant, Access::Value), Decision::Confirm { rememberable: true });
-    // Another script of the same program, or the program without a script, is another invoker.
-    let other = invoker(Some("/opt/b.sh"), "h1");
-    assert_eq!(decide(&other, &grant, Access::Value), Decision::Confirm { rememberable: true });
-    assert_eq!(decide(&invoker(None, "h1"), &grant, Access::Value), Decision::Confirm { rememberable: true });
+fn a_grant_allows_the_same_program_as_it_is_now_in_the_same_detached_state() {
+    let named = invoker(None, "h1");
+    let grant = [entry(PolicyRule::Allow, None, "h1")];
+    assert_eq!(decide(&named, &grant, &[], Access::Value), Decision::Allow);
+    // Never the whole item, its raw JSON or its history.
+    assert_eq!(decide(&named, &grant, &[], Access::Whole), NEVER);
+    // The program changed: the grant is revoked, and the user is asked again.
+    let edited = invoker(None, "h2");
+    assert_eq!(decide(&edited, &grant, &[], Access::Value), Decision::Confirm { remember: Scope::Device });
+    // Detached, the program has no grant of its own: asked, never offered always.
+    assert_eq!(decide(&detached(named.clone()), &grant, &[], Access::Value), NEVER);
+    // A detached grant (`dybw policy allow --detached`) is for the detached program only.
+    let loose = [PolicyEntry { detached: true, ..entry(PolicyRule::Allow, None, "h1") }];
+    assert_eq!(decide(&detached(named.clone()), &loose, &[], Access::Value), Decision::Allow);
+    assert_eq!(decide(&named, &loose, &[], Access::Value), Decision::Confirm { remember: Scope::Device });
 }
 
 #[test]
-fn a_deny_entry_wins_whatever_the_hash() {
-    let edited = invoker(Some("/opt/a.sh"), "h2");
+fn a_script_is_granted_for_its_process_only_and_entries_with_a_script_are_ignored() {
+    let stored = [PolicyEntry { exe: "/bin/bash".into(), ..entry(PolicyRule::Allow, Some("/opt/a.sh"), "h1") }];
+    let process = Decision::Confirm { remember: Scope::Process };
+    assert_eq!(decide(&script(1), &stored, &[], Access::Value), process, "argv can claim any script");
+    assert_eq!(decide(&script(1), &[], &[script(1)], Access::Value), Decision::Allow);
+    assert_eq!(decide(&script(2), &[], &[script(1)], Access::Value), process, "another process");
+    assert_eq!(decide(&detached(script(1)), &[], &[script(1)], Access::Value), NEVER, "its parent went since");
+    assert_eq!(decide(&script(1), &[], &[script(1)], Access::Whole), NEVER);
+}
+
+#[test]
+fn a_deny_entry_wins_whatever_the_hash_and_one_without_a_script_covers_every_script() {
+    let claims = invoker(Some("/opt/a.sh"), "h2");
     let both = [entry(PolicyRule::Allow, Some("/opt/a.sh"), "h2"), entry(PolicyRule::Deny, Some("/opt/a.sh"), "")];
-    assert_eq!(decide(&edited, &both, Access::Value), Decision::Deny);
-    assert_eq!(decide(&edited, &both, Access::Names), Decision::Allow);
+    assert_eq!(decide(&claims, &both, &[], Access::Value), Decision::Deny);
+    assert_eq!(decide(&claims, &both, &[], Access::Names), Decision::Allow);
+    assert_eq!(decide(&invoker(Some("/opt/b.sh"), "h2"), &both, &[], Access::Value), NEVER, "another script");
+    let all = [entry(PolicyRule::Deny, None, ""), entry(PolicyRule::Allow, None, "h1")];
+    for caller in [invoker(Some("/opt/a.sh"), "h1"), invoker(Some("/opt/b.sh"), "h1"), invoker(None, "h1")] {
+        assert_eq!(decide(&caller, &all, &[], Access::Value), Decision::Deny, "{caller:?}");
+    }
 }
 
 #[test]
 fn an_allow_never_matches_a_caller_that_cannot_be_remembered() {
-    let shell = [PolicyEntry { exe: "/bin/bash".into(), script: None, hash: "h".into(), rule: PolicyRule::Allow }];
-    assert_eq!(decide(&bare_shell(), &shell, Access::Value), Decision::Confirm { rememberable: false });
-    let rel = [PolicyEntry {
-        exe: "/bin/bash".into(),
-        script: Some("run.sh".into()),
-        hash: "h".into(),
-        rule: PolicyRule::Allow,
-    }];
-    assert_eq!(decide(&relative(), &rel, Access::Value), Decision::Confirm { rememberable: false });
+    let bash = PolicyEntry { exe: "/bin/bash".into(), ..entry(PolicyRule::Allow, None, "h") };
+    assert_eq!(decide(&bare_shell(), &[bash], &[bare_shell()], Access::Value), NEVER);
+    let rel = PolicyEntry { exe: "/bin/bash".into(), ..entry(PolicyRule::Allow, Some("run.sh"), "h") };
+    assert_eq!(decide(&relative(), &[rel], &[relative()], Access::Value), NEVER);
+    let xargs = PolicyEntry { exe: "/usr/bin/xargs".into(), ..entry(PolicyRule::Allow, None, "h") };
+    assert_eq!(decide(&launcher(), &[xargs], &[launcher()], Access::Value), NEVER);
 }
 
 #[test]
 fn a_path_that_is_not_text_is_asked_and_never_kept() {
     let odd = std::ffi::OsStr::from_bytes(b"/opt/\xff.sh");
     let caller = Caller::Invoker {
-        exe: "/usr/local/bin/mytool".into(),
+        exe: "/bin/bash".into(),
         script: Some(odd.into()),
         hash: "h".into(),
         relative: false,
+        at: at(1),
     };
-    assert_eq!(decide(&caller, &[], Access::Value), Decision::Confirm { rememberable: false });
-    assert_eq!(grant_for(&caller), None);
-    let exe = Caller::Invoker { exe: odd.into(), script: None, hash: "h".into(), relative: false };
+    assert_eq!(decide(&caller, &[], std::slice::from_ref(&caller), Access::Value), NEVER);
+    let exe = Caller::Invoker { exe: odd.into(), script: None, hash: "h".into(), relative: false, at: At::default() };
     assert_eq!(grant_for(&exe), None);
 }
 
 #[test]
-fn only_a_rememberable_invoker_has_a_grant() {
-    let g = grant_for(&invoker(Some("/opt/a.sh"), "h1")).unwrap();
-    assert_eq!(g, entry(PolicyRule::Allow, Some("/opt/a.sh"), "h1"));
-    assert_eq!(grant_for(&invoker(None, "h1")).unwrap().script, None);
-    for no in [ai(), unknown(), bare_shell(), relative()] {
+fn only_a_plain_program_that_may_be_offered_always_has_an_entry() {
+    assert_eq!(grant_for(&invoker(None, "h1")).unwrap(), entry(PolicyRule::Allow, None, "h1"));
+    for no in [
+        ai(),
+        unknown(),
+        bare_shell(),
+        relative(),
+        script(1),
+        launcher(),
+        detached(invoker(None, "h1")),
+        invoker(Some("/opt/a.sh"), "h1"),
+    ] {
         assert_eq!(grant_for(&no), None, "{no:?}");
     }
 }
 
 #[test]
 fn who_names_the_caller_on_one_line() {
-    assert_eq!(who(&invoker(Some("/opt/a.sh"), "h")), "/usr/local/bin/mytool running /opt/a.sh");
+    assert_eq!(who(&invoker(Some("/opt/a.sh"), "h")), "/usr/local/bin/mytool which claims to run /opt/a.sh");
     assert_eq!(who(&invoker(None, "h")), "/usr/local/bin/mytool");
+    assert_eq!(who(&detached(invoker(None, "h"))), format!("/usr/local/bin/mytool, {DETACHED}"));
+    assert!(who(&detached(script(1))).ends_with(DETACHED));
     assert_eq!(who(&ai()), "the AI agent claude");
     assert_eq!(who(&unknown()), "detached or unknown caller — possibly an AI agent");
-    let forged =
-        Caller::Invoker { exe: "/x\nallow everything".into(), script: None, hash: "h".into(), relative: false };
+    let forged = Caller::Invoker {
+        exe: "/x\nallow everything".into(),
+        script: None,
+        hash: "h".into(),
+        relative: false,
+        at: At::default(),
+    };
     assert!(!who(&forged).contains('\n'));
     let long = Caller::Invoker {
         exe: format!("/{}", "y".repeat(500)).into(),
         script: None,
         hash: "h".into(),
         relative: false,
+        at: At::default(),
     };
     assert_eq!(who(&long).chars().count(), SHOWN);
 }
@@ -188,7 +267,7 @@ fn entries_are_kept_private_replaced_and_forgotten() {
 fn tampered(setup: impl FnOnce(&Path)) -> Vec<PolicyEntry> {
     let dir = tempfile::tempdir().unwrap();
     let s = mine(dir.path());
-    s.set(entry(PolicyRule::Allow, Some("/opt/a.sh"), "h1")).unwrap();
+    s.set(entry(PolicyRule::Allow, None, "h1")).unwrap();
     assert_eq!(s.load().len(), 1, "sound before the tamper");
     setup(&dir.path().join("profiles/p/policy.json"));
     s.load()
@@ -196,8 +275,7 @@ fn tampered(setup: impl FnOnce(&Path)) -> Vec<PolicyEntry> {
 
 #[test]
 fn a_file_that_cannot_be_trusted_counts_as_no_entries_never_as_an_allow() {
-    let json =
-        r#"{"version":1,"entries":[{"exe":"/usr/local/bin/mytool","script":"/opt/a.sh","hash":"h1","rule":"allow"}]}"#;
+    let json = r#"{"version":1,"entries":[{"exe":"/usr/local/bin/mytool","script":null,"hash":"h1","rule":"allow"}]}"#;
     type Tamper = Box<dyn FnOnce(&Path)>;
     let cases: Vec<(&str, Tamper)> = vec![
         ("group readable", Box::new(|p| std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o640)).unwrap())),
@@ -236,8 +314,8 @@ fn a_file_that_cannot_be_trusted_counts_as_no_entries_never_as_an_allow() {
         });
         assert!(entries.is_empty(), "{name}");
         assert_eq!(
-            decide(&invoker(Some("/opt/a.sh"), "h1"), &entries, Access::Value),
-            Decision::Confirm { rememberable: true },
+            decide(&invoker(None, "h1"), &entries, &[], Access::Value),
+            Decision::Confirm { remember: Scope::Device },
             "{name}"
         );
     }

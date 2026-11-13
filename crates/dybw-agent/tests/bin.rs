@@ -10,6 +10,7 @@ use dybw_proto::{Op, Reply, Request, Response, decode_response, encode};
 fn agent(home: &std::path::Path, runtime: &std::path::Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_dybw-agent"))
         .env("HOME", home)
+        .env(dybw_agent::trust::TEST_PASSWD_HOME, home)
         .env("XDG_RUNTIME_DIR", runtime)
         .env_remove("XDG_CONFIG_HOME")
         .stderr(Stdio::null())
@@ -39,6 +40,23 @@ fn ask(runtime: &std::path::Path, op: Op) -> Reply {
     reply
 }
 
+/// Run under an AI harness (an agent runs these tests), this process is an AI-class caller: its `StopAgent` is
+/// refused, and the agent is stopped with SIGTERM instead.
+fn stop(runtime: &std::path::Path, child: &mut Child) {
+    let ai = matches!(
+        dybw_agent::caller::this_process(std::path::Path::new("/nonexistent/harnesses.toml")),
+        Some(dybw_agent::caller::Caller::Ai { .. })
+    );
+    let reply = ask(runtime, Op::StopAgent);
+    if ai {
+        assert!(matches!(reply, Reply::Error { error: dybw_proto::AgentError::Denied }), "{reply:?}");
+        assert!(Command::new("kill").args(["-TERM", &child.id().to_string()]).status().expect("kill").success());
+    } else {
+        assert!(matches!(reply, Reply::Done), "{reply:?}");
+    }
+    assert!(child.wait().expect("wait").success());
+}
+
 fn dirs() -> (tempfile::TempDir, tempfile::TempDir) {
     let home = tempfile::tempdir().expect("home");
     let runtime = tempfile::Builder::new().prefix("d").tempdir_in("/tmp").expect("runtime");
@@ -60,14 +78,28 @@ fn an_untrusted_home_stops_it_with_a_message() {
 }
 
 #[test]
+fn a_home_variable_other_than_the_users_home_stops_it() {
+    let (home, runtime) = dirs();
+    let other = tempfile::tempdir().expect("other");
+    let out = Command::new(env!("CARGO_BIN_EXE_dybw-agent"))
+        .env("HOME", other.path())
+        .env(dybw_agent::trust::TEST_PASSWD_HOME, home.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("password database"));
+}
+
+#[test]
 fn stop_agent_ends_it_cleanly_and_a_second_agent_is_refused() {
     let (home, runtime) = dirs();
     let mut first = agent(home.path(), runtime.path());
     assert!(matches!(ask(runtime.path(), Op::Status { profile: None }), Reply::Error { .. }), "no profile defined");
     let second = agent(home.path(), runtime.path()).wait().expect("wait second");
     assert!(!second.success(), "a second agent must refuse");
-    assert!(matches!(ask(runtime.path(), Op::StopAgent), Reply::Done), "the first still answers");
-    assert!(first.wait().expect("wait").success());
+    // The first still answers.
+    stop(runtime.path(), &mut first);
 }
 
 fn ends_on(signal: &str) {
@@ -92,6 +124,7 @@ fn sigint_ends_it_cleanly() {
 fn fails_with(home: &std::path::Path, runtime: &std::path::Path, text: &str) {
     let out = Command::new(env!("CARGO_BIN_EXE_dybw-agent"))
         .env("HOME", home)
+        .env(dybw_agent::trust::TEST_PASSWD_HOME, home)
         .env("XDG_RUNTIME_DIR", runtime)
         .env_remove("XDG_CONFIG_HOME")
         .output()
@@ -123,11 +156,11 @@ fn the_config_comes_from_the_trusted_home_not_from_xdg_config_home() {
     std::fs::write(elsewhere.path().join("dybw/config.toml"), "not = [valid\n").expect("config");
     let mut child = Command::new(env!("CARGO_BIN_EXE_dybw-agent"))
         .env("HOME", home.path())
+        .env(dybw_agent::trust::TEST_PASSWD_HOME, home.path())
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env("XDG_CONFIG_HOME", elsewhere.path())
         .stderr(Stdio::null())
         .spawn()
         .expect("start dybw-agent");
-    assert!(matches!(ask(runtime.path(), Op::StopAgent), Reply::Done));
-    assert!(child.wait().expect("wait").success());
+    stop(runtime.path(), &mut child);
 }

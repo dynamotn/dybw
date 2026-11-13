@@ -28,6 +28,8 @@ pub type VarFn = Box<dyn Fn(&str) -> Option<OsString>>;
 pub struct Env {
     pub var: VarFn,
     pub uid: u32,
+    /// This user's home in the password database (never `HOME`): where the agent keeps its files.
+    pub home: Option<PathBuf>,
     /// The directory of the running `dybw`: the only place `dybw-agent` is looked for.
     pub exe_dir: Option<PathBuf>,
     pub start_wait: Duration,
@@ -37,9 +39,11 @@ pub struct Env {
 
 impl Env {
     pub fn real() -> Env {
+        let uid = rustix::process::geteuid().as_raw();
         Env {
             var: Box::new(|name| std::env::var_os(name)),
-            uid: rustix::process::geteuid().as_raw(),
+            uid,
+            home: dybw_agent::trust::passwd_home(uid),
             exe_dir: exe_dir_of(std::env::current_exe()),
             start_wait: START_WAIT,
             started_log: RefCell::new(None),

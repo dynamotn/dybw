@@ -98,7 +98,7 @@ enum Cmd {
     },
     /// Show the audit log: who asked for which item, and what was decided (never a value).
     Audit {
-        /// Only requests from AI-class callers.
+        /// Only requests from AI-class and unknown callers (an unknown one may be an AI agent too).
         #[arg(long)]
         ai: bool,
         /// How many of the latest lines to show.
@@ -122,17 +122,19 @@ enum AgentCmd {
 
 #[derive(Subcommand, Debug)]
 enum PolicyCmd {
-    /// List the remembered programs: rule, program, script, hash.
+    /// List the remembered programs: rule (`allow`, `allow-detached`, `deny`), program, script, hash.
     Show,
-    /// Always let a program read values, as long as the program (or its script) is unchanged.
+    /// Always let a program read single values, as long as it is unchanged. Not for an interpreter, a shell or a
+    /// launcher: a script's "always" is given in the question and lasts for its process only.
     Allow {
-        /// The program's absolute path (for an interpreter, the interpreter).
+        /// The program's absolute path.
         invoker: String,
-        /// The script the program runs, an absolute path.
+        /// For the program when it runs detached (its parent exited), and only then: such a run is never offered
+        /// "always" in a question.
         #[arg(long)]
-        script: Option<String>,
+        detached: bool,
     },
-    /// Never let a program read values, whatever it contains.
+    /// Never let a program read values, whatever it contains; without `--script`, whatever script it runs.
     Deny {
         invoker: String,
         #[arg(long)]
@@ -314,10 +316,9 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
         Cmd::Policy { command } => {
             let action = match command {
                 PolicyCmd::Show => PolicyAction::Show,
-                PolicyCmd::Allow { invoker, script } => PolicyAction::Allow {
-                    invoker: canonical(&invoker)?,
-                    script: script.as_deref().map(canonical).transpose()?,
-                },
+                PolicyCmd::Allow { invoker, detached } => {
+                    PolicyAction::Allow { invoker: canonical(&invoker)?, script: None, detached }
+                }
                 PolicyCmd::Deny { invoker, script } => PolicyAction::Deny {
                     invoker: canonical(&invoker)?,
                     script: script.as_deref().map(canonical).transpose()?,
@@ -328,7 +329,11 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
             match ask_started(env, Op::Policy { profile, action })? {
                 Reply::Policy { entries } if shown => {
                     for e in entries {
-                        let rule = if e.rule == PolicyRule::Allow { "allow" } else { "deny" };
+                        let rule = match (e.rule, e.detached) {
+                            (PolicyRule::Allow, false) => "allow",
+                            (PolicyRule::Allow, true) => "allow-detached",
+                            (PolicyRule::Deny, _) => "deny",
+                        };
                         let script = e.script.as_deref().unwrap_or("");
                         writeln!(out, "{rule}\t{}\t{}\t{}", escape(&e.exe), escape(script), escape(&e.hash))?;
                     }
@@ -352,14 +357,15 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
 
 /// The last `n` lines of the audit log (the file is read directly: same user, no agent needed).
 fn audit(env: &Env, ai: bool, n: usize, out: &mut dyn Write) -> Result<u8, Fail> {
-    let home = doctor::home_of(env).ok_or_else(|| Fail::Log("HOME is not set to an absolute path".into()))?;
+    let home = doctor::home_of(env)
+        .ok_or_else(|| Fail::Log("this user has no home directory in the password database".into()))?;
     let path = dybw_agent::paths::audit_path(&home);
     let log = match dybw_agent::audit::read(&path, env.uid) {
         Ok(log) => log,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(Fail::Log(format!("cannot read the audit log {}: {e}", path.display()))),
     };
-    let shown: Vec<_> = log.entries.iter().filter(|e| !ai || e.class == "ai").collect();
+    let shown: Vec<_> = log.entries.iter().filter(|e| !ai || e.class == "ai" || e.class == "unknown").collect();
     for e in shown.iter().skip(shown.len().saturating_sub(n)) {
         let who = e.harness.as_deref().or(e.exe.as_deref());
         let cells = [

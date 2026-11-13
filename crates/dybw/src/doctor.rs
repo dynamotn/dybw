@@ -33,9 +33,9 @@ impl Report<'_> {
     }
 }
 
-/// `HOME` when it is an absolute path.
+/// This user's home in the password database: where the agent keeps its files, whatever `HOME` says.
 pub fn home_of(env: &Env) -> Option<PathBuf> {
-    (env.var)("HOME").map(PathBuf::from).filter(|h| h.is_absolute())
+    env.home.clone()
 }
 
 /// Run every check. `me` is what this process would be taken for as a caller of the agent, and `pinentry` resolves a
@@ -57,9 +57,21 @@ pub fn run(
     }
     sockets(env, &mut r)?;
     let Some(home) = home_of(env) else {
-        r.problem("home", "HOME is not set to an absolute path")?;
+        r.problem("home", "this user has no home directory in the password database")?;
         return Ok(1);
     };
+    // The agent refuses to start under a HOME that is not the user's home.
+    let real = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+    if let Some(var) = (env.var)("HOME").map(PathBuf::from)
+        && (real(&var).is_none() || real(&var) != real(&home))
+    {
+        let note = format!(
+            "HOME {} is not your home {} (password database): the agent will not start",
+            var.display(),
+            home.display()
+        );
+        r.problem("home", &note)?;
+    }
     match Config::load(&config_path(&home)) {
         Err(e) => r.problem("config", &format!("{e:#}"))?,
         Ok(config) => {

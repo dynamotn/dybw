@@ -39,6 +39,12 @@ pub struct Entry {
     pub kind: Option<String>,
     pub item: Option<String>,
     pub verdict: String,
+    /// Why an unknown caller could not be named (a fixed text of the agent's).
+    #[serde(default)]
+    pub why: Option<String>,
+    /// The peer's executable, for an unknown caller and for a `dybw` that is not the agent's companion.
+    #[serde(default)]
+    pub peer: Option<String>,
 }
 
 fn verdict_name(v: Verdict) -> &'static str {
@@ -57,10 +63,12 @@ fn verdict_name(v: Verdict) -> &'static str {
 fn entry_of(event: &AuditEvent) -> Entry {
     let text = |s: &str| shown(s, 200);
     let path = |p: &Path| text(&p.to_string_lossy());
-    let (class, exe, script, harness) = match &event.caller {
-        Caller::Ai { harness, .. } => ("ai", None, None, Some(text(harness))),
-        Caller::Unknown { .. } => ("unknown", None, None, None),
-        Caller::Invoker { exe, script, .. } => ("invoker", Some(path(exe)), script.as_deref().map(path), None),
+    let (class, exe, script, harness, why, peer) = match &event.caller {
+        Caller::Ai { harness, .. } => ("ai", None, None, Some(text(harness)), None, None),
+        Caller::Unknown { why, peer } => ("unknown", None, None, None, Some(text(why)), peer.as_deref().map(path)),
+        Caller::Invoker { exe, script, at, .. } => {
+            ("invoker", Some(path(exe)), script.as_deref().map(path), None, None, at.peer.as_deref().map(path))
+        }
     };
     Entry {
         time: rfc3339(event.time),
@@ -73,6 +81,8 @@ fn entry_of(event: &AuditEvent) -> Entry {
         kind: event.kind.map(str::to_owned),
         item: event.item.as_deref().map(text),
         verdict: verdict_name(event.verdict).to_owned(),
+        why,
+        peer,
     }
 }
 

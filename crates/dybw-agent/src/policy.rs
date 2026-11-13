@@ -15,7 +15,7 @@ use dybw_native::prompter::one_line;
 use dybw_proto::{PolicyEntry, PolicyRule};
 use serde::{Deserialize, Serialize};
 
-use crate::caller::Caller;
+use crate::caller::{Caller, Scope};
 
 const FILE_VERSION: u32 = 1;
 /// Largest policy file read; a bigger one is not ours.
@@ -28,16 +28,18 @@ const SHOWN: usize = 120;
 pub enum Access {
     /// Names, ids, list, search, status: no secret.
     Names,
-    /// Any value, any field name, a password history.
+    /// One value or the field names.
     Value,
+    /// Every value at once (`--full`, `--raw`) or the password history: never covered by a grant.
+    Whole,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Allow,
-    /// Ask the user; "always" may be offered only when `rememberable`.
+    /// Ask the user; "always" is offered unless `remember` is [`Scope::Never`], and stores a grant of that scope.
     Confirm {
-        rememberable: bool,
+        remember: Scope,
     },
     Deny,
 }
@@ -90,32 +92,47 @@ impl Audit for NoAudit {
     fn record(&self, _event: AuditEvent) {}
 }
 
-/// What the policy says about `caller` asking for `access`, given the profile's entries.
+/// What the policy says about `caller` asking for `access`, given the profile's entries and the per-process grants
+/// the profile holds in memory (`held`).
 ///
-/// An AI-class caller is denied every value. An unknown caller is asked every time. A named invoker is allowed by a
-/// remembered grant that matches its executable, its script and the hash of the program as it is now; a deny entry
-/// for its executable and script wins over everything; otherwise it is asked, with "always" offered only when the
-/// caller can be named stably (see [`Caller::rememberable`]).
-pub fn decide(caller: &Caller, entries: &[PolicyEntry], access: Access) -> Decision {
+/// An AI-class caller is denied every value. An unknown caller is asked every time. For a named invoker, a deny
+/// entry for its executable (with no script: any script; with one: that script) wins over everything. Then a grant
+/// allows it: for a plain executable an `allow` entry with no script, the hash of the program as it is now and the
+/// same `detached` state; for an interpreter's script a grant held for this very process (entries with a script are
+/// ignored: argv can claim any script). A grant never covers [`Access::Whole`]. Otherwise it is asked, with
+/// "always" offered only when [`Caller::rememberable`].
+pub fn decide(caller: &Caller, entries: &[PolicyEntry], held: &[Caller], access: Access) -> Decision {
+    let never = Decision::Confirm { remember: Scope::Never };
     if access == Access::Names {
         return Decision::Allow;
     }
-    match caller {
-        Caller::Ai { .. } => Decision::Deny,
-        Caller::Unknown { .. } => Decision::Confirm { rememberable: false },
-        Caller::Invoker { .. } => {
-            // A path that is not text cannot be told apart from another once written: never matched, never kept.
-            let Some((exe, script, hash)) = text_of(caller) else { return Decision::Confirm { rememberable: false } };
-            let rememberable = caller.rememberable();
-            let mine = || entries.iter().filter(|e| e.exe == exe && e.script.as_deref() == script);
-            if mine().any(|e| e.rule == PolicyRule::Deny) {
-                Decision::Deny
-            } else if rememberable && mine().any(|e| e.rule == PolicyRule::Allow && e.hash == hash) {
-                Decision::Allow
-            } else {
-                Decision::Confirm { rememberable }
-            }
-        }
+    let Caller::Invoker { at, .. } = caller else {
+        return if matches!(caller, Caller::Ai { .. }) { Decision::Deny } else { never };
+    };
+    // A path that is not text cannot be told apart from another once written: never matched, never kept.
+    let Some((exe, script, hash)) = text_of(caller) else { return never };
+    let denied = |e: &&PolicyEntry| e.rule == PolicyRule::Deny && e.exe == exe;
+    if entries.iter().filter(denied).any(|e| e.script.is_none() || e.script.as_deref() == script) {
+        return Decision::Deny;
+    }
+    if access == Access::Whole {
+        return never;
+    }
+    let granted = match caller.scope() {
+        Scope::Device => entries.iter().any(|e| {
+            e.rule == PolicyRule::Allow
+                && e.exe == exe
+                && e.script.is_none()
+                && e.hash == hash
+                && e.detached == at.detached
+        }),
+        Scope::Process => held.contains(caller),
+        Scope::Never => false,
+    };
+    match (granted, caller.rememberable()) {
+        (true, _) => Decision::Allow,
+        (false, true) => Decision::Confirm { remember: caller.scope() },
+        (false, false) => never,
     }
 }
 
@@ -129,10 +146,11 @@ fn text_of(caller: &Caller) -> Option<(&str, Option<&str>, &str)> {
     Some((exe.to_str()?, script, hash))
 }
 
-/// The grant a user's "always" stores for `caller`; `None` when it cannot be remembered.
+/// The entry a user's "always" stores for `caller`; `None` unless its grants are kept on the device and "always"
+/// may be offered (so never a detached one).
 pub fn grant_for(caller: &Caller) -> Option<PolicyEntry> {
-    let (exe, script, hash) = text_of(caller).filter(|_| caller.rememberable())?;
-    Some(PolicyEntry { exe: exe.into(), script: script.map(Into::into), hash: hash.into(), rule: PolicyRule::Allow })
+    let (exe, _, hash) = text_of(caller).filter(|_| caller.rememberable() && caller.scope() == Scope::Device)?;
+    Some(PolicyEntry { exe: exe.into(), script: None, hash: hash.into(), rule: PolicyRule::Allow, detached: false })
 }
 
 /// `text` on one line and at most `cap` characters: a longer one keeps its head and its last 40 characters (the
@@ -147,12 +165,18 @@ pub fn shown(text: &str, cap: usize) -> String {
     one_line(&format!("{head}…{tail}"))
 }
 
-/// Who is asking, on one line and cut, for a question or a log line.
+/// What a question says of a detached caller.
+pub const DETACHED: &str = "a detached caller (parent exited) — possibly an AI agent";
+
+/// Who is asking, on one line and cut, for a question or a log line. A script is only what the process claims.
 pub fn who(caller: &Caller) -> String {
     let cut = |p: &Path| shown(&p.to_string_lossy(), SHOWN);
+    let detached = if caller.detached() { format!(", {DETACHED}") } else { String::new() };
     match caller {
-        Caller::Invoker { exe, script: Some(script), .. } => format!("{} running {}", cut(exe), cut(script)),
-        Caller::Invoker { exe, script: None, .. } => cut(exe),
+        Caller::Invoker { exe, script: Some(script), .. } => {
+            format!("{} which claims to run {}{detached}", cut(exe), cut(script))
+        }
+        Caller::Invoker { exe, script: None, .. } => format!("{}{detached}", cut(exe)),
         Caller::Ai { harness, .. } => format!("the AI agent {}", one_line(harness)),
         Caller::Unknown { .. } => "detached or unknown caller — possibly an AI agent".to_owned(),
     }
@@ -235,10 +259,15 @@ impl Store {
         }
     }
 
-    /// Set the rule of `entry`'s executable and script, replacing what was there.
+    /// Set the rule of `entry`'s executable and script, replacing what was there: a deny replaces every entry of
+    /// them, an allow the allow of the same `detached` state and any deny.
     pub fn set(&self, entry: PolicyEntry) -> std::io::Result<()> {
         let mut entries = self.load_for_write()?;
-        entries.retain(|e| !(e.exe == entry.exe && e.script == entry.script));
+        let replaced = |e: &PolicyEntry| {
+            let deny = e.rule == PolicyRule::Deny || entry.rule == PolicyRule::Deny;
+            e.exe == entry.exe && e.script == entry.script && (deny || e.detached == entry.detached)
+        };
+        entries.retain(|e| !replaced(e));
         entries.push(entry);
         self.save(entries)
     }

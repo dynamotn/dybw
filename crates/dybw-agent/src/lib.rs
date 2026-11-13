@@ -57,7 +57,9 @@ pub fn run() -> anyhow::Result<()> {
     // The lock file stays held until the process ends.
     let (listener, _lock) = socket::bind(&socket::socket_dir(&var, user.uid), user.uid)?;
     let harnesses = caller::Harnesses::load(&paths::harnesses_path(&home));
-    let resolver = Arc::new(caller::Resolver::new(Arc::new(dybw_peer::Os), harnesses));
+    // The companion CLI: the `dybw` next to this executable.
+    let companion = trust.exe.as_deref().and_then(|exe| std::fs::canonicalize(exe.with_file_name("dybw")).ok());
+    let resolver = Arc::new(caller::Resolver::new(Arc::new(dybw_peer::Os), harnesses).with_companion(companion));
     let audit = Arc::new(audit::FileAudit::new(&paths::audit_path(&home), user.uid));
     let agent = Arc::new(agent::Agent::new(config, home, user, real_spawn(trust), resolver, audit));
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;

@@ -11,7 +11,7 @@ use dybw_proto::{AgentError, Field, Op, PolicyAction, PolicyEntry, PolicyRule, R
 use serde_json::{Value, json};
 
 use crate::agent::testing::{Rig, process, rig, rig_with, unlock};
-use crate::caller::{Caller, Via, hash_of};
+use crate::caller::{At, Caller, Via, hash_of};
 use crate::host::fake::Answer;
 use crate::policy::Verdict;
 use crate::read_tests::{VAULT, err, get_op, history_op, items, text, until};
@@ -33,13 +33,20 @@ fn policy_file(dir: &tempfile::TempDir) -> PathBuf {
     dir.path().join(".local/state/dybw/profiles/work/policy.json")
 }
 
+/// bash running `script`, always the same process: a grant for it lasts for that process.
 fn tool(script: &str, hash: &str) -> Caller {
     Caller::Invoker {
-        exe: "/usr/local/bin/mytool".into(),
+        exe: "/bin/bash".into(),
         script: Some(script.into()),
         hash: hash.into(),
         relative: false,
+        at: At::default(),
     }
+}
+
+/// A plain program: a grant for it is kept in `policy.json`.
+fn program(exe: &str, hash: &str) -> Caller {
+    Caller::Invoker { exe: exe.into(), script: None, hash: hash.into(), relative: false, at: At::default() }
 }
 
 fn ai() -> Caller {
@@ -47,15 +54,16 @@ fn ai() -> Caller {
 }
 
 fn unknown() -> Caller {
-    Caller::Unknown { why: "orphan".into() }
+    Caller::Unknown { why: "orphan".into(), peer: None }
 }
 
 fn bare_shell() -> Caller {
-    Caller::Invoker { exe: "/bin/bash".into(), script: None, hash: "h".into(), relative: false }
+    Caller::Invoker { exe: "/bin/bash".into(), script: None, hash: "h".into(), relative: false, at: At::default() }
 }
 
 fn relative_script() -> Caller {
-    Caller::Invoker { exe: "/bin/bash".into(), script: Some("run.sh".into()), hash: "h".into(), relative: true }
+    let at = At::default();
+    Caller::Invoker { exe: "/bin/bash".into(), script: Some("run.sh".into()), hash: "h".into(), relative: true, at }
 }
 
 fn password(rig: &Rig, caller: Caller) -> impl Future<Output = Reply> + use<> {
@@ -132,29 +140,30 @@ async fn an_unknown_caller_is_asked_every_time_with_a_warning_and_never_remember
 }
 
 #[tokio::test]
-async fn an_always_is_remembered_for_that_program_and_script_until_the_content_changes() {
+async fn an_always_is_remembered_for_that_program_until_its_content_changes() {
     let (dir, rig) = setup(|_| {}).await;
-    let a = || tool("/opt/a.sh", "h1");
+    let a = || program("/usr/local/bin/mytool", "h1");
     rig.host.allow_always();
     assert_eq!(text(password(&rig, a()).await), "the note's text");
     assert_eq!(rig.host.world().offered, [true]);
     let stored: Value = serde_json::from_slice(&std::fs::read(policy_file(&dir)).unwrap()).unwrap();
     assert_eq!(stored["entries"][0]["hash"], "h1");
+    assert_eq!(stored["entries"][0]["detached"], false);
     assert_eq!(std::fs::metadata(policy_file(&dir)).unwrap().permissions().mode() & 0o777, 0o600);
 
-    // The same invoker is let through without a question, for any value and the history.
+    // The same program is let through without a question, for any single value.
     assert_eq!(text(password(&rig, a()).await), "the note's text");
-    let history = rig.agent.dispatch_as(history_op(NOTE), a()).await;
-    assert_eq!(history, Reply::History { entries: vec![] });
+    rig.host.allow();
+    assert!(!matches!(rig.agent.dispatch_as(get_op(NOTE, Select::ListFields), a()).await, Reply::Error { .. }));
     assert_eq!(rig.host.world().confirmed.len(), 1, "no second question");
 
-    // The script was edited: the grant is revoked, and the question comes back.
+    // The program was replaced: the grant is revoked, and the question comes back.
     rig.host.allow();
-    assert_eq!(text(password(&rig, tool("/opt/a.sh", "h2")).await), "the note's text");
+    assert_eq!(text(password(&rig, program("/usr/local/bin/mytool", "h2")).await), "the note's text");
     assert_eq!(rig.host.world().confirmed.len(), 2);
-    // Another script run by the same program is another invoker.
+    // Another program is another invoker.
     rig.host.allow();
-    password(&rig, tool("/opt/b.sh", "h1")).await;
+    password(&rig, program("/usr/local/bin/other", "h1")).await;
     assert_eq!(rig.host.world().confirmed.len(), 3);
     // What was granted for the old content still names only that content.
     assert_eq!(text(password(&rig, a()).await), "the note's text");
@@ -212,24 +221,25 @@ async fn a_grant_never_satisfies_a_reprompt() {
 #[tokio::test]
 async fn a_policy_file_that_cannot_be_trusted_never_allows() {
     let (dir, rig) = setup(|_| {}).await;
+    let mine = || program("/usr/local/bin/mytool", "h1");
     rig.host.allow_always();
-    password(&rig, tool("/opt/a.sh", "h1")).await;
+    password(&rig, mine()).await;
     let file = policy_file(&dir);
     // Anyone could have written a file others can read.
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
     rig.host.allow();
-    password(&rig, tool("/opt/a.sh", "h1")).await;
+    password(&rig, mine()).await;
     assert_eq!(rig.host.world().confirmed.len(), 2, "asked again");
     // So can a link, and text that is not a policy.
     std::fs::remove_file(&file).unwrap();
     std::os::unix::fs::symlink("/dev/null", &file).unwrap();
     rig.host.allow();
-    password(&rig, tool("/opt/a.sh", "h1")).await;
+    password(&rig, mine()).await;
     std::fs::remove_file(&file).unwrap();
     std::fs::write(&file, "allow everything").unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
     rig.host.allow();
-    password(&rig, tool("/opt/a.sh", "h1")).await;
+    password(&rig, mine()).await;
     assert_eq!(rig.host.world().confirmed.len(), 4);
 }
 
@@ -238,7 +248,7 @@ async fn a_grant_that_cannot_be_written_still_serves_this_request_once() {
     let (dir, rig) = setup(|_| {}).await;
     std::fs::create_dir(policy_file(&dir)).unwrap();
     rig.host.allow_always();
-    assert_eq!(text(password(&rig, tool("/opt/a.sh", "h1")).await), "the note's text");
+    assert_eq!(text(password(&rig, program("/usr/local/bin/mytool", "h1")).await), "the note's text");
     assert_eq!(verdicts(&rig), [Verdict::Confirmed]);
 }
 
@@ -286,20 +296,25 @@ async fn a_policy_change_is_dropped_when_the_peer_changes_while_the_user_is_aske
 #[tokio::test]
 async fn an_allow_that_could_never_match_is_refused_and_a_deny_of_it_is_not() {
     let (dir, rig) = setup(|_| {}).await;
-    let script = std::fs::canonicalize(dir.path().join("config.toml")).unwrap();
-    let bare = PolicyAction::Allow { invoker: "/bin/bash".into(), script: None };
-    assert_eq!(rig.agent.dispatch(policy_op(bare)).await, err(AgentError::Config));
+    let script = std::fs::canonicalize(dir.path().join("config.toml")).unwrap().to_string_lossy().into_owned();
+    let allow = |invoker: &str, script: Option<&str>| PolicyAction::Allow {
+        invoker: invoker.into(),
+        script: script.map(Into::into),
+        detached: false,
+    };
+    // A shell, with or without a script (its grants last for a process), and a launcher (it runs anything).
+    for refused in [allow("/bin/bash", None), allow("/bin/bash", Some(&script)), allow("/usr/bin/xargs", None)] {
+        assert_eq!(rig.agent.dispatch(policy_op(refused)).await, err(AgentError::Config));
+    }
     assert!(rig.host.world().confirmed.is_empty(), "not even asked");
-    let named =
-        PolicyAction::Allow { invoker: "/bin/bash".into(), script: Some(script.to_string_lossy().into_owned()) };
-    assert_eq!(
-        rig.agent.dispatch(policy_op(named)).await,
-        err(AgentError::Denied),
-        "a script is fine: asked, no answer"
-    );
     rig.host.allow();
     let deny = PolicyAction::Deny { invoker: "/bin/bash".into(), script: None };
     assert_eq!(rig.agent.dispatch(policy_op(deny)).await, Reply::Done);
+    rig.host.allow();
+    let deny = PolicyAction::Deny { invoker: "/bin/bash".into(), script: Some(script.clone()) };
+    assert_eq!(rig.agent.dispatch(policy_op(deny)).await, Reply::Done);
+    let asked = rig.host.world().confirmed[1].clone();
+    assert!(asked.contains(&format!("always refuse reading values for /bin/bash running {script}")), "{asked}");
 }
 
 #[tokio::test]
@@ -338,14 +353,14 @@ async fn a_request_of_the_same_invoker_that_waited_finds_the_grant_made_meanwhil
 }
 
 #[tokio::test]
-async fn policy_show_is_open_to_every_class_and_changes_need_a_named_invoker() {
+async fn policy_show_is_open_to_every_class_but_ai_and_changes_need_a_named_invoker() {
     let (dir, rig) = setup(|_| {}).await;
     let agent = &rig.agent;
-    for caller in [ai(), unknown(), tool("/opt/a.sh", "h1")] {
+    for caller in [unknown(), tool("/opt/a.sh", "h1")] {
         assert!(entries(agent.dispatch_as(policy_op(PolicyAction::Show), caller).await).is_empty());
     }
     let changes = [
-        PolicyAction::Allow { invoker: "/usr/bin/x".into(), script: None },
+        PolicyAction::Allow { invoker: "/usr/bin/x".into(), script: None, detached: false },
         PolicyAction::Deny { invoker: "/usr/bin/x".into(), script: None },
         PolicyAction::Forget { invoker: "/usr/bin/x".into() },
     ];
@@ -364,55 +379,53 @@ async fn policy_show_is_open_to_every_class_and_changes_need_a_named_invoker() {
 #[tokio::test]
 async fn allow_deny_and_forget_ask_the_user_and_change_what_the_next_request_gets() {
     let (dir, rig) = setup(|_| {}).await;
-    let script = dir.path().join("job.sh");
-    std::fs::write(&script, "echo job").unwrap();
-    let script = std::fs::canonicalize(script).unwrap();
-    let hash = hash_of(&script).unwrap();
-    let allow = || PolicyAction::Allow {
-        invoker: "/usr/local/bin/mytool".into(),
-        script: Some(script.to_string_lossy().into_owned()),
-    };
-    let job = || tool(script.to_str().unwrap(), &hash);
+    let exe = dir.path().join("mytool");
+    std::fs::write(&exe, "elf v1").unwrap();
+    let exe = std::fs::canonicalize(exe).unwrap();
+    let path = exe.to_string_lossy().into_owned();
+    let hash = hash_of(&exe).unwrap();
+    let allow = |detached| PolicyAction::Allow { invoker: path.clone(), script: None, detached };
+    let job = || program(&path, &hash);
 
     // The user says no: nothing changes.
-    assert_eq!(rig.agent.dispatch(policy_op(allow())).await, err(AgentError::Denied));
+    assert_eq!(rig.agent.dispatch(policy_op(allow(false))).await, err(AgentError::Denied));
     assert!(!policy_file(&dir).exists());
-    // Yes: the invoker is let through from now on, without a question, as long as the file is what it was.
+    // Yes: the program is let through from now on, without a question, as long as the file is what it was.
     rig.host.allow();
-    assert_eq!(rig.agent.dispatch(policy_op(allow())).await, Reply::Done);
+    assert_eq!(rig.agent.dispatch(policy_op(allow(false))).await, Reply::Done);
     let shown = entries(rig.agent.dispatch(policy_op(PolicyAction::Show)).await);
-    let want = PolicyEntry {
-        exe: "/usr/local/bin/mytool".into(),
-        script: Some(script.to_string_lossy().into_owned()),
-        hash: hash.clone(),
-        rule: PolicyRule::Allow,
-    };
-    assert_eq!(shown, [want]);
+    let want =
+        PolicyEntry { exe: path.clone(), script: None, hash: hash.clone(), rule: PolicyRule::Allow, detached: false };
+    assert_eq!(shown.as_slice(), std::slice::from_ref(&want));
     let asked = rig.host.world().confirmed.clone();
-    assert!(asked[1].contains("always allow reading values for /usr/local/bin/mytool running"), "{}", asked[1]);
+    assert!(asked[1].contains(&format!("always allow reading values for {path} (dybw policy)")), "{}", asked[1]);
     assert_eq!(text(password(&rig, job()).await), "the note's text");
     assert_eq!(rig.host.world().confirmed.len(), 2, "no question for the value");
-    std::fs::write(&script, "echo edited").unwrap();
+    // A detached grant is a grant of its own, next to the other.
     rig.host.allow();
-    password(&rig, tool(script.to_str().unwrap(), &hash_of(&script).unwrap())).await;
-    assert_eq!(rig.host.world().confirmed.len(), 3, "an edited script is asked about again");
+    assert_eq!(rig.agent.dispatch(policy_op(allow(true))).await, Reply::Done);
+    assert!(rig.host.world().confirmed[2].contains("when run detached (parent exited)"));
+    let shown = entries(rig.agent.dispatch(policy_op(PolicyAction::Show)).await);
+    assert_eq!(shown, [want.clone(), PolicyEntry { detached: true, ..want }]);
+    std::fs::write(&exe, "elf v2").unwrap();
+    rig.host.allow();
+    password(&rig, program(&path, &hash_of(&exe).unwrap())).await;
+    assert_eq!(rig.host.world().confirmed.len(), 4, "a replaced program is asked about again");
 
-    // A deny is by path and holds whatever the content.
+    // A deny is by path and holds whatever the content, for every script of the program too.
     rig.host.allow();
-    let deny = PolicyAction::Deny {
-        invoker: "/usr/local/bin/mytool".into(),
-        script: Some(script.to_string_lossy().into_owned()),
-    };
+    let deny = PolicyAction::Deny { invoker: path.clone(), script: None };
     assert_eq!(rig.agent.dispatch(policy_op(deny)).await, Reply::Done);
     assert_eq!(password(&rig, job()).await, err(AgentError::Denied));
-    assert_eq!(rig.host.world().confirmed.len(), 4, "refused without a question");
-    assert!(rig.host.world().confirmed[3].contains("always refuse reading values for"));
+    assert_eq!(rig.host.world().confirmed.len(), 5, "refused without a question");
+    assert!(rig.host.world().confirmed[4].contains("always refuse reading values for"));
+    assert_eq!(entries(rig.agent.dispatch(policy_op(PolicyAction::Show)).await).len(), 1, "the deny replaced both");
 
     // Forget: the question comes back.
     rig.host.allow();
-    let forget = PolicyAction::Forget { invoker: script.to_string_lossy().into_owned() };
+    let forget = PolicyAction::Forget { invoker: path.clone() };
     assert_eq!(rig.agent.dispatch(policy_op(forget)).await, Reply::Done);
-    assert!(rig.host.world().confirmed[4].contains("forget what is remembered for"));
+    assert!(rig.host.world().confirmed[5].contains("forget what is remembered for"));
     assert!(entries(rig.agent.dispatch(policy_op(PolicyAction::Show)).await).is_empty());
     rig.host.allow();
     assert_eq!(text(password(&rig, job()).await), "the note's text");
@@ -420,6 +433,7 @@ async fn allow_deny_and_forget_ask_the_user_and_change_what_the_next_request_get
         rig.audit.events().iter().filter(|e| e.item.is_none()).map(|e| (e.op, e.verdict)).collect::<Vec<_>>(),
         [
             ("policy-allow", Verdict::Declined),
+            ("policy-allow", Verdict::Confirmed),
             ("policy-allow", Verdict::Confirmed),
             ("policy-deny", Verdict::Confirmed),
             ("policy-forget", Verdict::Confirmed)
@@ -433,11 +447,11 @@ async fn a_policy_change_that_cannot_be_planned_or_saved_is_refused_after_no_que
     let agent = &rig.agent;
     let not_a_path = |action| async move { agent.dispatch(policy_op(action)).await };
     rig.host.allow();
-    let relative = PolicyAction::Allow { invoker: "tool".into(), script: None };
+    let relative = PolicyAction::Allow { invoker: "tool".into(), script: None, detached: false };
     assert_eq!(not_a_path(relative).await, err(AgentError::Config));
     let relative_script = PolicyAction::Deny { invoker: "/usr/bin/x".into(), script: Some("run.sh".into()) };
     assert_eq!(not_a_path(relative_script).await, err(AgentError::Config));
-    let missing = PolicyAction::Allow { invoker: "/usr/bin/x".into(), script: Some("/no/such/script".into()) };
+    let missing = PolicyAction::Allow { invoker: "/no/such/program".into(), script: None, detached: false };
     assert_eq!(not_a_path(missing).await, err(AgentError::Config));
     assert!(rig.host.world().confirmed.is_empty(), "nothing was asked about a change that cannot be made");
     // Forget takes a name that is not a path too (it only matches nothing).
@@ -543,4 +557,190 @@ async fn every_read_of_an_ai_or_unknown_caller_is_logged_also_when_it_never_reac
     // An invoker's names-only requests are not logged; a decision on its value is, as before.
     items(agent.dispatch_as(list(), tool("/opt/a.sh", "h1")).await);
     assert_eq!(events.len(), rig.audit.events().len());
+}
+
+#[tokio::test]
+async fn an_ai_class_caller_cannot_stop_unlock_log_in_or_touch_the_policy() {
+    let (_dir, rig) = setup(|_| {}).await;
+    let agent = &rig.agent;
+    let asked = rig.host.world().asked.len();
+    let work = || Some("work".to_owned());
+    for op in [
+        Op::StopAgent,
+        Op::Unlock { profile: work() },
+        Op::Login { profile: work() },
+        policy_op(PolicyAction::Show),
+        policy_op(PolicyAction::Forget { invoker: "/usr/bin/x".into() }),
+    ] {
+        rig.host.allow();
+        assert_eq!(agent.dispatch_as(op, ai()).await, err(AgentError::Denied));
+    }
+    assert_eq!(rig.host.world().asked.len(), asked, "no password or API-key prompt on behalf of an AI agent");
+    assert!(rig.host.world().confirmed.is_empty());
+    assert_eq!(verdicts(&rig), vec![Verdict::Denied; 5]);
+    let ops: Vec<_> = rig.audit.events().iter().map(|e| e.op).collect();
+    assert_eq!(ops, ["stop_agent", "unlock", "login", "policy-show", "policy-forget"]);
+    // The others may still look at the policy.
+    assert!(entries(agent.dispatch_as(policy_op(PolicyAction::Show), unknown()).await).is_empty());
+}
+
+#[tokio::test]
+async fn an_ai_list_of_a_locked_profile_answers_locked_and_raises_no_prompt() {
+    let (_dir, rig) = setup(|_| {}).await;
+    let agent = &rig.agent;
+    assert_eq!(agent.dispatch(Op::Lock { target: dybw_proto::Target::Profile("work".into()) }).await, Reply::Done);
+    let asked = rig.host.world().asked.len();
+    let list = || Op::List { profile: Some("work".into()), fields: vec![Field::Name], folder: None };
+    let search =
+        Op::Search { profile: Some("work".into()), term: "mail".into(), folder: None, fields: vec![Field::Name] };
+    let sync = Op::Sync { target: dybw_proto::Target::Profile("work".into()) };
+    for op in [list(), search, sync] {
+        assert_eq!(agent.dispatch_as(op, ai()).await, err(AgentError::Locked));
+    }
+    assert_eq!(rig.host.world().asked.len(), asked, "an AI agent never raises the master-password prompt");
+    // Anyone else still unlocks on first need.
+    rig.host.answer(Answer::Text(crate::host::fake::PASSWORD));
+    assert!(!items(agent.dispatch_as(list(), unknown()).await).is_empty());
+}
+
+#[tokio::test]
+async fn a_deny_without_a_script_covers_every_script_of_that_program() {
+    let (dir, rig) = setup(|_| {}).await;
+    let entry = PolicyEntry {
+        exe: "/bin/bash".into(),
+        script: None,
+        hash: String::new(),
+        rule: PolicyRule::Deny,
+        detached: false,
+    };
+    let file = serde_json::json!({ "version": 1, "entries": [entry] });
+    std::fs::create_dir_all(policy_file(&dir).parent().unwrap()).unwrap();
+    std::fs::write(policy_file(&dir), file.to_string()).unwrap();
+    std::fs::set_permissions(policy_file(&dir), PermissionsExt::from_mode(0o600)).unwrap();
+    rig.host.allow();
+    assert_eq!(password(&rig, tool("/opt/a.sh", "h1")).await, err(AgentError::Denied));
+    assert!(rig.host.world().confirmed.is_empty());
+}
+
+fn app() -> Caller {
+    program("/usr/local/bin/app", "h")
+}
+
+#[tokio::test]
+async fn a_grant_never_covers_the_whole_item_its_raw_json_or_the_history() {
+    let (_dir, rig) = setup(|_| {}).await;
+    rig.host.allow_always();
+    assert_eq!(text(password(&rig, app()).await), "the note's text");
+    for op in [get_op(NOTE, Select::Full), get_op(NOTE, Select::Raw), history_op(NOTE)] {
+        rig.host.allow_always();
+        assert!(!matches!(rig.agent.dispatch_as(op, app()).await, Reply::Error { .. }));
+    }
+    let w = rig.host.world();
+    assert_eq!(w.confirmed.len(), 4, "asked for each, the grant notwithstanding");
+    assert_eq!(w.offered, [true, false, false, false], "and never offered always");
+}
+
+fn bash_running(script: &str) -> Caller {
+    tool(script, "h1")
+}
+
+#[tokio::test]
+async fn an_always_for_a_script_lasts_for_that_process_only_and_is_never_written() {
+    let (dir, rig) = setup(|_| {}).await;
+    rig.host.allow_always();
+    assert_eq!(text(password(&rig, bash_running("/opt/a.sh")).await), "the note's text");
+    assert!(!policy_file(&dir).exists(), "a script's argv is its own to forge: nothing goes to disk");
+    let asked = rig.host.world().confirmed[0].clone();
+    assert!(asked.contains("claims to run /opt/a.sh") && asked.contains("[always (this process only)]"), "{asked}");
+    // The same process again: granted, no question.
+    // (Nothing is scripted: a question would be answered no.)
+    assert_eq!(text(password(&rig, bash_running("/opt/a.sh")).await), "the note's text");
+    assert_eq!(rig.host.world().confirmed.len(), 1);
+}
+
+#[tokio::test]
+async fn a_stop_from_an_ai_agent_over_the_socket_is_refused_and_the_agent_keeps_running() {
+    use dybw_proto::{Request, decode_response, encode};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (_dir, rig) = setup(|_| {}).await;
+    let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+    let me = dybw_peer::peer_of_stream(&client).unwrap();
+    let mut proc = process(me.token.start);
+    proc.image = me.token.image.clone();
+    proc.env = Some(vec![("CLAUDECODE".into(), "1".into())]);
+    rig.tree.add(me.pid, proc);
+    let task = tokio::spawn(crate::server::handle(Arc::clone(&rig.agent), server));
+    client.write_all(&encode(&Request::new(Op::StopAgent)).unwrap()).await.unwrap();
+    let mut out = Vec::new();
+    client.read_to_end(&mut out).await.unwrap();
+    assert!(!task.await.unwrap(), "the agent must not stop");
+    assert_eq!(decode_response(&out).unwrap().unwrap().0.reply, err(AgentError::Denied));
+}
+
+/// `caller` as another process, or with its parent gone.
+fn moved(caller: Caller, pid: u32, detached: bool) -> Caller {
+    let Caller::Invoker { exe, script, hash, relative, .. } = caller else { unreachable!() };
+    Caller::Invoker { exe, script, hash, relative, at: At { pid, detached, ..At::default() } }
+}
+
+#[tokio::test]
+async fn a_script_grant_is_for_one_process_dropped_by_a_lock_and_bounded() {
+    let (_dir, rig) = setup(|_| {}).await;
+    rig.host.allow_always();
+    password(&rig, moved(tool("/opt/a.sh", "h1"), 1, false)).await;
+    // Another process running the same script is asked; so is the first once its parent is gone.
+    rig.host.allow();
+    password(&rig, moved(tool("/opt/a.sh", "h1"), 2, false)).await;
+    rig.host.allow();
+    password(&rig, moved(tool("/opt/a.sh", "h1"), 1, true)).await;
+    assert_eq!(rig.host.world().confirmed.len(), 3);
+    assert!(rig.host.world().confirmed[2].contains("detached caller (parent exited) — possibly an AI agent"));
+    assert_eq!(rig.host.world().offered, [true, true, false], "a detached caller is never offered always");
+    // A lock forgets every per-process grant.
+    assert_eq!(rig.agent.dispatch(Op::Lock { target: dybw_proto::Target::All }).await, Reply::Done);
+    unlock(&rig.agent, &rig.host, "work").await;
+    rig.host.allow();
+    password(&rig, moved(tool("/opt/a.sh", "h1"), 1, false)).await;
+    assert_eq!(rig.host.world().confirmed.len(), 4, "asked again after the lock");
+    // At most 64 are held: the oldest goes first.
+    for pid in 100..=164 {
+        rig.host.allow_always();
+        password(&rig, moved(tool("/opt/a.sh", "h1"), pid, false)).await;
+    }
+    let asked = rig.host.world().confirmed.len();
+    password(&rig, moved(tool("/opt/a.sh", "h1"), 164, false)).await;
+    assert_eq!(rig.host.world().confirmed.len(), asked, "the newest is held");
+    rig.host.allow();
+    password(&rig, moved(tool("/opt/a.sh", "h1"), 100, false)).await;
+    assert_eq!(rig.host.world().confirmed.len(), asked + 1, "the oldest was dropped");
+}
+
+#[tokio::test]
+async fn a_detached_program_is_never_offered_always_and_uses_only_a_detached_grant() {
+    let (dir, rig) = setup(|_| {}).await;
+    let loose = || moved(program("/usr/local/bin/mytool", "h1"), 0, true);
+    rig.host.allow_always();
+    assert_eq!(text(password(&rig, loose()).await), "the note's text");
+    assert_eq!(rig.host.world().offered, [false]);
+    assert!(!policy_file(&dir).exists());
+    let entry = |detached| PolicyEntry {
+        exe: "/usr/local/bin/mytool".into(),
+        script: None,
+        hash: "h1".into(),
+        rule: PolicyRule::Allow,
+        detached,
+    };
+    let write = |entries: &[PolicyEntry]| {
+        std::fs::create_dir_all(policy_file(&dir).parent().unwrap()).unwrap();
+        std::fs::write(policy_file(&dir), json!({ "version": 1, "entries": entries }).to_string()).unwrap();
+        std::fs::set_permissions(policy_file(&dir), PermissionsExt::from_mode(0o600)).unwrap();
+    };
+    // A grant for the program run normally is not one for it run detached.
+    write(&[entry(false)]);
+    rig.host.allow();
+    password(&rig, loose()).await;
+    assert_eq!(rig.host.world().confirmed.len(), 2);
+    write(&[entry(true)]);
+    assert_eq!(text(password(&rig, loose()).await), "the note's text");
+    assert_eq!(rig.host.world().confirmed.len(), 2, "the detached grant lets it through");
 }
