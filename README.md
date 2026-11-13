@@ -129,5 +129,6 @@ scripts/e2e.sh
 It builds `tests/e2e/Dockerfile`, starts Vaultwarden, and runs pytest in a container that shares its network.
 The suite writes under the test user's real home (the agent only runs on the password database's home), so it runs
 only in that container (`DYBW_E2E_CONTAINER`). The cargo tests run the agent binary on a home of their own through
-`DYBW_TEST_PASSWD_HOME`, which only a debug build reads.
+`DYBW_TEST_PASSWD_HOME`, read only by the `dybw-agent-test-home` binary of the test-only `test-home` feature (never
+in a release build, refused by CI in the normal graph); `dybw-agent` itself never reads it.
 `DOCKER_HOST` and `DOCKER_CONFIG` come from your environment.

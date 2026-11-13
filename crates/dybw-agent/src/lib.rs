@@ -43,13 +43,38 @@ pub fn banner() -> String {
     format!("dybw-agent {} (protocol {PROTOCOL_VERSION})", env!("CARGO_PKG_VERSION"))
 }
 
+#[cfg(all(feature = "test-home", not(debug_assertions)))]
+compile_error!("the `test-home` feature is for tests only and must not be built in release");
+
 /// Start the agent and serve until `StopAgent`, SIGTERM or SIGINT.
-#[expect(clippy::expect_used, reason = "`trust()` always sets the home")]
 pub fn run() -> anyhow::Result<()> {
+    run_on(None)
+}
+
+/// Tests only (feature `test-home`): `run()` with the password database's home taken from
+/// [`trust::TEST_PASSWD_HOME`], so the agent binary can be tested on a home of its own.
+#[cfg(feature = "test-home")]
+pub fn run_test_home() -> anyhow::Result<()> {
+    run_on(std::env::var_os(trust::TEST_PASSWD_HOME).map(Into::into))
+}
+
+/// The exit status for what `run` returned; an error is printed first.
+pub fn exit_code(result: anyhow::Result<()>) -> std::process::ExitCode {
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("dybw-agent: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+#[expect(clippy::expect_used, reason = "`trust()` always sets the home")]
+fn run_on(passwd: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     // First, before any other work: nothing may attach to the agent and read its memory.
     eprint!("{}", hardening::report(&hardening::harden()));
     init_logging();
-    let trust = trust::trust()?;
+    let trust = trust::trust_on(passwd)?;
     let home = trust.home.clone().expect("trust() sets the home");
     let var = |name: &str| std::env::var_os(name);
     let config = config::Config::load(&paths::config_path(&home))?;

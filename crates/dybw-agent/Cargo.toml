@@ -26,6 +26,19 @@ dybw-peer.workspace = true
 sha2.workspace = true
 tracing-subscriber.workspace = true
 
+[features]
+# Tests only: builds `dybw-agent-test-home`, which takes the password database's home from DYBW_TEST_PASSWD_HOME so
+# the tests can run the agent on a home of their own. The `dybw-agent` binary never reads that variable. Enabled
+# only by this crate's own dev-dependency on itself; a build without debug assertions refuses it (src/lib.rs), and CI
+# fails when it shows up in the normal dependency graph.
+test-home = []
+
+[[bin]]
+name = "dybw-agent-test-home"
+path = "src/test_home_main.rs"
+required-features = ["test-home"]
+
 [dev-dependencies]
+dybw-agent = { path = ".", features = ["test-home"] }
 tempfile.workspace = true
 dybw-peer = { workspace = true, features = ["fake"] }

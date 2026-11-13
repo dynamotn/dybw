@@ -15,25 +15,23 @@ pub const PINENTRY_SEARCH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bi
 
 /// The trust of this process: refuses root and an untrustworthy `HOME`.
 pub fn trust() -> anyhow::Result<Trust> {
+    trust_on(None)
+}
+
+/// `trust()`, with `passwd` standing in for the password database's home when given (the test-home binary only).
+pub(crate) fn trust_on(passwd: Option<PathBuf>) -> anyhow::Result<Trust> {
     let user = crate::current_user().context("cannot tell which user this is")?;
     let exe = std::env::current_exe().and_then(std::fs::canonicalize).context("cannot find this executable")?;
-    let passwd = passwd_home(user.uid);
+    let passwd = passwd.or_else(|| passwd_home(user.uid));
     trust_for(std::env::var_os("HOME"), user, exe, passwd)
 }
 
 /// This user's home in the password database, never `HOME`.
-///
-/// Debug builds only: [`TEST_PASSWD_HOME`] stands in for the database, so the tests can run the agent binary on a
-/// home of their own. A release build never reads it.
 pub fn passwd_home(uid: u32) -> Option<PathBuf> {
-    #[cfg(debug_assertions)]
-    if let Some(home) = std::env::var_os(TEST_PASSWD_HOME) {
-        return Some(home.into());
-    }
     dybw_peer::home_of(uid)
 }
 
-/// The variable a debug build takes as the password database's home (see [`passwd_home`]).
+/// The variable only the `dybw-agent-test-home` binary (feature `test-home`) takes as the password database's home.
 pub const TEST_PASSWD_HOME: &str = "DYBW_TEST_PASSWD_HOME";
 
 /// The trust for `user`, whose home in the password database is `passwd`; `home_var` is the `HOME` this process got.

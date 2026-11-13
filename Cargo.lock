@@ -503,6 +503,7 @@ name = "dybw-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dybw-agent",
  "dybw-core",
  "dybw-native",
  "dybw-peer",

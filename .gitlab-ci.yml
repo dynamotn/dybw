@@ -60,6 +60,8 @@ test:
     # The peer crate's fake process table must never be linked into a shipped binary.
     - cargo tree -e features --edges normal -p dybw -p dybw-agent --target all > features.txt
     - '! grep -q ''dybw-peer feature "fake"'' features.txt'
+    # Nor the agent's test-home binary (it takes its home from an environment variable).
+    - '! grep -q ''dybw-agent feature "test-home"'' features.txt'
 
 coverage:
   stage: test

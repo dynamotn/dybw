@@ -5,11 +5,5 @@ fn main() -> ExitCode {
         println!("{}", dybw_agent::banner());
         return ExitCode::SUCCESS;
     }
-    match dybw_agent::run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("dybw-agent: {e:#}");
-            ExitCode::FAILURE
-        }
-    }
+    dybw_agent::exit_code(dybw_agent::run())
 }

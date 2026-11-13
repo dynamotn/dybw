@@ -7,8 +7,11 @@ use std::time::{Duration, Instant};
 
 use dybw_proto::{Op, Reply, Request, Response, decode_response, encode};
 
+/// The agent with its home taken from DYBW_TEST_PASSWD_HOME (feature `test-home`).
+const AGENT: &str = env!("CARGO_BIN_EXE_dybw-agent-test-home");
+
 fn agent(home: &std::path::Path, runtime: &std::path::Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_dybw-agent"))
+    Command::new(AGENT)
         .env("HOME", home)
         .env(dybw_agent::trust::TEST_PASSWD_HOME, home)
         .env("XDG_RUNTIME_DIR", runtime)
@@ -81,7 +84,7 @@ fn an_untrusted_home_stops_it_with_a_message() {
 fn a_home_variable_other_than_the_users_home_stops_it() {
     let (home, runtime) = dirs();
     let other = tempfile::tempdir().expect("other");
-    let out = Command::new(env!("CARGO_BIN_EXE_dybw-agent"))
+    let out = Command::new(AGENT)
         .env("HOME", other.path())
         .env(dybw_agent::trust::TEST_PASSWD_HOME, home.path())
         .env("XDG_RUNTIME_DIR", runtime.path())
@@ -122,7 +125,7 @@ fn sigint_ends_it_cleanly() {
 }
 
 fn fails_with(home: &std::path::Path, runtime: &std::path::Path, text: &str) {
-    let out = Command::new(env!("CARGO_BIN_EXE_dybw-agent"))
+    let out = Command::new(AGENT)
         .env("HOME", home)
         .env(dybw_agent::trust::TEST_PASSWD_HOME, home)
         .env("XDG_RUNTIME_DIR", runtime)
@@ -154,7 +157,7 @@ fn the_config_comes_from_the_trusted_home_not_from_xdg_config_home() {
     let elsewhere = tempfile::tempdir().expect("xdg");
     std::fs::create_dir_all(elsewhere.path().join("dybw")).expect("dir");
     std::fs::write(elsewhere.path().join("dybw/config.toml"), "not = [valid\n").expect("config");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dybw-agent"))
+    let mut child = Command::new(AGENT)
         .env("HOME", home.path())
         .env(dybw_agent::trust::TEST_PASSWD_HOME, home.path())
         .env("XDG_RUNTIME_DIR", runtime.path())
@@ -163,4 +166,30 @@ fn the_config_comes_from_the_trusted_home_not_from_xdg_config_home() {
         .spawn()
         .expect("start dybw-agent");
     stop(runtime.path(), &mut child);
+}
+
+#[test]
+fn the_shipped_binary_ignores_the_test_home_variable() {
+    // The `dybw-agent` binary reads the password database only: a starter's DYBW_TEST_PASSWD_HOME is not obeyed.
+    let (home, runtime) = dirs();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dybw-agent"))
+        .env("HOME", home.path())
+        .env(dybw_agent::trust::TEST_PASSWD_HOME, home.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start dybw-agent");
+    // An agent that obeyed the variable would start and serve: stop it and fail rather than wait for ever.
+    let begun = Instant::now();
+    while child.try_wait().expect("wait").is_none() {
+        if begun.elapsed() > Duration::from_secs(10) {
+            child.kill().expect("kill");
+            panic!("dybw-agent started on the home DYBW_TEST_PASSWD_HOME named");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().expect("output");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("password database"), "{out:?}");
 }
