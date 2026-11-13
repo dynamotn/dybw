@@ -57,6 +57,9 @@ test:
   extends: .cargo-cache
   script:
     - cargo test --workspace --locked
+    # The peer crate's fake process table must never be linked into a shipped binary.
+    - cargo tree -e features --edges normal -p dybw -p dybw-agent --target all > features.txt
+    - '! grep -q ''dybw-peer feature "fake"'' features.txt'
 
 coverage:
   stage: test
