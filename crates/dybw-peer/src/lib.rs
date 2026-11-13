@@ -414,15 +414,25 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn oversized_arguments_are_hidden_not_an_error() {
-        let big = "a".repeat(MAX_ARGS_BYTES / 4);
+        // One argument is capped at 128 KiB (MAX_ARG_STRLEN): twenty of 64 KiB pass the 1 MiB cap.
+        let big = vec!["a".repeat(64 << 10); 20];
         let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tests::child_body", &big, &big, &big, &big, &big])
+            .args(["--exact", "tests::child_body"])
+            .args(&big)
             .env(MARKER, "x=y")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
-        let p = Process::of(child.id()).unwrap();
+        // Right after the exec the kernel may not have set the new arguments up yet (empty cmdline): wait for them.
+        let begun = Instant::now();
+        let p = loop {
+            let p = Process::of(child.id()).unwrap();
+            if p.argv.as_ref().is_none_or(|a| !a.is_empty()) || begun.elapsed() > Duration::from_secs(5) {
+                break p;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(p.ppid, std::process::id());
