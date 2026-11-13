@@ -561,6 +561,7 @@ pub(crate) mod testing {
             cwd: None,
             started: None,
             exe_uuid: None,
+            args: dybw_peer::Args::Visible,
         }
     }
 

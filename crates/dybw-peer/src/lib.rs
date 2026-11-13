@@ -110,6 +110,18 @@ pub struct Peer {
     pub token: Token,
 }
 
+/// Whether a process's argv and environment could be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Args {
+    /// Read: `argv` and `env` are `Some`.
+    Visible,
+    /// The kernel keeps them from this user (another user's process, SIP, a zombie): `None`, which is normal.
+    Withheld,
+    /// Readable in principle (this user's process) but the read failed: too large, malformed, a size that moved
+    /// between two reads. `None`, and a caller must treat the process as hiding something.
+    Unreadable,
+}
+
 /// What the kernel says about a process now.
 ///
 /// `exe` and `ppid` are the primary facts (ancestry). `argv` and `env` are
@@ -136,6 +148,8 @@ pub struct Process {
     /// macOS: the `LC_UUID` of the image the kernel runs (`p_uuid`), to tell whether a file on disk is that image;
     /// `None` on Linux or when the kernel has none.
     pub exe_uuid: Option<[u8; 16]>,
+    /// Why `argv` and `env` are what they are.
+    pub args: Args,
 }
 
 /// (ppid, start time, image) in one read.
@@ -166,6 +180,17 @@ pub fn home_of(uid: u32) -> Option<PathBuf> {
     raw::home_of(uid, 1024)
 }
 
+type ArgsRead = (Option<Vec<OsString>>, Option<Vec<(OsString, OsString)>>);
+
+/// What an argv/env read gave: `Ok((None, None))` is the kernel withholding them, an error is a failed read.
+fn args_of(read: Result<ArgsRead, Error>) -> (ArgsRead, Args) {
+    match read {
+        Ok(read @ (Some(_), _)) => (read, Args::Visible),
+        Ok(read) => (read, Args::Withheld),
+        Err(_) => ((None, None), Args::Unreadable),
+    }
+}
+
 /// Identify the peer of a connected Unix socket.
 pub fn peer_of(sock: BorrowedFd<'_>) -> Result<Peer, Error> {
     sys::peer_of(sock)
@@ -180,7 +205,7 @@ impl Process {
     pub fn of(pid: u32) -> Result<Self, Error> {
         let before = read_id(pid)?;
         let exe = sys::exe(pid)?;
-        let (argv, env) = sys::args(pid).unwrap_or_default();
+        let ((argv, env), args) = args_of(sys::args(pid));
         let cwd = sys::cwd(pid).ok().flatten();
         unchanged(&before, &read_id(pid)?)?;
         let exe_uuid = sys::exe_uuid(&before.2);
@@ -194,6 +219,7 @@ impl Process {
             cwd,
             started: sys::started(before.1),
             exe_uuid,
+            args,
         })
     }
 }
@@ -408,6 +434,16 @@ mod tests {
         let on_disk = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
         assert_eq!((opened.dev(), opened.ino()), (on_disk.dev(), on_disk.ino()));
         assert_eq!(me.exe_uuid.is_some(), cfg!(target_os = "macos"));
+        assert_eq!(me.args, Args::Visible);
+    }
+
+    #[test]
+    fn withheld_arguments_are_told_apart_from_a_failed_read() {
+        assert_eq!(args_of(Ok((None, None))).1, Args::Withheld);
+        assert_eq!(args_of(Ok((Some(vec![]), Some(vec![])))).1, Args::Visible);
+        for e in [Error::TooLarge, Error::Malformed, Error::Os(libc::ENOMEM)] {
+            assert_eq!(args_of(Err(e)), ((None, None), Args::Unreadable));
+        }
     }
 
     /// Arguments past the cap are "not visible", and the process is still read (Linux: macOS cannot exec that much).
@@ -436,7 +472,7 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(p.ppid, std::process::id());
-        assert_eq!(p.argv, None);
+        assert_eq!((p.argv, p.args), (None, Args::Unreadable));
     }
 
     #[test]

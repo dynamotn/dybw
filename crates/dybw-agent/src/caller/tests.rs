@@ -49,6 +49,7 @@ impl Tree {
                 cwd: None,
                 started: Some(SystemTime::now() + Duration::from_secs(3600)),
                 exe_uuid: None,
+                args: dybw_peer::Args::Visible,
             },
         );
     }
@@ -362,6 +363,7 @@ fn a_peer_whose_pid_is_reused_fails_the_recheck() {
             cwd: None,
             started: None,
             exe_uuid: None,
+            args: dybw_peer::Args::Visible,
         },
     );
     assert!(!t.resolver().recheck(&resolved));
@@ -629,6 +631,7 @@ fn the_harness_list_only_grows() {
         cwd: None,
         started: None,
         exe_uuid: None,
+        args: dybw_peer::Args::Visible,
     };
     assert_eq!(table.find(&mine), Some("mine"));
     let claude = Process { exe: "/bin/claude".into(), ..mine };
@@ -843,4 +846,23 @@ fn the_grant_scope_follows_the_invoker() {
     assert_eq!((c.scope(), c.rememberable(), c.detached()), (Scope::Process, true, false));
     assert!(matches!(c, Caller::Invoker { at, .. } if at == super::tests::at(50, false)));
     assert_eq!(Caller::Ai { harness: "x".into(), via: Via::Marker }.scope(), Scope::Never);
+}
+
+#[test]
+fn an_ancestor_whose_arguments_cannot_be_read_makes_the_caller_unknown_but_withheld_ones_do_not() {
+    let t = Tree::new();
+    let app = t.file("app", "binary");
+    t.dybw(50);
+    t.add(50, &app, 10, Some(&["app"]), Some(&[]));
+    t.add(10, Path::new("/usr/bin/node"), 1, None, None);
+    let with = |args| Process { args, ..t.fake.process(10).unwrap() };
+    // Another user's (or SIP's) process: withheld, as normal.
+    t.fake.add(10, with(dybw_peer::Args::Withheld));
+    assert!(matches!(t.caller(), Caller::Invoker { .. }));
+    // Ours, but oversized or malformed: it may hide a harness's argv.
+    t.fake.add(10, with(dybw_peer::Args::Unreadable));
+    assert!(unknown(&t.caller()).contains("arguments could not be read"));
+    // An AI match still wins.
+    t.fake.add(10, Process { exe: "/opt/claude".into(), ..with(dybw_peer::Args::Unreadable) });
+    assert!(matches!(t.caller(), Caller::Ai { .. }));
 }

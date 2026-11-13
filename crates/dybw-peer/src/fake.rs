@@ -77,6 +77,7 @@ mod tests {
             cwd: None,
             started: None,
             exe_uuid: None,
+            args: crate::Args::Visible,
         }
     }
 

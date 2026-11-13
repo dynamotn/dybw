@@ -385,6 +385,11 @@ impl Resolver {
         if !complete {
             return (unknown("the ancestry could not be read to the top"), seen);
         }
+        // A process of this user whose argv could not be read (oversized, malformed) may be hiding a harness's argv.
+        // Withheld arguments (another user's process, SIP) are normal and do not count.
+        if chain.iter().any(|p| p.args == dybw_peer::Args::Unreadable) {
+            return (unknown("an ancestor's arguments could not be read"), seen);
+        }
         if !chain.first().is_some_and(is_cli) {
             return (unknown("the peer is not dybw"), seen);
         }
