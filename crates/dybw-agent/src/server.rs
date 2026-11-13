@@ -168,7 +168,8 @@ mod tests {
             client.shutdown().await.unwrap();
         }
         let mut out = Vec::new();
-        client.read_to_end(&mut out).await.unwrap();
+        // A dropped peer with unread input is reset on Linux and closed cleanly on macOS: both mean no reply.
+        let _ = client.read_to_end(&mut out).await;
         task.await.unwrap();
         decode_response(&out).unwrap().map(|(r, _)| r.reply)
     }

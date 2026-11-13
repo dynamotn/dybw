@@ -297,6 +297,8 @@ async fn a_policy_change_is_dropped_when_the_peer_changes_while_the_user_is_aske
 async fn an_allow_that_could_never_match_is_refused_and_a_deny_of_it_is_not() {
     let (dir, rig) = setup(|_| {}).await;
     let script = std::fs::canonicalize(dir.path().join("config.toml")).unwrap().to_string_lossy().into_owned();
+    // The invoker is stored resolved: /bin is a symlink to /usr/bin on Linux.
+    let bash = std::fs::canonicalize("/bin/bash").unwrap().to_string_lossy().into_owned();
     let allow = |invoker: &str, script: Option<&str>| PolicyAction::Allow {
         invoker: invoker.into(),
         script: script.map(Into::into),
@@ -314,7 +316,7 @@ async fn an_allow_that_could_never_match_is_refused_and_a_deny_of_it_is_not() {
     let deny = PolicyAction::Deny { invoker: "/bin/bash".into(), script: Some(script.clone()) };
     assert_eq!(rig.agent.dispatch(policy_op(deny)).await, Reply::Done);
     let asked = rig.host.world().confirmed[1].clone();
-    assert!(asked.contains(&format!("always refuse reading values for /bin/bash running {script}")), "{asked}");
+    assert!(asked.contains(&format!("always refuse reading values for {bash} running {script}")), "{asked}");
 }
 
 #[tokio::test]
