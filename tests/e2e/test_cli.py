@@ -6,6 +6,7 @@ offline test can switch the server off. Pinentry answers come from /tmp/fake-pin
 
 import json
 import os
+import pwd
 import shutil
 import socket
 import subprocess
@@ -112,19 +113,26 @@ def world(account, dybw_bin):
     seeded = {k: v["id"] for k, v in seeded.items()}
     ssh = next((c for c in account.sync()["ciphers"] if c["id"] == seeded["ssh"]), None)
     assert ssh and ssh["type"] == 5 and ssh.get("sshKey"), f"Vaultwarden does not return the SSH key item: {ssh}"
+    # The agent only runs on this user's home in the password database, so the suite writes there: only in the e2e
+    # container, where that home is a throwaway.
+    if not os.environ.get("DYBW_E2E_CONTAINER"):
+        pytest.skip("the e2e suite uses the real home: run it in its container (scripts/e2e.sh)")
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    for d in (".config/dybw", ".local/state/dybw", ".cache/dybw"):
+        shutil.rmtree(home / d, ignore_errors=True)
     root = Path(tempfile.mkdtemp(prefix="d", dir="/tmp"))
-    for d in ("home/.config/dybw", "run"):
+    for d in ("run",):
         (root / d).mkdir(parents=True)
+    (home / ".config/dybw").mkdir(parents=True)
     (root / "run").chmod(0o700)
-    (root / "home").chmod(0o700)
-    (root / "home/.config/dybw/config.toml").write_text(
+    (home / ".config/dybw/config.toml").write_text(
         f'default = "e2e"\n[profiles.e2e]\nserver_url = "http://127.0.0.1:{PROXY_PORT}"\n'
         f'email = "{account.email}"\npinentry = "/usr/local/bin/fake-pinentry"\nlock_timeout_minutes = 0\n'
     )
     env = {
         **os.environ,
         # Config, state and cache all live under the agent's trusted home.
-        "HOME": str(root / "home"),
+        "HOME": str(home),
         "XDG_RUNTIME_DIR": str(root / "run"),
     }
     env.pop("DYBW_PROFILE", None)

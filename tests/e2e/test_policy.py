@@ -1,9 +1,10 @@
 """The caller policy and the AI-agent class, end to end on Linux (so dybw-peer's /proc code runs for real).
 
-Callers are made with small scripts: `bash /abs/s.sh` is an invoker the policy can remember, `./s.sh` is not
-rememberable, `CLAUDECODE=1` or a binary under `.../claude/versions/` is an AI agent, and `setsid -f ... exec dybw`
-leaves dybw with no parent. The fake pinentry log tells what the user was asked. The tests run in file order and
-share one agent and one policy file.
+Callers are made with small scripts: `bash /abs/s.sh` is an invoker whose "always" lasts for that bash process only,
+`./s.sh` is never offered "always", `find -exec dybw` is a plain program the policy file can remember, `CLAUDECODE=1`
+or a binary under `.../claude/versions/` is an AI agent, `setsid -f ... exec dybw` leaves dybw with no parent, and a
+caller whose own parent exits first is detached. The fake pinentry log tells what the user was asked. The tests run
+in file order and share one agent and one policy file.
 """
 
 import os
@@ -18,6 +19,9 @@ from test_cli import ensure_unlocked, pinentry, world  # noqa: F401  (world is a
 LOG = Path("/tmp/fake-pinentry.log")
 BASH = os.path.realpath(shutil.which("bash"))
 SCRIPT = '#!/bin/bash\n"$DYBW" "$@"\nexit $?\n'
+# Two reads by one bash process.
+TWICE = '#!/bin/bash\n"$DYBW" "$@"\necho --\n"$DYBW" "$@"\n'
+FIND = os.path.realpath(shutil.which("find"))
 
 
 def via(world, script, *args, confirm="deny", cwd=None, extra=None):
@@ -54,11 +58,11 @@ def write(path, text):
     time.sleep(1.2)
 
 
-def script_in(world, name, subdir="scripts"):
+def script_in(world, name, subdir="scripts", text=SCRIPT):
     d = world.root / subdir
     d.mkdir(exist_ok=True)
     path = d / name
-    write(path, SCRIPT)
+    write(path, text)
     return path
 
 
@@ -68,27 +72,83 @@ def test_login_and_unlock(world, account):
     ensure_unlocked(world, account)
 
 
-def test_a_script_read_is_confirmed_remembered_and_asked_again_when_edited(world):
-    s = script_in(world, "a.sh")
+def test_a_script_always_lasts_for_that_process_only_and_is_never_written(world):
+    s = script_in(world, "a.sh", text=TWICE)
     r = via(world, s, "get", "login-item", confirm="always")
-    assert (r.returncode, r.stdout) == (0, "login-pw\n"), r.stderr
-    (p,) = prompts()
+    assert (r.returncode, r.stdout) == (0, "login-pw\n--\nlogin-pw\n"), r.stderr
+    (p,) = prompts()  # the second read of the same process was not asked about
     assert p["title"] == "dybw" and p["always"]
-    for part in (BASH, str(s), "login-item", "dybw get"):
+    for part in (BASH, f"which claims to run {s}", "login-item", "dybw get", "always (this process only)"):
         assert part in p["text"], (part, p["text"])
-    # Remembered: a "deny" pinentry would refuse, but it is never asked.
+    # Nothing on disk: a second run of the same script is a new process, and is asked again.
+    assert policy_rows(world) == []
     r = via(world, s, "get", "login-item", confirm="deny")
-    assert (r.returncode, r.stdout) == (0, "login-pw\n"), r.stderr
-    assert prompts() == []
-    # The script changed: the grant no longer applies.
-    write(s, SCRIPT + "# edited\n")
-    r = via(world, s, "get", "login-item", confirm="once")
-    assert (r.returncode, r.stdout) == (0, "login-pw\n"), r.stderr
+    assert r.returncode == 1 and "login-pw" not in r.stdout
+    assert len(prompts()) == 2
+
+
+def test_a_script_detached_from_its_parent_gets_no_reuse_and_no_always(world):
+    """The first read happens while the script's parent is alive ("always" for the process); the parent then
+    exits, and the second read of the same process is detached: asked again, never offered always."""
+    s = script_in(world, "d.sh", text='#!/bin/bash\n"$DYBW" get login-item > "$1"\nsleep 4\n"$DYBW" get login-item > "$2"\n')
+    first, second = world.root / "d1.out", world.root / "d2.out"
+    for f in (first, second):
+        f.unlink(missing_ok=True)
+    LOG.unlink(missing_ok=True)
+    pinentry(pins=[], confirm="always")
+    env = {**world.env, "DYBW": world.bin}
+    subprocess.run(["sh", "-c", 'bash "$0" "$1" "$2" & sleep 2', str(s), str(first), str(second)], env=env, timeout=30)
+    for _ in range(200):
+        if second.exists() and second.stat().st_size:
+            break
+        time.sleep(0.1)
+    assert first.read_text() == second.read_text() == "login-pw\n"
+    one, two = prompts()
+    assert one["always"] and "detached" not in one["text"], one
+    assert not two["always"] and "detached caller (parent exited)" in two["text"], two
+
+
+def find_runs(world, *args, confirm, detached=False):
+    """`find` (a plain program) runs dybw; `detached`: its starter has exited by then (setsid -f, after a pause)."""
+    out = world.root / "find.out"
+    out.unlink(missing_ok=True)
+    LOG.unlink(missing_ok=True)
+    pinentry(pins=[], confirm=confirm)
+    cmd = f'exec {shlex.quote(FIND)} /tmp -maxdepth 0 -exec {shlex.quote(world.bin)} {shlex.join(args)} ";" > {out}'
+    if detached:
+        subprocess.run(["setsid", "-f", "sh", "-c", f"sleep 1; {cmd}"], env=world.env, check=True, timeout=30)
+        for _ in range(300):
+            if out.exists() and out.stat().st_size:
+                break
+            time.sleep(0.1)
+    else:
+        subprocess.run(["sh", "-c", cmd], env=world.env, timeout=60)
+    return out.read_text() if out.exists() else ""
+
+
+def test_a_program_is_remembered_on_disk_and_detached_runs_need_a_grant_of_their_own(world):
+    assert find_runs(world, "get", "login-item", confirm="always") == "login-pw\n"
     (p,) = prompts()
-    assert p["always"] and str(s) in p["text"]
-    # "Once" stored nothing: still asked.
-    via(world, s, "get", "login-item", confirm="deny")
-    assert len(prompts()) == 1
+    assert p["always"] and FIND in p["text"] and "this process only" not in p["text"], p
+    assert [row[:2] for row in policy_rows(world)] == [["allow", FIND]]
+    assert find_runs(world, "get", "login-item", confirm="deny") == "login-pw\n" and prompts() == []
+    # Run detached, the grant does not apply, and "always" is not offered.
+    assert find_runs(world, "get", "login-item", confirm="always", detached=True) == "login-pw\n"
+    (p,) = prompts()
+    assert not p["always"] and "detached caller (parent exited)" in p["text"], p
+    # Only `dybw policy allow --detached` makes a grant for detached runs (asked for by a named invoker: this test
+    # process, python -m pytest, is an unknown caller).
+    s = script_in(world, "p.sh")
+    r = via(world, s, "policy", "allow", "--detached", FIND, confirm="once")
+    assert r.returncode == 0, r.stderr
+    assert sorted(row[0] for row in policy_rows(world)) == ["allow", "allow-detached"]
+    assert find_runs(world, "get", "login-item", confirm="deny", detached=True) == "login-pw\n" and prompts() == []
+    # An interpreter, or a launcher, is never remembered on disk.
+    for target in (BASH, os.path.realpath(shutil.which("xargs"))):
+        r = via(world, s, "policy", "allow", target, confirm="once")
+        assert r.returncode == 1 and "configuration is invalid" in r.stderr, r
+    r = via(world, s, "policy", "forget", FIND, confirm="once")
+    assert r.returncode == 0 and policy_rows(world) == [], r.stderr
 
 
 def test_a_relative_script_is_asked_every_time_and_never_offered_always(world):
@@ -167,9 +227,8 @@ def policy_rows(world):
 
 
 def test_policy_show_deny_and_forget_round_trip(world):
-    s = world.root / "scripts/a.sh"
-    # The "always" in the first test left one remembered grant for bash running a.sh.
-    assert [row[:3] for row in policy_rows(world)] == [["allow", BASH, str(s)]]
+    s = world.root / "scripts/p.sh"  # one dybw call per run (scripts/a.sh makes two)
+    assert policy_rows(world) == []
     r = via(world, s, "policy", "deny", BASH, "--script", str(s), confirm="once")
     assert r.returncode == 0, r.stderr
     (p,) = prompts()
@@ -203,7 +262,7 @@ def test_the_audit_log_records_the_requests_without_a_value_or_a_name(world):
         for secret in ("login-pw", "login-item", "login notes", "luser", "field-v1"):
             assert secret not in text, secret
     ai = [line.split("\t") for line in world("audit", "--ai").stdout.splitlines()]
-    assert ai and {row[2] for row in ai} == {"ai"}
+    assert ai and {row[2] for row in ai} == {"ai", "unknown"}
     assert {"denied", "listed"} <= {row[8] for row in ai}
 
 

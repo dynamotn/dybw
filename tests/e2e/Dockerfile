@@ -16,6 +16,6 @@ RUN --mount=type=bind,target=/fetch cargo fetch --locked --manifest-path /fetch/
 
 RUN useradd --create-home --uid 1000 tester
 
-ENV CARGO_TARGET_DIR=/target DYBW_BIN=/target/release/dybw DYBW_AGENT_BIN=/target/release/dybw-agent PYTHONDONTWRITEBYTECODE=1
+ENV DYBW_E2E_CONTAINER=1 CARGO_TARGET_DIR=/target DYBW_BIN=/target/release/dybw DYBW_AGENT_BIN=/target/release/dybw-agent PYTHONDONTWRITEBYTECODE=1
 WORKDIR /src
 CMD ["sh", "-c", "cargo build --release --locked && setpriv --reuid=tester --regid=tester --init-groups env HOME=/home/tester python3 -m pytest -q -p no:cacheprovider tests/e2e"]
