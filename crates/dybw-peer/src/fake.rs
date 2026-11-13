@@ -1,7 +1,9 @@
 //! A scripted [`ProcessSource`] for tests of the crates above this one.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::os::fd::BorrowedFd;
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::{Error, Peer, Process, ProcessSource};
@@ -48,6 +50,11 @@ impl ProcessSource for Fake {
     fn still_same(&self, peer: &Peer) -> bool {
         self.state().procs.get(&peer.pid).is_some_and(|p| p.start == peer.token.start && p.image == peer.token.image)
     }
+
+    /// The file at `exe`: a fake process runs whatever file the test named.
+    fn executable(&self, _pid: u32, exe: &Path) -> std::io::Result<File> {
+        File::open(exe)
+    }
 }
 
 #[cfg(test)]
@@ -69,6 +76,7 @@ mod tests {
             env: None,
             cwd: None,
             started: None,
+            exe_uuid: None,
         }
     }
 
@@ -88,6 +96,7 @@ mod tests {
         assert!(!fake.still_same(&peer));
         fake.add(7, Process { image: vec![1], ..proc(5) });
         assert!(!fake.still_same(&peer));
+        assert!(fake.executable(7, Path::new("/")).is_ok());
         fake.kill(7);
         assert_eq!(fake.process(7), Err(Error::Gone));
     }

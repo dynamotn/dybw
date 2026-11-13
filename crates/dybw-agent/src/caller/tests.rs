@@ -42,6 +42,7 @@ impl Tree {
                 env: env.map(|e| e.iter().map(|k| (os(k), os("1"))).collect()),
                 cwd: None,
                 started: Some(SystemTime::now() + Duration::from_secs(3600)),
+                exe_uuid: None,
             },
         );
     }
@@ -350,6 +351,7 @@ fn a_peer_whose_pid_is_reused_fails_the_recheck() {
             env: None,
             cwd: None,
             started: None,
+            exe_uuid: None,
         },
     );
     assert!(!t.resolver().recheck(&resolved));
@@ -522,6 +524,7 @@ fn the_harness_list_only_grows() {
         env: None,
         cwd: None,
         started: None,
+        exe_uuid: None,
     };
     assert_eq!(table.find(&mine), Some("mine"));
     let claude = Process { exe: "/bin/claude".into(), ..mine };

@@ -1,8 +1,15 @@
 //! The two syscall shapes both OSes share, as safe functions over bytes.
 
+use std::ffi::{CStr, OsStr};
+use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 
 use crate::Error;
+
+/// Largest buffer offered to `getpwuid_r`: an entry that needs more is not believed.
+const MAX_PASSWD_BUF: usize = 1 << 20;
 
 pub(crate) fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
@@ -28,9 +35,52 @@ pub(crate) fn getsockopt(fd: RawFd, level: libc::c_int, name: libc::c_int, buf: 
     Ok((len as usize).min(buf.len()))
 }
 
+/// The home directory of `uid` in the password database, starting with a `start`-byte buffer and doubling it while
+/// the entry does not fit. `None`: no entry, an error, or a home that is not an absolute path.
+pub(crate) fn home_of(uid: u32, start: usize) -> Option<PathBuf> {
+    let mut size = start.max(1);
+    loop {
+        let mut buf = vec![0u8; size];
+        let mut pwd = MaybeUninit::<libc::passwd>::zeroed();
+        let mut out: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `pwd` is valid for one `passwd`, `buf` for `buf.len()` bytes, `out` is a live pointer slot; the
+        // strings the call stores in `pwd` point into `buf`, which outlives every read below.
+        let rc = unsafe { libc::getpwuid_r(uid, pwd.as_mut_ptr(), buf.as_mut_ptr().cast(), buf.len(), &mut out) };
+        if rc == libc::ERANGE && size < MAX_PASSWD_BUF {
+            size *= 2;
+            continue;
+        }
+        if rc != 0 || out.is_null() {
+            return None;
+        }
+        // SAFETY: on success `out` points at `pwd`, which the call filled in.
+        let dir = unsafe { (*out).pw_dir };
+        if dir.is_null() {
+            return None;
+        }
+        // SAFETY: `pw_dir` is a NUL-terminated string inside `buf`, still alive and unchanged.
+        let bytes = unsafe { CStr::from_ptr(dir) }.to_bytes();
+        let home = PathBuf::from(OsStr::from_bytes(bytes));
+        return home.is_absolute().then_some(home);
+    }
+}
+
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_home_of_a_user_comes_from_the_password_database() {
+        let root = home_of(0, 1024).unwrap();
+        assert_eq!(root, PathBuf::from(if cfg!(target_os = "macos") { "/var/root" } else { "/root" }));
+        // A one-byte buffer grows until the entry fits.
+        assert_eq!(home_of(0, 1), Some(root));
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = home_of(unsafe { libc::geteuid() }, 1024).unwrap();
+        assert!(me.is_absolute());
+        assert_eq!(home_of(4_000_000_000, 1024), None, "no such user");
+    }
 
     #[test]
     fn failures_carry_errno() {

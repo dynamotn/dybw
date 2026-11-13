@@ -13,8 +13,9 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use std::ffi::OsString;
+use std::fs::File;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(feature = "fake")]
@@ -132,6 +133,9 @@ pub struct Process {
     pub started: Option<std::time::SystemTime>,
     /// Working directory; `None` when not visible. Read in the same window as the rest.
     pub cwd: Option<PathBuf>,
+    /// macOS: the `LC_UUID` of the image the kernel runs (`p_uuid`), to tell whether a file on disk is that image;
+    /// `None` on Linux or when the kernel has none.
+    pub exe_uuid: Option<[u8; 16]>,
 }
 
 /// (ppid, start time, image) in one read.
@@ -156,6 +160,12 @@ pub(crate) fn stable_id(pid: u32) -> Result<Id, Error> {
     Ok(first)
 }
 
+/// The home directory of `uid` in the password database (`getpwuid_r`), not from `HOME`, which whoever started
+/// this process chose. `None` when there is no entry or its home is not an absolute path.
+pub fn home_of(uid: u32) -> Option<PathBuf> {
+    raw::home_of(uid, 1024)
+}
+
 /// Identify the peer of a connected Unix socket.
 pub fn peer_of(sock: BorrowedFd<'_>) -> Result<Peer, Error> {
     sys::peer_of(sock)
@@ -163,13 +173,17 @@ pub fn peer_of(sock: BorrowedFd<'_>) -> Result<Peer, Error> {
 
 impl Process {
     /// Read a process. `Err(Gone)` when it does not exist, or when it exited,
-    /// was replaced or exec'd another program while being read.
+    /// was replaced or exec'd another program while being read. Arguments,
+    /// environment and working directory that cannot be read (too large,
+    /// malformed, a size that moved between two reads) are `None`, not an
+    /// error: the exe, parent and start time are what ancestry rests on.
     pub fn of(pid: u32) -> Result<Self, Error> {
         let before = read_id(pid)?;
         let exe = sys::exe(pid)?;
-        let (argv, env) = sys::args(pid)?;
-        let cwd = sys::cwd(pid)?;
+        let (argv, env) = sys::args(pid).unwrap_or_default();
+        let cwd = sys::cwd(pid).ok().flatten();
         unchanged(&before, &read_id(pid)?)?;
+        let exe_uuid = sys::exe_uuid(&before.2);
         Ok(Self {
             exe,
             ppid: before.0,
@@ -179,6 +193,7 @@ impl Process {
             env,
             cwd,
             started: sys::started(before.1),
+            exe_uuid,
         })
     }
 }
@@ -203,6 +218,10 @@ pub trait ProcessSource: Send + Sync {
     fn peer_of(&self, sock: BorrowedFd<'_>) -> Result<Peer, Error>;
     fn process(&self, pid: u32) -> Result<Process, Error>;
     fn still_same(&self, peer: &Peer) -> bool;
+    /// The executable of `pid` (whose path was read as `exe`) opened for
+    /// reading: on Linux the running image itself (`/proc/<pid>/exe`, even if
+    /// the path now names another file), on macOS the file at `exe`.
+    fn executable(&self, pid: u32, exe: &Path) -> std::io::Result<File>;
 }
 
 /// The real thing: the operating system.
@@ -218,6 +237,9 @@ impl ProcessSource for Os {
     }
     fn still_same(&self, peer: &Peer) -> bool {
         still_same(peer)
+    }
+    fn executable(&self, pid: u32, exe: &Path) -> std::io::Result<File> {
+        sys::executable(pid, exe)
     }
 }
 
@@ -371,6 +393,40 @@ mod tests {
     #[test]
     fn a_pid_that_cannot_exist_is_gone() {
         assert_eq!(Process::of(u32::MAX - 1), Err(Error::Gone));
+    }
+
+    #[test]
+    fn the_home_of_this_user_is_absolute() {
+        assert!(home_of(euid()).is_some_and(|h| h.is_absolute()));
+    }
+
+    #[test]
+    fn the_executable_opened_is_the_running_one() {
+        use std::os::unix::fs::MetadataExt;
+        let me = Process::of(std::process::id()).unwrap();
+        let opened = Os.executable(std::process::id(), &me.exe).unwrap().metadata().unwrap();
+        let on_disk = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+        assert_eq!((opened.dev(), opened.ino()), (on_disk.dev(), on_disk.ino()));
+        assert_eq!(me.exe_uuid.is_some(), cfg!(target_os = "macos"));
+    }
+
+    /// Arguments past the cap are "not visible", and the process is still read (Linux: macOS cannot exec that much).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_arguments_are_hidden_not_an_error() {
+        let big = "a".repeat(MAX_ARGS_BYTES / 4);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::child_body", &big, &big, &big, &big, &big])
+            .env(MARKER, "x=y")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let p = Process::of(child.id()).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(p.ppid, std::process::id());
+        assert_eq!(p.argv, None);
     }
 
     #[test]

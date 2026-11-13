@@ -97,6 +97,17 @@ pub(crate) fn image(pid: u32) -> Result<Vec<u8>, Error> {
     Ok(image)
 }
 
+/// The executable's UUID inside an [`image`] (bytes 12..28); `None` when the kernel left it zero.
+pub(crate) fn exe_uuid(image: &[u8]) -> Option<[u8; 16]> {
+    let uuid = *image.get(12..)?.first_chunk::<16>()?;
+    (uuid != [0; 16]).then_some(uuid)
+}
+
+/// The file at the path: macOS has no handle on the running image.
+pub(crate) fn executable(_pid: u32, exe: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(exe)
+}
+
 /// Nothing to add to the identity re-check on macOS.
 pub(crate) fn alive(_peer: &Peer) -> bool {
     true
@@ -208,6 +219,16 @@ mod tests {
         assert_eq!(image_version(&image(me).unwrap()).unwrap(), uniq(me).unwrap().p_idversion);
         assert_eq!(image_version(&[0; 11]), Err(Error::Malformed));
         assert_eq!(image_version(&[]), Err(Error::Malformed));
+    }
+
+    #[test]
+    fn the_uuid_is_read_from_the_image() {
+        assert!(exe_uuid(&image(std::process::id()).unwrap()).is_some());
+        assert_eq!(exe_uuid(&[0; 28]), None);
+        assert_eq!(exe_uuid(&[1; 27]), None);
+        let mut image = vec![0; 12];
+        image.extend([7; 16]);
+        assert_eq!(exe_uuid(&image), Some([7; 16]));
     }
 
     #[test]

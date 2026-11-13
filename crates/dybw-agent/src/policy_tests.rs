@@ -497,6 +497,9 @@ impl dybw_peer::ProcessSource for Flips {
     fn still_same(&self, peer: &dybw_peer::Peer) -> bool {
         self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < self.2 && self.0.still_same(peer)
     }
+    fn executable(&self, pid: u32, exe: &std::path::Path) -> std::io::Result<std::fs::File> {
+        self.0.executable(pid, exe)
+    }
 }
 
 #[tokio::test]

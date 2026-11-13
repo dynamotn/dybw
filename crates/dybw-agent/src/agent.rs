@@ -536,6 +536,7 @@ pub(crate) mod testing {
             env: None,
             cwd: None,
             started: None,
+            exe_uuid: None,
         }
     }
 

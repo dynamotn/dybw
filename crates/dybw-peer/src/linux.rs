@@ -125,6 +125,17 @@ pub(crate) fn image(pid: u32) -> Result<Vec<u8>, Error> {
     Ok(image)
 }
 
+/// No executable UUID on Linux: the running image is opened through `/proc/<pid>/exe` instead.
+pub(crate) fn exe_uuid(_image: &[u8]) -> Option<[u8; 16]> {
+    None
+}
+
+/// The running image, through the `/proc/<pid>/exe` link (the file the process runs, even if its path was
+/// replaced since).
+pub(crate) fn executable(pid: u32, _exe: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(format!("/proc/{pid}/exe"))
+}
+
 /// (ppid, start time in clock ticks since boot).
 pub(crate) fn ppid_start(pid: u32) -> Result<(u32, u64), Error> {
     parse::proc_stat(&read(pid, "stat")?).ok_or(Error::Malformed)
