@@ -51,8 +51,10 @@ only says "see the agent log" is explained there.
 
 - API-key login only (`auth = "password"` profiles are refused).
 - Reading a value (including `get --list-fields` and `history`) follows the caller policy: an AI-class caller is
-  denied, an unknown or detached caller is asked every time, any other invoker is asked once or "always" (remembered
+  denied, an unknown caller (for example a `dybw` whose own parent exited) is asked every time, any other invoker is asked once or "always" (remembered
   by program, script and content hash; a changed script asks again). `list` and `search` show only names and never ask.
+  A script detached from its harness (`setsid`, `nohup`, launchd) is not detected as AI: the out-of-band pinentry
+  confirmation is the boundary.
 - The policy file (`policy.json`, in the profile's state directory) is plain device state: a program running as the
   same user can edit it directly. The boundary is the harness sandbox, which must not reach the agent's socket or
   state directories. `dybw policy show` is open to every class; `allow`, `deny` and `forget` are confirmed in
@@ -79,6 +81,11 @@ only says "see the agent log" is explained there.
 - No lookup by URI yet.
 - Items that ask for a master-password reprompt are denied until P4.3.
 - Organization items are readable.
+- The agent keeps its state and cache (credentials, device id, `policy.json`, the vault cache, `harnesses.toml`,
+  the audit log) under its trusted home (`~/.local/state/dybw`, `~/.cache/dybw`), never under `XDG_STATE_HOME` or
+  `XDG_CACHE_HOME`: the `XDG_*` of whoever started the agent no longer moves agent state (only `XDG_CONFIG_HOME`
+  still finds `config.toml`). Files an earlier build wrote under a custom `XDG_STATE_HOME` or `XDG_CACHE_HOME`
+  are not found: log in again, or move them.
 - An agent started on demand inherits the environment of the first caller: `XDG_*`, `RUST_LOG`, and the session
   variables the agent forwards to pinentry (`SESSION_ENV` of `dybw-native`: `DISPLAY`, `WAYLAND_DISPLAY`,
   `DBUS_SESSION_BUS_ADDRESS`, `XAUTHORITY`, `LANG`, `HOME` and so on). Start the first `dybw` from the GUI
