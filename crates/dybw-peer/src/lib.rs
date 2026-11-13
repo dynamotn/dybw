@@ -305,7 +305,34 @@ mod tests {
 
     fn spawn(cmd: &mut Command) -> Child {
         let _one = FORK.lock().unwrap();
-        cmd.spawn().unwrap()
+        retry_busy(|| cmd.spawn()).unwrap()
+    }
+
+    /// A fork in another test thread can still hold a copied binary open for writing (ETXTBSY): retry briefly.
+    fn retry_busy<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+        let mut tries = 0;
+        loop {
+            match f() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 100 => tries += 1,
+                r => return r,
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_busy_text_file_is_retried_then_given_up() {
+        let busy = || Err::<(), _>(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy));
+        let mut calls = 0;
+        assert!(
+            retry_busy(|| {
+                calls += 1;
+                if calls < 3 { busy() } else { Ok(()) }
+            })
+            .is_ok()
+        );
+        assert_eq!(calls, 3);
+        assert_eq!(retry_busy(busy).unwrap_err().kind(), std::io::ErrorKind::ExecutableFileBusy);
     }
 
     /// Right after the exec the kernel may not have set the new arguments up yet (an empty or briefly withheld cmdline, Linux): read the
@@ -417,8 +444,7 @@ mod tests {
 
     #[test]
     fn a_child_that_execs_another_program_is_not_the_same() {
-        let mut child =
-            Command::new("/bin/sh").args(["-c", "read x; exec /bin/sleep 30"]).stdin(Stdio::piped()).spawn().unwrap();
+        let mut child = spawn(Command::new("/bin/sh").args(["-c", "read x; exec /bin/sleep 30"]).stdin(Stdio::piped()));
         let peer = sys::peer_of_pid(child.id()).unwrap();
         assert!(still_same(&peer));
         child.stdin.take().unwrap().write_all(b"\n").unwrap();
@@ -475,14 +501,14 @@ mod tests {
     fn oversized_arguments_are_hidden_not_an_error() {
         // One argument is capped at 128 KiB (MAX_ARG_STRLEN): twenty of 64 KiB pass the 1 MiB cap.
         let big = vec!["a".repeat(64 << 10); 20];
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tests::child_body"])
-            .args(&big)
-            .env(MARKER, "x=y")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut child = spawn(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::child_body"])
+                .args(&big)
+                .env(MARKER, "x=y")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null()),
+        );
         let p = process_of(&child);
         child.kill().unwrap();
         child.wait().unwrap();
