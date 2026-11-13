@@ -52,14 +52,14 @@ pub fn run() -> anyhow::Result<()> {
     let trust = trust::trust()?;
     let home = trust.home.clone().expect("trust() sets the home");
     let var = |name: &str| std::env::var_os(name);
-    let config = config::Config::load(&paths::config_path(&var, &home))?;
+    let config = config::Config::load(&paths::config_path(&home))?;
     let user = trust.user.clone();
     // The lock file stays held until the process ends.
     let (listener, _lock) = socket::bind(&socket::socket_dir(&var, user.uid), user.uid)?;
     let harnesses = caller::Harnesses::load(&paths::harnesses_path(&home));
     let resolver = Arc::new(caller::Resolver::new(Arc::new(dybw_peer::Os), harnesses));
     let audit = Arc::new(audit::FileAudit::new(&paths::audit_path(&home), user.uid));
-    let agent = Arc::new(agent::Agent::new(config, home, user, Box::new(var), real_spawn(trust), resolver, audit));
+    let agent = Arc::new(agent::Agent::new(config, home, user, real_spawn(trust), resolver, audit));
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(server::serve(agent, listener, stop_signal())).map_err(anyhow::Error::from)
 }
@@ -105,7 +105,7 @@ mod tests {
         std::fs::write(&file, "[profiles.work]\nserver_url = \"https://w.example.org\"\nemail = \"w@example.org\"\n")
             .unwrap();
         let profile = crate::config::Config::load(&file).unwrap().profile(Some("work")).unwrap();
-        let paths = crate::paths::ProfilePaths::with(&|_| None, dir.path(), &profile);
+        let paths = crate::paths::ProfilePaths::with(dir.path(), &profile);
         let user = User { uid: rustix::process::geteuid().as_raw(), groups: None };
         let trust = Trust { search: Some("/usr/bin:/bin".into()), user: user.clone(), exe: None, home: None };
         let worker = super::real_spawn(trust)(crate::session::Ctx {

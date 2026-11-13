@@ -60,10 +60,10 @@ pub fn run(
         r.problem("home", "HOME is not set to an absolute path")?;
         return Ok(1);
     };
-    match Config::load(&config_path(&env.var, &home)) {
+    match Config::load(&config_path(&home)) {
         Err(e) => r.problem("config", &format!("{e:#}"))?,
         Ok(config) => {
-            r.ok("config", &config_path(&env.var, &home).display().to_string())?;
+            r.ok("config", &config_path(&home).display().to_string())?;
             profile_checks(env, &config, profile, &home, pinentry, &mut r)?;
         }
     }
@@ -127,7 +127,7 @@ fn profile_checks(
         Ok(path) => r.ok("pinentry", &path)?,
         Err(e) => r.problem("pinentry", &format!("{}: {e}", profile.pinentry))?,
     }
-    let file = ProfilePaths::with(&env.var, home, &profile).policy;
+    let file = ProfilePaths::with(home, &profile).policy;
     let shown = file.display();
     match Store::new(&file, env.uid).read() {
         Ok(entries) => r.ok("policy", &format!("{shown}, {} entries", entries.len())),

@@ -113,3 +113,21 @@ fn a_bad_config_or_socket_directory_stops_it_before_serving() {
     std::fs::write(&file, "").expect("file");
     fails_with(home.path(), &file, "create");
 }
+
+#[test]
+fn the_config_comes_from_the_trusted_home_not_from_xdg_config_home() {
+    let (home, runtime) = dirs();
+    // A starter points XDG_CONFIG_HOME at a config of its own: it is never read.
+    let elsewhere = tempfile::tempdir().expect("xdg");
+    std::fs::create_dir_all(elsewhere.path().join("dybw")).expect("dir");
+    std::fs::write(elsewhere.path().join("dybw/config.toml"), "not = [valid\n").expect("config");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dybw-agent"))
+        .env("HOME", home.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_CONFIG_HOME", elsewhere.path())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start dybw-agent");
+    assert!(matches!(ask(runtime.path(), Op::StopAgent), Reply::Done));
+    assert!(child.wait().expect("wait").success());
+}

@@ -81,12 +81,12 @@ only says "see the agent log" is explained there.
 - No lookup by URI yet.
 - Items that ask for a master-password reprompt are denied until P4.3.
 - Organization items are readable.
-- The agent keeps its state and cache (credentials, device id, `policy.json`, the vault cache, `harnesses.toml`,
-  the audit log) under its trusted home (`~/.local/state/dybw`, `~/.cache/dybw`), never under `XDG_STATE_HOME` or
-  `XDG_CACHE_HOME`: the `XDG_*` of whoever started the agent no longer moves agent state (only `XDG_CONFIG_HOME`
-  still finds `config.toml`). Files an earlier build wrote under a custom `XDG_STATE_HOME` or `XDG_CACHE_HOME`
-  are not found: log in again, or move them.
-- An agent started on demand inherits the environment of the first caller: `XDG_*`, `RUST_LOG`, and the session
+- Every file of the agent lives under its trusted home: the config (`~/.config/dybw/config.toml`), the state
+  (credentials, device id, `policy.json`, `harnesses.toml`, the audit log, in `~/.local/state/dybw`) and the vault
+  cache (`~/.cache/dybw`). The `XDG_*` variables of whoever started the agent are ignored, so a starter cannot point
+  it at another server or pinentry; `dybw doctor` reads the same places. Files an earlier build wrote under a custom
+  `XDG_*` directory are not found: move them, or log in again.
+- An agent started on demand inherits the environment of the first caller: `RUST_LOG`, and the session
   variables the agent forwards to pinentry (`SESSION_ENV` of `dybw-native`: `DISPLAY`, `WAYLAND_DISPLAY`,
   `DBUS_SESSION_BUS_ADDRESS`, `XAUTHORITY`, `LANG`, `HOME` and so on). Start the first `dybw` from the GUI
   session, or run `dybw agent stop` after an agent was started from an ssh session.

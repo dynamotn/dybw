@@ -1,7 +1,6 @@
 //! The agent's shared state: the config, the per-profile workers, the clocks and the lock rules.
 
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -70,9 +69,6 @@ impl Clock for SystemClock {
     }
 }
 
-/// How the agent reads its environment; tests swap it.
-pub type EnvFn = Box<dyn Fn(&str) -> Option<OsString> + Send + Sync>;
-
 pub struct Agent {
     pub(crate) config: Config,
     pub(crate) home: PathBuf,
@@ -80,7 +76,6 @@ pub struct Agent {
     /// The uid every peer must have.
     pub(crate) uid: u32,
     pub(crate) clock: Arc<dyn Clock>,
-    pub(crate) var: EnvFn,
     pub(crate) read_timeout: Duration,
     pub(crate) drain_timeout: Duration,
     spawn: Spawn,
@@ -103,7 +98,6 @@ impl Agent {
         config: Config,
         home: PathBuf,
         user: User,
-        var: EnvFn,
         spawn: Spawn,
         resolver: Arc<Resolver>,
         audit: Arc<dyn Audit>,
@@ -116,7 +110,6 @@ impl Agent {
             uid: user.uid,
             user,
             clock,
-            var,
             read_timeout: READ_TIMEOUT,
             drain_timeout: DRAIN_TIMEOUT,
             spawn,
@@ -147,7 +140,7 @@ impl Agent {
         if let Some(w) = workers.get(&profile.name).filter(|w| w.is_alive()) {
             return Some(w.clone());
         }
-        let paths = ProfilePaths::with(&*self.var, &self.home, profile);
+        let paths = ProfilePaths::with(&self.home, profile);
         let w = Arc::new((self.spawn)(Ctx {
             profile: profile.clone(),
             paths,
@@ -514,11 +507,6 @@ pub(crate) mod testing {
     ) -> Rig {
         let file = dir.join("config.toml");
         std::fs::write(&file, CONFIG).unwrap();
-        // State and cache land under the home, which is `dir`; an inherited XDG variable must not move them.
-        let var = Box::new(|name: &str| match name {
-            "XDG_STATE_HOME" | "XDG_CACHE_HOME" => Some("/nonexistent/xdg".into()),
-            _ => None,
-        });
         let host = FakeHost::new();
         let spawn: Spawn = Box::new({
             let host = host.clone();
@@ -531,7 +519,7 @@ pub(crate) mod testing {
         let audit = Arc::new(Recorder::default());
         let user = User { uid: me(), groups: None };
         let config = Config::load(&file).unwrap();
-        let mut agent = Agent::new(config, dir.to_owned(), user, var, spawn, resolver, audit.clone());
+        let mut agent = Agent::new(config, dir.to_owned(), user, spawn, resolver, audit.clone());
         let clock = Arc::new(FakeClock(Mutex::new((SystemTime::now(), Instant::now()))));
         agent.clock = clock.clone();
         Rig { agent: Arc::new(agent), clock, host, tree, audit }
@@ -564,7 +552,7 @@ pub(crate) mod testing {
     /// The stored API key of a profile, as `dybw login` leaves it.
     pub fn seed_credentials(agent: &Agent, profile: &str) {
         let p = agent.config.profile(Some(profile)).unwrap();
-        let paths = ProfilePaths::with(&*agent.var, &agent.home, &p);
+        let paths = ProfilePaths::with(&agent.home, &p);
         let creds = Credentials {
             identity_origin: dybw_core::api::origin_of(&p.server_url).unwrap(),
             client_id: "user.0000".into(),

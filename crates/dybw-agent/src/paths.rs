@@ -1,14 +1,14 @@
-//! Where a profile keeps its files (profiles §1): the XDG layout under the trusted home. Only the shared config
-//! honours `XDG_CONFIG_HOME`; state and cache never follow the variables of whoever started the agent.
+//! Where a profile keeps its files (profiles §1): the XDG layout under the trusted home. No `XDG_*` variable is
+//! read: the agent inherits the environment of whoever started it, and that caller must not choose its config,
+//! state or cache.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::config::Profile;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfilePaths {
-    /// `$XDG_CONFIG_HOME/dybw/config.toml`, shared by every profile.
+    /// `<home>/.config/dybw/config.toml`, shared by every profile.
     pub config: PathBuf,
     /// `<home>/.local/state/dybw/profiles/<p>`.
     pub state: PathBuf,
@@ -26,14 +26,14 @@ impl ProfilePaths {
     /// `home` is the validated one from `trust()`, never the raw `HOME`.
     #[cfg(test)]
     pub fn from_env(profile: &Profile, home: &Path) -> Self {
-        Self::with(&|var| std::env::var_os(var), home, profile)
+        Self::with(home, profile)
     }
 
-    /// The locations under `home`; `var` only moves the shared config (when `XDG_CONFIG_HOME` is absolute).
-    pub fn with(var: &dyn Fn(&str) -> Option<OsString>, home: &Path, profile: &Profile) -> Self {
+    /// The locations under `home`.
+    pub fn with(home: &Path, profile: &Profile) -> Self {
         let state = home.join(".local/state/dybw/profiles").join(&profile.name);
         ProfilePaths {
-            config: config_path(var, home),
+            config: config_path(home),
             credentials: state.join("credentials"),
             policy: state.join("policy.json"),
             device: state.join("devices/dybw"),
@@ -41,10 +41,6 @@ impl ProfilePaths {
             state,
         }
     }
-}
-
-fn xdg_dir(var: &dyn Fn(&str) -> Option<OsString>, home: &Path, name: &str, fallback: &str) -> PathBuf {
-    var(name).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(fallback))
 }
 
 /// `<home>/.local/state/dybw/harnesses.toml`: harnesses to add to the built-in table.
@@ -59,9 +55,9 @@ pub fn audit_path(home: &Path) -> PathBuf {
     home.join(".local/state/dybw/audit.log")
 }
 
-/// `$XDG_CONFIG_HOME/dybw/config.toml`: the one file every profile shares, known before any profile is.
-pub fn config_path(var: &dyn Fn(&str) -> Option<OsString>, home: &Path) -> PathBuf {
-    xdg_dir(var, home, "XDG_CONFIG_HOME", ".config").join("dybw/config.toml")
+/// `<home>/.config/dybw/config.toml`: the one file every profile shares, known before any profile is.
+pub fn config_path(home: &Path) -> PathBuf {
+    home.join(".config/dybw/config.toml")
 }
 
 #[cfg(test)]
@@ -82,31 +78,17 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
-        move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| OsString::from(v))
-    }
-
     #[test]
-    fn only_the_config_follows_xdg() {
-        let vars = [("XDG_CONFIG_HOME", "/c"), ("XDG_STATE_HOME", "/s"), ("XDG_CACHE_HOME", "/k"), ("HOME", "/raw")];
-        let p = ProfilePaths::with(&env(&vars), Path::new("/h"), &test_profile("w"));
-        assert_eq!(p.config, Path::new("/c/dybw/config.toml"));
-        // State and cache ignore XDG_STATE_HOME and XDG_CACHE_HOME, which a caller can set.
+    fn everything_is_under_the_trusted_home() {
+        // Nothing reads XDG_* or the raw HOME: a caller can set them.
+        let p = ProfilePaths::with(Path::new("/h"), &test_profile("w"));
+        assert_eq!(p.config, Path::new("/h/.config/dybw/config.toml"));
         assert_eq!(p.state, Path::new("/h/.local/state/dybw/profiles/w"));
         assert_eq!(p.credentials, Path::new("/h/.local/state/dybw/profiles/w/credentials"));
         assert_eq!(p.policy, Path::new("/h/.local/state/dybw/profiles/w/policy.json"));
         assert_eq!(harnesses_path(Path::new("/h")), Path::new("/h/.local/state/dybw/harnesses.toml"));
         assert_eq!(audit_path(Path::new("/h")), Path::new("/h/.local/state/dybw/audit.log"));
         assert_eq!(p.device, Path::new("/h/.local/state/dybw/profiles/w/devices/dybw"));
-        assert_eq!(p.cache, Path::new("/h/.cache/dybw/profiles/w"));
-    }
-
-    #[test]
-    fn defaults_use_the_trusted_home_never_the_raw_one() {
-        let vars = [("XDG_CONFIG_HOME", "relative"), ("HOME", "/raw")];
-        let p = ProfilePaths::with(&env(&vars), Path::new("/h"), &test_profile("w"));
-        assert_eq!(p.config, Path::new("/h/.config/dybw/config.toml"));
-        assert_eq!(p.state, Path::new("/h/.local/state/dybw/profiles/w"));
         assert_eq!(p.cache, Path::new("/h/.cache/dybw/profiles/w"));
     }
 

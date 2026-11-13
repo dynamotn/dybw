@@ -68,7 +68,7 @@ mod tests {
     use super::*;
 
     fn paths(dir: &Path) -> ProfilePaths {
-        ProfilePaths::with(&|_| None, dir, &crate::paths::test_profile("p"))
+        ProfilePaths::with(dir, &crate::paths::test_profile("p"))
     }
 
     fn mine(p: &ProfilePaths) -> u32 {
