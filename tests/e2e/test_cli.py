@@ -141,6 +141,9 @@ def world(account, dybw_bin):
             pytest.fail(f"dybw {args} hung; agent log:\n{agent_log}\nstderr: {e.stderr}", pytrace=False)
 
     run.ids = seeded
+    run.root = root
+    run.env = env
+    run.bin = dybw_bin
     run.proxy = proxy
     run.log = root / "run/dybw/agent.log"
     yield run
