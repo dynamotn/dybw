@@ -18,11 +18,11 @@ fn err(error: AgentError) -> Reply {
 }
 
 fn state(dir: &std::path::Path, profile: &str, file: &str) -> std::path::PathBuf {
-    dir.join("state/dybw/profiles").join(profile).join(file)
+    dir.join(".local/state/dybw/profiles").join(profile).join(file)
 }
 
 fn cache(dir: &std::path::Path, profile: &str) -> std::path::PathBuf {
-    dir.join("cache/dybw/profiles").join(profile).join("sync.json")
+    dir.join(".cache/dybw/profiles").join(profile).join("sync.json")
 }
 
 fn mode(path: &std::path::Path) -> u32 {

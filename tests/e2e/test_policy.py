@@ -198,7 +198,7 @@ def test_the_audit_log_records_the_requests_without_a_value_or_a_name(world):
     verdicts = {row[8] for row in rows}
     assert {"remembered", "granted", "confirmed", "declined", "denied", "listed"} <= verdicts, verdicts
     assert {row[7] for row in rows if row[5] == "get" and row[2] == "invoker"} == {world.ids["login"]}
-    raw = (Path.home() / ".local/state/dybw/audit.log").read_text()
+    raw = (Path(world.env["HOME"]) / ".local/state/dybw/audit.log").read_text()
     for text in (r.stdout, raw):
         for secret in ("login-pw", "login-item", "login notes", "luser", "field-v1"):
             assert secret not in text, secret

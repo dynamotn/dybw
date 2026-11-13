@@ -738,23 +738,56 @@ fn policy_show_prints_one_escaped_row_per_entry() {
 
 #[test]
 fn policy_changes_send_their_action_and_succeed_on_done() {
-    let cases: [(&[&str], PolicyAction); 3] = [
+    let dir = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(dir.path()).unwrap();
+    let (sh, script, tool) = (dir.join("sh"), dir.join("a.sh"), dir.join("x"));
+    for f in [&sh, &script, &tool] {
+        std::fs::write(f, "x").unwrap();
+    }
+    let p = |f: &Path| f.to_string_lossy().into_owned();
+    let cases: [(Vec<String>, PolicyAction); 3] = [
         (
-            &["policy", "allow", "/bin/sh", "--script", "/opt/a.sh"],
-            PolicyAction::Allow { invoker: s("/bin/sh"), script: Some(s("/opt/a.sh")) },
+            vec![s("policy"), s("allow"), p(&sh), s("--script"), p(&script)],
+            PolicyAction::Allow { invoker: p(&sh), script: Some(p(&script)) },
         ),
         (
-            &["-p", "home", "policy", "deny", "/usr/bin/x"],
-            PolicyAction::Deny { invoker: s("/usr/bin/x"), script: None },
+            vec![s("-p"), s("home"), s("policy"), s("deny"), p(&tool)],
+            PolicyAction::Deny { invoker: p(&tool), script: None },
         ),
-        (&["policy", "forget", "/opt/a.sh"], PolicyAction::Forget { invoker: s("/opt/a.sh") }),
+        (vec![s("policy"), s("forget"), s("/opt/a.sh")], PolicyAction::Forget { invoker: s("/opt/a.sh") }),
     ];
     for (args, action) in cases {
-        let ((code, out, _), op) = one(args, Reply::Done);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let ((code, out, _), op) = one(&argv, Reply::Done);
         assert_eq!((code, out.as_str()), (0, ""), "{args:?}");
-        let profile = args.contains(&"home").then(|| s("home"));
+        let profile = args.contains(&s("home")).then(|| s("home"));
         assert_eq!(op, Op::Policy { profile, action });
     }
+}
+
+#[test]
+fn policy_allow_sends_canonical_paths_and_a_missing_file_is_a_cli_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = std::fs::canonicalize(dir.path()).unwrap().join("real.sh");
+    std::fs::write(&real, "x").unwrap();
+    let link = dir.path().join("link.sh");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let (link, real) = (link.to_string_lossy().into_owned(), real.to_string_lossy().into_owned());
+    let ((code, _, _), op) = one(&["policy", "allow", "/bin/sh", "--script", &link], Reply::Done);
+    assert_eq!(code, 0);
+    let Op::Policy { action: PolicyAction::Allow { invoker, script }, .. } = op else { panic!("{op:?}") };
+    assert!(Path::new(&invoker).is_absolute());
+    assert_eq!(script, Some(real));
+    // No agent is running: the command must fail before it looks for one.
+    let base = base();
+    for args in [["policy", "allow", "no/such/prog"], ["policy", "deny", "no/such/prog"]] {
+        let (code, _, err) = run_in(&env_in(base.path(), None, None), &args);
+        assert_eq!(code, 1, "{args:?}");
+        assert!(err.contains("cannot find no/such/prog"), "{err}");
+    }
+    let (code, _, err) =
+        run_in(&env_in(base.path(), None, None), &["policy", "allow", "/bin/sh", "--script", "gone.sh"]);
+    assert!((code, err.contains("cannot find gone.sh")) == (1, true), "{err}");
 }
 
 #[test]

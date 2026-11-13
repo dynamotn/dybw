@@ -142,6 +142,12 @@ enum PolicyCmd {
     Forget { invoker: String },
 }
 
+/// The absolute, symlink-free path the agent sees a program or script under; a relative path means nothing to it.
+fn canonical(path: &str) -> Result<String, Fail> {
+    let found = std::fs::canonicalize(path).map_err(|e| Fail::Log(format!("cannot find {path}: {e}")))?;
+    Ok(found.to_string_lossy().into_owned())
+}
+
 /// What `list` and `search` show.
 #[derive(Args, Debug)]
 struct Shape {
@@ -308,8 +314,14 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
         Cmd::Policy { command } => {
             let action = match command {
                 PolicyCmd::Show => PolicyAction::Show,
-                PolicyCmd::Allow { invoker, script } => PolicyAction::Allow { invoker, script },
-                PolicyCmd::Deny { invoker, script } => PolicyAction::Deny { invoker, script },
+                PolicyCmd::Allow { invoker, script } => PolicyAction::Allow {
+                    invoker: canonical(&invoker)?,
+                    script: script.as_deref().map(canonical).transpose()?,
+                },
+                PolicyCmd::Deny { invoker, script } => PolicyAction::Deny {
+                    invoker: canonical(&invoker)?,
+                    script: script.as_deref().map(canonical).transpose()?,
+                },
                 PolicyCmd::Forget { invoker } => PolicyAction::Forget { invoker },
             };
             let shown = action == PolicyAction::Show;
@@ -329,7 +341,7 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
         Cmd::Audit { ai, n } => audit(env, ai, n, out),
         Cmd::Doctor => {
             let me = doctor::home_of(env)
-                .and_then(|home| dybw_agent::caller::this_process(&dybw_agent::paths::harnesses_path(&env.var, &home)));
+                .and_then(|home| dybw_agent::caller::this_process(&dybw_agent::paths::harnesses_path(&home)));
             let pinentry = |p: &str| dybw_agent::trust::pinentry_of(p).map_err(|e| format!("{e:#}"));
             Ok(doctor::run(env, profile.as_deref(), me, &pinentry, out)?)
         }

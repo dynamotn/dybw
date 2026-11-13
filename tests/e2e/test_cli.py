@@ -113,18 +113,19 @@ def world(account, dybw_bin):
     ssh = next((c for c in account.sync()["ciphers"] if c["id"] == seeded["ssh"]), None)
     assert ssh and ssh["type"] == 5 and ssh.get("sshKey"), f"Vaultwarden does not return the SSH key item: {ssh}"
     root = Path(tempfile.mkdtemp(prefix="d", dir="/tmp"))
-    for d in ("config/dybw", "state", "cache", "run"):
+    for d in ("config/dybw", "home", "run"):
         (root / d).mkdir(parents=True)
     (root / "run").chmod(0o700)
+    (root / "home").chmod(0o700)
     (root / "config/dybw/config.toml").write_text(
         f'default = "e2e"\n[profiles.e2e]\nserver_url = "http://127.0.0.1:{PROXY_PORT}"\n'
         f'email = "{account.email}"\npinentry = "/usr/local/bin/fake-pinentry"\nlock_timeout_minutes = 0\n'
     )
     env = {
         **os.environ,
+        # State and cache live under the agent's trusted home; only the config follows XDG.
+        "HOME": str(root / "home"),
         "XDG_CONFIG_HOME": str(root / "config"),
-        "XDG_STATE_HOME": str(root / "state"),
-        "XDG_CACHE_HOME": str(root / "cache"),
         "XDG_RUNTIME_DIR": str(root / "run"),
     }
     env.pop("DYBW_PROFILE", None)

@@ -1,4 +1,5 @@
-//! Where a profile keeps its files (profiles §1): XDG locations, with the XDG defaults on macOS too.
+//! Where a profile keeps its files (profiles §1): the XDG layout under the trusted home. Only the shared config
+//! honours `XDG_CONFIG_HOME`; state and cache never follow the variables of whoever started the agent.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use crate::config::Profile;
 pub struct ProfilePaths {
     /// `$XDG_CONFIG_HOME/dybw/config.toml`, shared by every profile.
     pub config: PathBuf,
-    /// `$XDG_STATE_HOME/dybw/profiles/<p>`.
+    /// `<home>/.local/state/dybw/profiles/<p>`.
     pub state: PathBuf,
     /// `<state>/credentials`.
     pub credentials: PathBuf,
@@ -17,7 +18,7 @@ pub struct ProfilePaths {
     pub policy: PathBuf,
     /// `<state>/devices/dybw`.
     pub device: PathBuf,
-    /// `$XDG_CACHE_HOME/dybw/profiles/<p>`.
+    /// `<home>/.cache/dybw/profiles/<p>`.
     pub cache: PathBuf,
 }
 
@@ -28,17 +29,15 @@ impl ProfilePaths {
         Self::with(&|var| std::env::var_os(var), home, profile)
     }
 
-    /// The locations for an environment read through `var`. An XDG variable counts only when absolute; the
-    /// default is under `home`.
+    /// The locations under `home`; `var` only moves the shared config (when `XDG_CONFIG_HOME` is absolute).
     pub fn with(var: &dyn Fn(&str) -> Option<OsString>, home: &Path, profile: &Profile) -> Self {
-        let xdg = |name: &str, fallback: &str| xdg_dir(var, home, name, fallback);
-        let state = xdg("XDG_STATE_HOME", ".local/state").join("dybw/profiles").join(&profile.name);
+        let state = home.join(".local/state/dybw/profiles").join(&profile.name);
         ProfilePaths {
             config: config_path(var, home),
             credentials: state.join("credentials"),
             policy: state.join("policy.json"),
             device: state.join("devices/dybw"),
-            cache: xdg("XDG_CACHE_HOME", ".cache").join("dybw/profiles").join(&profile.name),
+            cache: home.join(".cache/dybw/profiles").join(&profile.name),
             state,
         }
     }
@@ -48,9 +47,9 @@ fn xdg_dir(var: &dyn Fn(&str) -> Option<OsString>, home: &Path, name: &str, fall
     var(name).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(fallback))
 }
 
-/// `$XDG_STATE_HOME/dybw/harnesses.toml`: harnesses to add to the built-in table.
-pub fn harnesses_path(var: &dyn Fn(&str) -> Option<OsString>, home: &Path) -> PathBuf {
-    xdg_dir(var, home, "XDG_STATE_HOME", ".local/state").join("dybw/harnesses.toml")
+/// `<home>/.local/state/dybw/harnesses.toml`: harnesses to add to the built-in table.
+pub fn harnesses_path(home: &Path) -> PathBuf {
+    home.join(".local/state/dybw/harnesses.toml")
 }
 
 /// `<home>/.local/state/dybw/audit.log`: every value request and policy change, for every profile. Under the
@@ -88,18 +87,18 @@ mod tests {
     }
 
     #[test]
-    fn xdg_variables_win() {
+    fn only_the_config_follows_xdg() {
         let vars = [("XDG_CONFIG_HOME", "/c"), ("XDG_STATE_HOME", "/s"), ("XDG_CACHE_HOME", "/k"), ("HOME", "/raw")];
         let p = ProfilePaths::with(&env(&vars), Path::new("/h"), &test_profile("w"));
         assert_eq!(p.config, Path::new("/c/dybw/config.toml"));
-        assert_eq!(p.state, Path::new("/s/dybw/profiles/w"));
-        assert_eq!(p.credentials, Path::new("/s/dybw/profiles/w/credentials"));
-        assert_eq!(p.policy, Path::new("/s/dybw/profiles/w/policy.json"));
-        assert_eq!(harnesses_path(&env(&vars), Path::new("/h")), Path::new("/s/dybw/harnesses.toml"));
-        // Not under XDG_STATE_HOME, which a caller can set.
+        // State and cache ignore XDG_STATE_HOME and XDG_CACHE_HOME, which a caller can set.
+        assert_eq!(p.state, Path::new("/h/.local/state/dybw/profiles/w"));
+        assert_eq!(p.credentials, Path::new("/h/.local/state/dybw/profiles/w/credentials"));
+        assert_eq!(p.policy, Path::new("/h/.local/state/dybw/profiles/w/policy.json"));
+        assert_eq!(harnesses_path(Path::new("/h")), Path::new("/h/.local/state/dybw/harnesses.toml"));
         assert_eq!(audit_path(Path::new("/h")), Path::new("/h/.local/state/dybw/audit.log"));
-        assert_eq!(p.device, Path::new("/s/dybw/profiles/w/devices/dybw"));
-        assert_eq!(p.cache, Path::new("/k/dybw/profiles/w"));
+        assert_eq!(p.device, Path::new("/h/.local/state/dybw/profiles/w/devices/dybw"));
+        assert_eq!(p.cache, Path::new("/h/.cache/dybw/profiles/w"));
     }
 
     #[test]

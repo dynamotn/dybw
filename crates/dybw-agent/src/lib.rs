@@ -56,7 +56,7 @@ pub fn run() -> anyhow::Result<()> {
     let user = trust.user.clone();
     // The lock file stays held until the process ends.
     let (listener, _lock) = socket::bind(&socket::socket_dir(&var, user.uid), user.uid)?;
-    let harnesses = caller::Harnesses::load(&paths::harnesses_path(&var, &home));
+    let harnesses = caller::Harnesses::load(&paths::harnesses_path(&home));
     let resolver = Arc::new(caller::Resolver::new(Arc::new(dybw_peer::Os), harnesses));
     let audit = Arc::new(audit::FileAudit::new(&paths::audit_path(&home), user.uid));
     let agent = Arc::new(agent::Agent::new(config, home, user, Box::new(var), real_spawn(trust), resolver, audit));
