@@ -465,6 +465,7 @@ dependencies = [
  "const-oid",
  "crypto-common",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -524,7 +525,7 @@ dependencies = [
 [[package]]
 name = "dybw-core"
 version = "0.1.0"
-source = "git+https://gitlab.com/dynamo-tools/dybw-core.git?rev=08194c3a9a0c5a05a07a15f869dc9096733808d1#08194c3a9a0c5a05a07a15f869dc9096733808d1"
+source = "git+https://gitlab.com/dynamo-tools/dybw-core.git?rev=4c5ae763a903f0877d418ffcc74fc72fc5707f6d#4c5ae763a903f0877d418ffcc74fc72fc5707f6d"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -540,6 +541,7 @@ dependencies = [
  "pbkdf2",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "thiserror",
  "time",
@@ -551,7 +553,7 @@ dependencies = [
 [[package]]
 name = "dybw-native"
 version = "0.1.0"
-source = "git+https://gitlab.com/dynamo-tools/dybw-core.git?rev=08194c3a9a0c5a05a07a15f869dc9096733808d1#08194c3a9a0c5a05a07a15f869dc9096733808d1"
+source = "git+https://gitlab.com/dynamo-tools/dybw-core.git?rev=4c5ae763a903f0877d418ffcc74fc72fc5707f6d#4c5ae763a903f0877d418ffcc74fc72fc5707f6d"
 dependencies = [
  "anyhow",
  "dybw-core",
