@@ -432,7 +432,8 @@ async fn add_creates_a_login_whose_values_come_from_the_pinentry_only() {
     {
         let world = rig.host.world();
         assert!(world.confirmed[0].ends_with(
-            "(dybw add) to add the login \"New\" for the user \"robot\" in the folder \"Work ünï 😀\"? (asked for every change)"
+            "(dybw add) to add the login \"New\" for the user \"robot\" in the folder \"Work ünï 😀\" with the URIs \"https://new.example.invalid\"? (asked for every \
+         change)"
         ));
         assert_eq!(world.prompts[1..], ["New password:", "Notes:", "TOTP key:"]);
         let sent = world.bodies[0].to_string();
@@ -585,6 +586,7 @@ async fn a_reprompt_item_needs_the_master_password_before_any_value() {
         got,
         [
             ("get", Verdict::Confirmed),
+            ("get", Verdict::Reprompted),
             ("code", Verdict::Confirmed),
             ("code", Verdict::Denied),
             ("history", Verdict::Confirmed),
@@ -615,7 +617,15 @@ async fn a_reprompt_item_needs_the_master_password_before_any_change() {
     let prompts = rig.host.world().prompts.clone();
     assert_eq!(prompts[prompts.len() - 2..], ["Master password:", "New password:"]);
     let got: Vec<_> = audited(&rig).into_iter().map(|(op, _, v)| (op, v)).collect();
-    assert_eq!(got, [("edit", Verdict::Denied), ("remove", Verdict::Declined), ("edit", Verdict::Confirmed)]);
+    assert_eq!(
+        got,
+        [
+            ("edit", Verdict::Denied),
+            ("remove", Verdict::Declined),
+            ("edit", Verdict::Reprompted),
+            ("edit", Verdict::Confirmed)
+        ]
+    );
 }
 
 #[tokio::test]
@@ -628,4 +638,82 @@ async fn a_reprompt_check_that_cannot_run_fails_closed() {
     rig.host.answer(Answer::Text(PASSWORD));
     assert_eq!(rig.agent.dispatch(get_op("x1", Select::Password)).await, err(AgentError::Internal));
     assert_eq!(audited(&rig).last().unwrap().2, Verdict::Failed);
+}
+
+#[tokio::test]
+async fn a_code_is_made_when_the_user_has_answered_not_when_it_was_asked_for() {
+    let (_dir, rig) = setup(|_| {}).await;
+    rig.clock.set_wall(at(PERIOD_START + 2));
+    rig.host.world().confirms.push_back(Answer::Held);
+    let agent = rig.agent.clone();
+    let pending = tokio::spawn(async move { agent.dispatch(code_op("c1", false)).await });
+    until(|| rig.host.world().confirmed.len() == 1).await;
+    // The user takes 40 s to answer: the code is the one of the period they answered in.
+    rig.clock.advance(Duration::from_secs(40), Duration::from_secs(40));
+    rig.host.world().release.notify_one();
+    let Reply::Code { code, seconds_left } = pending.await.unwrap() else { panic!() };
+    assert_eq!((code.expose(), seconds_left), (code_at(PERIOD_START + 42).as_str(), 18));
+}
+
+#[tokio::test]
+async fn a_reprompt_password_that_opens_another_user_key_is_refused() {
+    let (_dir, rig) = setup(reprompting("x1")).await;
+    // The copy now wraps another user key under the same master password (as after a key rotation elsewhere).
+    let kdf = dybw_core::crypto::KdfParams::Pbkdf2 { iterations: 600_000 };
+    let runner = dybw_native::ports::kdf::BlockingArgon2;
+    let master = dybw_core::crypto::derive_master_key(PASSWORD, "pbkdf2@vectors.invalid", kdf, &runner).await.unwrap();
+    let other = SymmetricKey::generate(&OsRandom).unwrap();
+    let format = dybw_core::crypto::ContentFormat::LegacyKey;
+    let wrapped = SymmetricKey::stretch(&master).encrypt_as(&other.to_bytes(), format, &OsRandom).unwrap();
+    rig.host.world().profile = Some(json!({ "id": "u1", "key": wrapped }).to_string());
+    assert_eq!(rig.agent.dispatch(Op::Sync { target: dybw_proto::Target::Profile("work".into()) }).await, Reply::Done);
+    rig.host.allow();
+    rig.host.answer(Answer::Text(PASSWORD));
+    assert_eq!(rig.agent.dispatch(get_op("x1", Select::Password)).await, err(AgentError::Denied));
+    assert_eq!(audited(&rig).last().unwrap().2, Verdict::Denied);
+}
+
+#[tokio::test]
+async fn an_organization_login_that_hides_its_password_gives_no_password_totp_or_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(dir.path());
+    let mut vault: Value = serde_json::from_str(include_str!("../tests/fixtures/org-vault.json")).unwrap();
+    for c in vault["ciphers"].as_array_mut().unwrap() {
+        c["reprompt"] = json!(0);
+        if c["id"] == "o1" {
+            c["viewPassword"] = json!(false);
+        }
+    }
+    rig.host.vault(&vault.to_string());
+    crate::agent::testing::seed_credentials(&rig.agent, "org");
+    rig.host.answer(Answer::Text("vectors-org-password"));
+    assert_eq!(rig.agent.dispatch(Op::Unlock { profile: Some("org".into()) }).await, Reply::Done);
+    let org = |mut op: Op| {
+        if let Op::Get { profile, .. } | Op::Code { profile, .. } | Op::History { profile, .. } = &mut op {
+            *profile = Some("org".into());
+        }
+        op
+    };
+    let hidden = [
+        get_op("o1", Select::Password),
+        get_op("o1", Select::Field("password".into())),
+        get_op("o1", Select::Field("totp".into())),
+        get_op("o1", Select::Full),
+        get_op("o1", Select::Raw),
+        history_op("o1"),
+        code_op("o1", false),
+    ];
+    for op in hidden {
+        rig.host.allow();
+        assert_eq!(rig.agent.dispatch(org(op)).await, err(AgentError::Denied));
+    }
+    assert!(rig.host.world().confirmed.is_empty(), "refused before any question");
+    assert_eq!(rig.agent.opens("org").await, 0);
+    assert!(audited(&rig).iter().all(|(_, item, v)| item.as_deref() == Some("o1") && *v == Verdict::Denied));
+    // What the organization shows is still given.
+    rig.host.world().confirms.clear();
+    rig.host.allow();
+    assert!(matches!(rig.agent.dispatch(org(get_op("o1", Select::ListFields))).await, Reply::FieldNames { .. }));
+    rig.host.allow();
+    assert_eq!(text(rig.agent.dispatch(org(get_op("o1", Select::Field("user".into())))).await), "me@example.invalid");
 }

@@ -118,10 +118,10 @@ fn label(part: Part) -> (&'static str, &'static str) {
 fn question(ctx: &Ctx, caller: &Caller, write: &Write, planned: &Planned) -> String {
     let name = tidy(&planned.name);
     let what = match write {
-        Write::Add { user, folder, .. } => {
+        Write::Add { user, folder, uris, .. } => {
             let user = user.as_deref().map(|u| format!(" for the user \"{}\"", tidy(u))).unwrap_or_default();
             let folder = folder.as_deref().map(|f| format!(" in the folder \"{}\"", tidy(f))).unwrap_or_default();
-            format!("add the login \"{name}\"{user}{folder}")
+            format!("add the login \"{name}\"{user}{folder}{}", uri_list(uris))
         }
         Write::Edit { ask, .. } => {
             let parts: Vec<_> = ask.iter().map(|p| label(*p).1).collect();
@@ -129,7 +129,7 @@ fn question(ctx: &Ctx, caller: &Caller, write: &Write, planned: &Planned) -> Str
         }
         Write::Remove { .. } if !planned.markers.is_empty() => format!(
             "move the item \"{name}\" to the trash; it is marked for {}, whose tools lose it",
-            tidy(&planned.markers.join(", "))
+            policy::shown(&planned.markers.join(", "), 200)
         ),
         Write::Remove { .. } => format!("move the item \"{name}\" to the trash"),
     };
@@ -139,6 +139,20 @@ fn question(ctx: &Ctx, caller: &Caller, write: &Write, planned: &Planned) -> Str
         policy::who(caller),
         write.op()
     )
+}
+
+/// How many URIs a question names; the others are counted.
+const URIS_SHOWN: usize = 3;
+
+/// The URIs a new login gets, for its question: each on one line and cut, the first few and how many more.
+fn uri_list(uris: &[String]) -> String {
+    if uris.is_empty() {
+        return String::new();
+    }
+    let shown: Vec<_> = uris.iter().take(URIS_SHOWN).map(|u| format!("\"{}\"", tidy(u))).collect();
+    let more = uris.len().saturating_sub(URIS_SHOWN);
+    let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+    format!(" with the URIs {}{more}", shown.join(", "))
 }
 
 /// The new values, each from the pinentry. A TOTP key that gives no code is refused here, before anything is sent.
@@ -222,14 +236,20 @@ async fn send<H: Host>(
     write: &Write,
     planned: &Planned,
     values: &[(Part, Zeroizing<String>)],
+    still: &Recheck,
 ) -> Result<Option<String>, AgentError> {
     let target = shared.state.borrow().slot.as_ref().map(|s| (s.origin.clone(), s.urls.clone()));
     let Some((origin, urls)) = target else { return Err(AgentError::Locked) };
     // One login, unlock, sync or write at a time.
     let _op = shared.op.lock().await;
+    // The wait for another operation may have been long: the peer must still be the one that asked.
+    if !still.holds() {
+        tracing::warn!(profile = %ctx.profile.name, "the caller changed while the write waited its turn");
+        return Err(AgentError::Denied);
+    }
     let (mut api, fresh) = session::connect(host, ctx, &origin, &urls).await?;
     install(shared, ctx, fresh).await;
-    let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let now_ms = i64::try_from(now.as_millis()).unwrap_or(i64::MAX);
     let body = with_vault(shared, |v| body(v, write, planned, values, now_ms))?;
     let sent = |e: ApiError| if e.is_out_of_date() { AgentError::OutOfDate } else { session::map_api(&e) };
@@ -300,11 +320,28 @@ pub(super) async fn write<H: Host>(
     {
         return end(Verdict::Denied, e);
     }
-    match send(shared, host, ctx, &write, &planned, &values).await {
+    match send(shared, host, ctx, &write, &planned, &values, still).await {
         Ok(id) => {
             audit(ctx, caller, op, id.as_deref(), Verdict::Confirmed);
             Reply::Done
         }
+        Err(AgentError::Denied) => end(Verdict::Denied, AgentError::Denied),
         Err(e) => end(Verdict::Failed, e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_question_names_the_first_uris_and_counts_the_others() {
+        let uris = |n: usize| (1..=n).map(|i| format!("https://{i}.invalid\nx")).collect::<Vec<_>>();
+        assert_eq!(uri_list(&[]), "");
+        assert_eq!(uri_list(&uris(1)), " with the URIs \"https://1.invalid\u{fffd}x\"");
+        assert_eq!(
+            uri_list(&uris(5)),
+            " with the URIs \"https://1.invalid\u{fffd}x\", \"https://2.invalid\u{fffd}x\", \"https://3.invalid\u{fffd}x\" and 2 more"
+        );
     }
 }

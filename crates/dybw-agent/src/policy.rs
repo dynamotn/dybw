@@ -66,6 +66,8 @@ pub enum Verdict {
     Failed,
     /// A names-only request (`list`, `search`) answered.
     Listed,
+    /// The master password asked again for an item that needs it (ADR 0025) was right.
+    Reprompted,
 }
 
 /// One decision on a value or a policy change, with no value in it.

@@ -17,7 +17,7 @@ use crate::paths::ProfilePaths;
 use crate::policy::{Audit, AuditEvent, Verdict};
 use crate::read::Lookup;
 use crate::session::Ctx;
-use crate::worker::{Cmd, Read, Recheck, Worker, Write, op_of};
+use crate::worker::{Cmd, Now, Read, Recheck, Worker, Write, op_of};
 
 /// How often the idle and sleep checks run.
 pub const TICK: Duration = Duration::from_secs(30);
@@ -336,8 +336,7 @@ impl Agent {
             }
             Op::Code { profile, needle, user, folder, ignorecase, next } => {
                 let find = Lookup { needle, user, folder, ignorecase };
-                let wall = self.clock.wall();
-                let cmd = Cmd::Code { find, next, wall, caller: caller(), still: still() };
+                let cmd = Cmd::Code { find, next, now: Now(self.clock.clone()), caller: caller(), still: still() };
                 self.on_unlocked(profile.as_deref(), cmd, ai).await
             }
             Op::Add { profile, name, user, uris, folder, ask } => {

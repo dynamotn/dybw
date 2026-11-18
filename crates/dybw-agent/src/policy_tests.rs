@@ -218,7 +218,7 @@ async fn a_grant_never_satisfies_a_reprompt() {
     rig.host.answer(Answer::Text(crate::host::fake::PASSWORD));
     let reply = rig.agent.dispatch_as(get_op("c1", Select::Password), tool("/opt/a.sh", "h1")).await;
     assert_eq!(text(reply), "pw-ünï-😀");
-    assert_eq!(verdicts(&rig)[1..], [Verdict::Granted, Verdict::Declined, Verdict::Granted]);
+    assert_eq!(verdicts(&rig)[1..], [Verdict::Granted, Verdict::Declined, Verdict::Granted, Verdict::Reprompted]);
 }
 
 #[tokio::test]
@@ -770,4 +770,20 @@ async fn a_detached_program_is_never_offered_always_and_uses_only_a_detached_gra
     write(&[entry(true)]);
     assert_eq!(text(password(&rig, loose()).await), "the note's text");
     assert_eq!(rig.host.world().confirmed.len(), 2, "the detached grant lets it through");
+}
+
+#[tokio::test]
+async fn a_peer_that_goes_while_a_write_waits_its_turn_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    // Three checks of a remove: before the request, after the answers (worker), and once the write has its turn.
+    let rig = rig_with(dir.path(), |tree| Arc::new(Flips(tree, Default::default(), 2)));
+    let mut vault: Value = serde_json::from_str(VAULT).unwrap();
+    vault["ciphers"].as_array_mut().unwrap().iter_mut().for_each(|c| c["reprompt"] = json!(0));
+    rig.host.vault(&vault.to_string());
+    unlock(&rig.agent, &rig.host, "work").await;
+    rig.host.allow();
+    let remove = Op::Remove { profile: Some("work".into()), needle: NOTE.into(), user: None, folder: None };
+    assert_eq!(rig.agent.dispatch(remove).await, err(AgentError::Denied));
+    assert_eq!(rig.host.world().count("/delete"), 0, "nothing was sent");
+    assert_eq!(verdicts(&rig), [Verdict::Denied]);
 }

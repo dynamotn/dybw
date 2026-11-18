@@ -57,6 +57,7 @@ fn verdict_name(v: Verdict) -> &'static str {
         Verdict::Denied => "denied",
         Verdict::Failed => "failed",
         Verdict::Listed => "listed",
+        Verdict::Reprompted => "reprompted",
     }
 }
 

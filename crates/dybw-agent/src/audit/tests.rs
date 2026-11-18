@@ -53,18 +53,21 @@ fn a_decision_is_one_json_line_without_a_value_or_a_name() {
     audit.record(event(Caller::Ai { harness: "claude".into(), via: Via::Ancestry }, Verdict::Denied));
     let peer = Some("/tmp/x/dybw".into());
     audit.record(event(Caller::Unknown { why: "no process above dybw (orphan)".into(), peer }, Verdict::Declined));
-    for verdict in [Verdict::Granted, Verdict::Confirmed, Verdict::Failed, Verdict::Listed] {
+    for verdict in [Verdict::Granted, Verdict::Confirmed, Verdict::Failed, Verdict::Listed, Verdict::Reprompted] {
         audit.record(event(tool(), verdict));
     }
     let path = dir.path().join("state/dybw/audit.log");
     let text = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(text.lines().count(), 7);
+    assert_eq!(text.lines().count(), 8);
     assert!(!text.contains("secret-hash"), "no hash: {text}");
     assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     let log = read(&path, me()).unwrap();
     assert_eq!(log.skipped, 0);
     let verdicts: Vec<_> = log.entries.iter().map(|e| e.verdict.as_str()).collect();
-    assert_eq!(verdicts, ["remembered", "denied", "declined", "granted", "confirmed", "failed", "listed"]);
+    assert_eq!(
+        verdicts,
+        ["remembered", "denied", "declined", "granted", "confirmed", "failed", "listed", "reprompted"]
+    );
     assert_eq!(
         log.entries[0],
         Entry {

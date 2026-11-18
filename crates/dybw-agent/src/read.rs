@@ -32,6 +32,9 @@ pub struct Found {
     pub user: Option<String>,
     /// The cipher asks for the master password again (`reprompt`, a plain field) before any value or change.
     pub reprompt: bool,
+    /// A login whose organization hides its password (`viewPassword: false`): its password, TOTP key and history are
+    /// never given, as Bitwarden's clients hide them.
+    pub hidden: bool,
 }
 
 // Opened items so far on this thread, for tests of the value gate (a worker is one thread).
@@ -125,6 +128,7 @@ pub fn find(vault: &UnlockedVault, q: &Lookup) -> Result<Found, AgentError> {
         name: s.name.to_string(),
         user: s.user.as_deref().cloned(),
         reprompt: c.get("reprompt").and_then(Value::as_u64).is_some_and(|r| r != 0),
+        hidden: s.kind == 1 && c.get("viewPassword") == Some(&Value::Bool(false)),
     };
     let rows = summaries(vault);
     if let Some(row) = rows.iter().find(|(_, s)| s.id == q.needle) {

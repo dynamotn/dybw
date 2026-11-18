@@ -15,7 +15,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use dybw_core::profile::UnlockedVault;
 use dybw_core::totp::TotpKey;
@@ -95,11 +95,11 @@ pub enum Cmd {
         caller: Caller,
         still: Recheck,
     },
-    /// The TOTP code of one item at `wall`, under the same rule.
+    /// The TOTP code of one item, at the time it is made, under the same rule.
     Code {
         find: Lookup,
         next: bool,
-        wall: SystemTime,
+        now: Now,
         caller: Caller,
         still: Recheck,
     },
@@ -291,7 +291,7 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
         }
         Cmd::Get { find, select, caller, still } => Long::Read(find, Read::Get(select), caller, still),
         Cmd::History { find, caller, still } => Long::Read(find, Read::History, caller, still),
-        Cmd::Code { find, next, wall, caller, still } => Long::Read(find, Read::Code { next, wall }, caller, still),
+        Cmd::Code { find, next, now, caller, still } => Long::Read(find, Read::Code { next, now }, caller, still),
         Cmd::Write { write, caller, still } => Long::Write(write, caller, still),
         Cmd::Policy { action, caller, still } => Long::Policy(action, caller, still),
         #[cfg(test)]
@@ -436,11 +436,23 @@ fn tidy(s: &str) -> String {
 pub enum Read {
     Get(Select),
     History,
-    /// The TOTP code at `wall`; with `next`, the next one when fewer than [`NEXT_UNDER`] seconds are left.
+    /// The TOTP code at the time it is made; with `next`, the next one when fewer than [`NEXT_UNDER`] seconds are
+    /// left.
     Code {
         next: bool,
-        wall: SystemTime,
+        now: Now,
     },
+}
+
+/// The agent's clock, read when a code is made rather than when its request came in: the user may have taken a
+/// while to answer.
+#[derive(Clone)]
+pub struct Now(pub std::sync::Arc<dyn crate::agent::Clock>);
+
+impl std::fmt::Debug for Now {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Now")
+    }
 }
 
 /// `dybw code --next` waits for the next code when the current one has fewer seconds left than this (profiles §7).
@@ -577,7 +589,10 @@ async fn reprompt<H: Host>(
     let (verdict, why) = match session::ask(host, "Master password:", &description, None).await {
         Err(e) => (Verdict::Declined, e),
         Ok(password) => match session::key_id_of(ctx, &origin, account, password).await {
-            Ok(Some(id)) if id == unlocked => return Ok(()),
+            Ok(Some(id)) if id == unlocked => {
+                audit(ctx, caller, op, Some(&found.id), Verdict::Reprompted);
+                return Ok(());
+            }
             Ok(_) => (Verdict::Denied, AgentError::Denied),
             Err(e) => (Verdict::Failed, e),
         },
@@ -606,6 +621,11 @@ async fn get<H: Host>(
     };
     // TODO(core): field_names, a names-only decrypt; until then `--list-fields` opens the whole item, so it is a
     // value request like any other.
+    if found.hidden && shows_password(&read) {
+        tracing::warn!(profile = %ctx.profile.name, id = %found.id, "denied: the organization hides this item's password");
+        audit(ctx, caller, op_of(&read), Some(&found.id), Verdict::Denied);
+        return error(AgentError::Denied);
+    }
     if let Err(e) = gate(shared, host, ctx, caller, &found, &read).await {
         return error(e);
     }
@@ -621,10 +641,10 @@ async fn get<H: Host>(
         audit(ctx, caller, op_of(&read), Some(&found.id), Verdict::Denied);
         return error(AgentError::Denied);
     }
-    if let Read::Code { next, wall } = read {
+    if let Read::Code { next, now } = read {
         let key = with_vault(shared, |v| same_item(ctx, v, &found).and_then(|()| read::totp(v, &found.id)));
         return match key {
-            Ok(key) => code(&key, wall, next).await,
+            Ok(key) => code(&key, &now, next).await,
             Err(e) => error(e),
         };
     }
@@ -638,6 +658,15 @@ async fn get<H: Host>(
     with_vault(shared, open).unwrap_or_else(error)
 }
 
+/// Whether `read` gives a login's password, TOTP key or history, or the whole item (which holds them).
+fn shows_password(read: &Read) -> bool {
+    match read {
+        Read::Code { .. } | Read::History | Read::Get(Select::Password | Select::Full | Select::Raw) => true,
+        Read::Get(Select::Field(name)) => name == "password" || name == "totp",
+        Read::Get(_) => false,
+    }
+}
+
 /// The user answered about `found`: it must still be the same item (a sync may have run meanwhile).
 fn same_item(ctx: &Ctx, v: &UnlockedVault, found: &Found) -> Result<(), AgentError> {
     let now = read::find(v, &Lookup { needle: found.id.clone(), user: None, folder: None, ignorecase: false });
@@ -648,10 +677,11 @@ fn same_item(ctx: &Ctx, v: &UnlockedVault, found: &Found) -> Result<(), AgentErr
     Err(AgentError::Denied)
 }
 
-/// The code at `wall`; with `next`, when fewer than [`NEXT_UNDER`] seconds of it are left, the next one once its
+/// The code at the agent's wall time now (after any wait on the user); with `next`, when fewer than [`NEXT_UNDER`]
+/// seconds of it are left, the next one once its
 /// period has started (a lock meanwhile cancels the wait).
-async fn code(key: &TotpKey, wall: SystemTime, next: bool) -> Reply {
-    let at = wall.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+async fn code(key: &TotpKey, now: &Now, next: bool) -> Reply {
+    let at = now.0.wall().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let mut code = key.generate(at.as_secs());
     if next && code.seconds_remaining() < NEXT_UNDER {
         let start = at.as_secs() + code.seconds_remaining();
@@ -851,6 +881,7 @@ mod tests {
     fn a_write_prints_its_selectors_only() {
         let find = Lookup { needle: "n".into(), user: None, folder: None, ignorecase: false };
         assert!(format!("{:?}", Write::Remove { find }).starts_with("Remove { find: Lookup { needle: \"n\""));
+        assert_eq!(format!("{:?}", Now(std::sync::Arc::new(crate::agent::SystemClock))), "Now");
     }
 
     #[test]
@@ -871,7 +902,7 @@ mod tests {
     fn the_audit_names_what_was_selected_but_never_a_field() {
         let kinds: Vec<_> = [
             Read::History,
-            Read::Code { next: true, wall: SystemTime::UNIX_EPOCH },
+            Read::Code { next: true, now: Now(std::sync::Arc::new(crate::agent::SystemClock)) },
             Read::Get(Select::Password),
             Read::Get(Select::Field("secret field".into())),
             Read::Get(Select::Full),
