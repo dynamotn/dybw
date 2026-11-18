@@ -1,4 +1,5 @@
-//! The audit log (ADR 0012): one JSON line per value request or policy change, in
+//! The audit log (ADR 0012): one JSON line per value request (`get`, `history`, `code`), write (`add`, `edit`,
+//! `remove`) or policy change, in
 //! `$XDG_STATE_HOME/dybw/audit.log`. A line names the profile, the caller (program and script, or the harness), the
 //! op, what `get` selected, the item's id and the verdict. Never a value, never an item or field name.
 //!

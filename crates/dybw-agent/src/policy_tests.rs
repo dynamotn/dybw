@@ -209,13 +209,16 @@ async fn a_grant_never_satisfies_a_reprompt() {
     assert_eq!(text(password(&rig, tool("/opt/a.sh", "h1")).await), "the note's text");
     let before = rig.host.world().confirmed.len();
     let opens = rig.agent.opens("work").await;
+    // The grant answers the policy, never the reprompt: without the master password, nothing is opened.
     let reply = rig.agent.dispatch_as(get_op("c1", Select::Password), tool("/opt/a.sh", "h1")).await;
     assert_eq!(reply, err(AgentError::Denied));
-    let reply = rig.agent.dispatch_as(history_op("c1"), tool("/opt/a.sh", "h1")).await;
-    assert_eq!(reply, err(AgentError::Denied));
-    assert_eq!(rig.host.world().confirmed.len(), before, "not even asked");
+    assert_eq!(rig.host.world().confirmed.len(), before, "the grant answered the policy");
+    assert_eq!(rig.host.world().prompts.last().unwrap(), "Master password:");
     assert_eq!(rig.agent.opens("work").await, opens, "not opened");
-    assert_eq!(verdicts(&rig)[1..], [Verdict::Denied, Verdict::Denied]);
+    rig.host.answer(Answer::Text(crate::host::fake::PASSWORD));
+    let reply = rig.agent.dispatch_as(get_op("c1", Select::Password), tool("/opt/a.sh", "h1")).await;
+    assert_eq!(text(reply), "pw-ünï-😀");
+    assert_eq!(verdicts(&rig)[1..], [Verdict::Granted, Verdict::Declined, Verdict::Granted]);
 }
 
 #[tokio::test]
@@ -530,6 +533,28 @@ async fn a_peer_that_goes_after_the_worker_opened_the_item_still_gets_no_value()
     rig.host.allow();
     assert_eq!(password(&rig, tool("/opt/a.sh", "h1")).await, err(AgentError::Denied));
     assert_eq!(rig.agent.opens("work").await, 1, "it was opened, and the reply was withheld");
+    assert_eq!(verdicts(&rig), [Verdict::Confirmed, Verdict::Denied]);
+}
+
+#[tokio::test]
+async fn a_peer_that_goes_after_the_code_was_made_gets_no_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig_with(dir.path(), |tree| Arc::new(Flips(tree, Default::default(), 2)));
+    let mut vault: Value = serde_json::from_str(VAULT).unwrap();
+    vault["ciphers"].as_array_mut().unwrap().iter_mut().for_each(|c| c["reprompt"] = json!(0));
+    rig.host.vault(&vault.to_string());
+    unlock(&rig.agent, &rig.host, "work").await;
+    rig.host.allow();
+    let code = Op::Code {
+        profile: Some("work".into()),
+        needle: "c1".into(),
+        user: None,
+        folder: None,
+        ignorecase: false,
+        next: false,
+    };
+    assert_eq!(rig.agent.dispatch_as(code, tool("/opt/a.sh", "h1")).await, err(AgentError::Denied));
+    assert_eq!(rig.agent.opens("work").await, 1, "the key was opened, and the code withheld");
     assert_eq!(verdicts(&rig), [Verdict::Confirmed, Verdict::Denied]);
 }
 

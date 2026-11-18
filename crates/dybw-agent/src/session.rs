@@ -205,7 +205,7 @@ fn short(text: &str) -> String {
     one_line(text).chars().take(LOG_SERVER_TEXT).collect()
 }
 
-fn map_api(e: &ApiError) -> AgentError {
+pub(crate) fn map_api(e: &ApiError) -> AgentError {
     tracing::warn!("server: {}", describe(e));
     match e {
         ApiError::Network(_) => AgentError::Network,
@@ -215,7 +215,7 @@ fn map_api(e: &ApiError) -> AgentError {
 }
 
 /// Ask for a secret. A cancel, an empty answer and a timeout are the user's no; anything else is a failed prompt.
-async fn ask<H: Host>(
+pub(crate) async fn ask<H: Host>(
     host: &H,
     prompt: &str,
     description: &str,
@@ -417,10 +417,47 @@ async fn open<H: Host>(
 /// A fresh `/sync` with the stored API key, for the server an unlock opened. The caller installs it, and keeps it
 /// with `save_cache`.
 pub async fn fetch<H: Host>(host: &H, ctx: &Ctx, origin: &str, urls: &ServerUrls) -> Result<Value, AgentError> {
+    connect(host, ctx, origin, urls).await.map(|(_, sync)| sync)
+}
+
+/// A logged-in client and a fresh `/sync` from it: what a write needs (the server wants the account id `/sync`
+/// gives).
+pub async fn connect<H: Host>(
+    host: &H,
+    ctx: &Ctx,
+    origin: &str,
+    urls: &ServerUrls,
+) -> Result<(Client<H::Http, SystemClock>, Value), AgentError> {
     let key = stored_key(ctx, origin)?;
     let mut client = client(host, ctx, urls)?;
     client.login(&key).await.map_err(|e| map_api(&e))?;
-    client.sync().await.map_err(|e| map_api(&e))
+    let sync = client.sync().await.map_err(|e| map_api(&e))?;
+    Ok((client, sync))
+}
+
+/// The id ([`UnlockedVault::user_key_id`]) of the user key `password` opens, re-derived as an unlock does (the
+/// profile's KDF, its pin and checks) from `account`, the unlocked `/sync`'s `profile` and `userDecryption`; `None`
+/// for a wrong password. Local only: nothing is sent anywhere (the reprompt of ADR 0025).
+pub async fn key_id_of(
+    ctx: &Ctx,
+    origin: &str,
+    account: Value,
+    password: Zeroizing<String>,
+) -> Result<Option<String>, AgentError> {
+    // The pin is bound to the identity origin the stored key names, as at unlock.
+    let key = stored_key(ctx, origin)?;
+    let storage = ctx.storage();
+    let prelogin_kdf = ran_kdf(&storage).await.map(Into::into);
+    let cached = CachedSync { sync: account, prelogin_kdf, email: ctx.profile.email.clone() };
+    let (kdf, rsa) = (&BlockingArgon2, &AwsLcRsa);
+    match profile::unlock_vault_cached(cached, &storage, &key.origin, password, kdf, rsa, &Organizations::None).await {
+        Ok(vault) => Ok(Some(vault.user_key_id())),
+        Err(ProfileError::WrongPassword) => Ok(None),
+        Err(e) => {
+            tracing::warn!(profile = %ctx.profile.name, "reprompt: {e}");
+            Err(AgentError::Internal)
+        }
+    }
 }
 
 #[cfg(test)]

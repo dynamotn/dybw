@@ -17,8 +17,7 @@ use crate::paths::ProfilePaths;
 use crate::policy::{Audit, AuditEvent, Verdict};
 use crate::read::Lookup;
 use crate::session::Ctx;
-use crate::worker::op_of;
-use crate::worker::{Cmd, Recheck, Worker};
+use crate::worker::{Cmd, Read, Recheck, Worker, Write, op_of};
 
 /// How often the idle and sleep checks run.
 pub const TICK: Duration = Duration::from_secs(30);
@@ -52,6 +51,10 @@ fn kind(op: &Op) -> &'static str {
         Op::Search { .. } => "search",
         Op::Get { .. } => "get",
         Op::History { .. } => "history",
+        Op::Code { .. } => "code",
+        Op::Add { .. } => "add",
+        Op::Edit { .. } => "edit",
+        Op::Remove { .. } => "remove",
         Op::Policy { .. } => "policy",
         Op::StopAgent => "stop_agent",
         _ => "other",
@@ -177,27 +180,44 @@ impl Agent {
         self.guard().await;
         tracing::info!(op = kind(&op), "request");
         let sensitive = match &op {
-            Op::Get { profile, select, .. } => Some((kind(&op), op_of(Some(select)).1, profile.clone())),
-            Op::History { profile, .. } | Op::Policy { profile, .. } => Some((kind(&op), None, profile.clone())),
+            Op::Get { profile, select, .. } => Some((kind(&op), op_of(&Read::Get(select.clone())).1, profile.clone())),
+            Op::History { profile, .. }
+            | Op::Code { profile, .. }
+            | Op::Add { profile, .. }
+            | Op::Edit { profile, .. }
+            | Op::Remove { profile, .. }
+            | Op::Policy { profile, .. } => Some((kind(&op), None, profile.clone())),
             _ => None,
         };
         let logged = sensitive.clone().filter(|_| !matches!(op, Op::Policy { .. })).or_else(|| match &op {
             Op::List { profile, .. } | Op::Search { profile, .. } => Some((kind(&op), None, profile.clone())),
             _ => None,
         });
-        // An AI-class caller reads names and status only: no value, no unlock or login (no prompt is raised on its
-        // behalf), no policy, no stop (it could restart the agent under its own environment). Refused before anything.
+        let write = matches!(op, Op::Add { .. } | Op::Edit { .. } | Op::Remove { .. });
+        // An AI-class caller reads names and status only: no value, no write, no unlock or login (no prompt is raised
+        // on its behalf), no policy, no stop (it could restart the agent under its own environment). An unknown caller
+        // writes nothing either. Refused before anything.
         let refused = match &op {
-            Op::Get { .. } | Op::History { .. } => sensitive.clone(),
+            Op::Get { .. }
+            | Op::History { .. }
+            | Op::Code { .. }
+            | Op::Add { .. }
+            | Op::Edit { .. }
+            | Op::Remove { .. } => sensitive.clone(),
             Op::StopAgent => Some((kind(&op), None, None)),
             Op::Unlock { profile } | Op::Login { profile } => Some((kind(&op), None, profile.clone())),
             Op::Policy { profile, action } => Some((policy_op(action), None, profile.clone())),
             _ => None,
         };
+        let barred = match who.caller {
+            Caller::Ai { .. } => true,
+            Caller::Unknown { .. } => write,
+            Caller::Invoker { .. } => false,
+        };
         if let Some(s) = refused
-            && matches!(who.caller, Caller::Ai { .. })
+            && barred
         {
-            return self.deny(who, s, "an AI-class caller asked for a value, a prompt, the policy or a stop: denied");
+            return self.deny(who, s, "an AI-class caller asked for a value, a write, a prompt, the policy or a stop, or an unknown caller for a write: denied");
         }
         if let Some(s) = sensitive.clone()
             && !self.resolver.recheck(who)
@@ -210,6 +230,7 @@ impl Agent {
         let holds_value = matches!(
             reply,
             Reply::Value { .. }
+                | Reply::Code { .. }
                 | Reply::Full { .. }
                 | Reply::Raw { .. }
                 | Reply::FieldNames { .. }
@@ -312,6 +333,24 @@ impl Agent {
             Op::History { profile, needle, user, folder } => {
                 let find = Lookup { needle, user, folder, ignorecase: false };
                 self.on_unlocked(profile.as_deref(), Cmd::History { find, caller: caller(), still: still() }, ai).await
+            }
+            Op::Code { profile, needle, user, folder, ignorecase, next } => {
+                let find = Lookup { needle, user, folder, ignorecase };
+                let wall = self.clock.wall();
+                let cmd = Cmd::Code { find, next, wall, caller: caller(), still: still() };
+                self.on_unlocked(profile.as_deref(), cmd, ai).await
+            }
+            Op::Add { profile, name, user, uris, folder, ask } => {
+                let write = Write::Add { name, user, uris, folder, ask };
+                self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
+            }
+            Op::Edit { profile, needle, user, folder, ask } => {
+                let write = Write::Edit { find: Lookup { needle, user, folder, ignorecase: false }, ask };
+                self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
+            }
+            Op::Remove { profile, needle, user, folder } => {
+                let write = Write::Remove { find: Lookup { needle, user, folder, ignorecase: false } };
+                self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
             }
             // The policy needs no unlocked vault.
             Op::Policy { profile, action } => {
@@ -673,13 +712,33 @@ mod tests {
                 select: dybw_proto::Select::Password,
             },
             Op::History { profile: None, needle: "n".into(), user: None, folder: None },
+            Op::Code { profile: None, needle: "n".into(), user: None, folder: None, ignorecase: false, next: false },
+            Op::Add { profile: None, name: "n".into(), user: None, uris: vec![], folder: None, ask: vec![] },
+            Op::Edit { profile: None, needle: "n".into(), user: None, folder: None, ask: vec![] },
+            Op::Remove { profile: None, needle: "n".into(), user: None, folder: None },
             Op::StopAgent,
             Op::Unknown,
         ];
         let kinds: Vec<_> = ops.iter().map(kind).collect();
         assert_eq!(
             kinds,
-            ["status", "login", "unlock", "lock", "sync", "list", "search", "get", "history", "stop_agent", "other"]
+            [
+                "status",
+                "login",
+                "unlock",
+                "lock",
+                "sync",
+                "list",
+                "search",
+                "get",
+                "history",
+                "code",
+                "add",
+                "edit",
+                "remove",
+                "stop_agent",
+                "other"
+            ]
         );
     }
 

@@ -2,24 +2,25 @@
 //! unlocked vault, which is not `Send`), and the rest of the agent reaches it through a `Send` [`Worker`] handle.
 //!
 //! The loop never waits on a command. Quick ones (`Status`, `IdleCheck`, `Lock`, `Exit`) run inline; the long ones
-//! (login, unlock, sync, and what Task 5 adds) each run in a task of their own that the loop tracks, so a `Lock`
-//! is never queued behind a pinentry or the network and cancels what is in flight. The state is behind a `RefCell`
-//! that is never borrowed across an await.
+//! (login, unlock, sync, the value reads and the writes) each run in a task of their own that the loop tracks, so a
+//! `Lock` is never queued behind a pinentry or the network and cancels what is in flight. The state is behind a
+//! `RefCell` that is never borrowed across an await.
 //!
 //! The reads reach the unlocked vault under a short `shared.state.borrow()` (`state.slot` is `Some(Session)` while
-//! unlocked, `Session::vault` is the core's `UnlockedVault`). `list` and `search` are quick. `get` and `history`
-//! are long: find the item by its summary, drop the borrow, wait for the user's confirmation (the value gate),
-//! and only then borrow again to open it. A `Lock` aborts the task at its next await, so nothing is opened or
-//! returned after it.
+//! unlocked, `Session::vault` is the core's `UnlockedVault`). `list` and `search` are quick. `get`, `history` and
+//! `code` are long: find the item by its summary, drop the borrow, wait for the user's confirmation (the value gate)
+//! and the master password of an item that asks for a reprompt, and only then borrow again to open it. A `Lock`
+//! aborts the task at its next await, so nothing is opened or returned after it. The writes are in `worker/write.rs`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use dybw_core::profile::UnlockedVault;
+use dybw_core::totp::TotpKey;
 use dybw_native::prompter::one_line;
-use dybw_proto::{AgentError, Field, PolicyAction, PolicyEntry, PolicyRule, ProfileStatus, Reply, Select};
+use dybw_proto::{AgentError, Field, PolicyAction, PolicyEntry, PolicyRule, ProfileStatus, Reply, Secret, Select};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
@@ -28,6 +29,9 @@ use crate::host::Host;
 use crate::policy::{self, Access, AuditEvent, Decision, Store, Verdict};
 use crate::read::{self, Found, Lookup};
 use crate::session::{self, Ctx, Session};
+
+mod write;
+pub use write::Write;
 
 /// Is the peer still the process that asked? Asked again once the user has answered.
 #[derive(Clone)]
@@ -91,6 +95,20 @@ pub enum Cmd {
         caller: Caller,
         still: Recheck,
     },
+    /// The TOTP code of one item at `wall`, under the same rule.
+    Code {
+        find: Lookup,
+        next: bool,
+        wall: SystemTime,
+        caller: Caller,
+        still: Recheck,
+    },
+    /// A change of the vault: confirmed every time, refused to an AI-class or unknown caller.
+    Write {
+        write: Write,
+        caller: Caller,
+        still: Recheck,
+    },
     /// Show the caller policy, or change it (the user confirms, and an AI-class caller cannot).
     Policy {
         action: PolicyAction,
@@ -115,8 +133,9 @@ enum Long {
     Login,
     Unlock,
     Sync,
-    /// `Some` is a `get`, `None` the password history; whose request it is.
-    Read(Lookup, Option<Select>, Caller, Recheck),
+    /// A value request, and whose request it is.
+    Read(Lookup, Read, Caller, Recheck),
+    Write(Write, Caller, Recheck),
     Policy(PolicyAction, Caller, Recheck),
     #[cfg(test)]
     Panic,
@@ -270,8 +289,10 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
             let search = |v: &UnlockedVault| Ok(read::list(v, &fields, folder.as_deref(), Some(&term)));
             return quick(reply, with_vault(shared, search).unwrap_or_else(error));
         }
-        Cmd::Get { find, select, caller, still } => Long::Read(find, Some(select), caller, still),
-        Cmd::History { find, caller, still } => Long::Read(find, None, caller, still),
+        Cmd::Get { find, select, caller, still } => Long::Read(find, Read::Get(select), caller, still),
+        Cmd::History { find, caller, still } => Long::Read(find, Read::History, caller, still),
+        Cmd::Code { find, next, wall, caller, still } => Long::Read(find, Read::Code { next, wall }, caller, still),
+        Cmd::Write { write, caller, still } => Long::Write(write, caller, still),
         Cmd::Policy { action, caller, still } => Long::Policy(action, caller, still),
         #[cfg(test)]
         Cmd::Opens => {
@@ -370,7 +391,8 @@ async fn run_long<H: Host>(shared: Rc<Shared>, host: Rc<H>, ctx: Rc<Ctx>, long: 
         }
         Long::Unlock => unlock(&shared, &*host, &ctx).await,
         Long::Sync => sync(&shared, &*host, &ctx, wait).await,
-        Long::Read(find, select, caller, still) => get(&shared, &*host, &ctx, &caller, &still, find, select).await,
+        Long::Read(find, read, caller, still) => get(&shared, &*host, &ctx, &caller, &still, find, read).await,
+        Long::Write(change, caller, still) => write::write(&shared, &*host, &ctx, &caller, &still, change).await,
         Long::Policy(action, caller, still) => change_policy(&shared, &*host, &ctx, &caller, &still, action).await,
         #[cfg(test)]
         Long::Panic => panic!("task panic for a test"),
@@ -385,15 +407,15 @@ fn with_vault<T>(shared: &Shared, f: impl FnOnce(&UnlockedVault) -> Result<T, Ag
 
 /// What the confirmation says: the profile, who asks and by which command, what is read of which item, each on one
 /// line; and when "always" is for this process only, that.
-fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, select: Option<&Select>, remember: Scope) -> String {
-    let tidy = |s: &str| one_line(s).chars().take(80).collect::<String>();
-    let (command, what) = match select {
-        Some(Select::Field(name)) => ("get", format!("its field \"{}\"", tidy(name))),
-        Some(Select::Full) => ("get", "the full item (every value)".to_owned()),
-        Some(Select::Raw) => ("get", "the raw item as JSON".to_owned()),
-        Some(Select::ListFields) => ("get", "the field names".to_owned()),
-        Some(_) => ("get", "its main value (password, notes, number or public key)".to_owned()),
-        None => ("history", "its password history".to_owned()),
+fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Scope) -> String {
+    let (command, what) = match read {
+        Read::Get(Select::Field(name)) => ("get", format!("its field \"{}\"", tidy(name))),
+        Read::Get(Select::Full) => ("get", "the full item (every value)".to_owned()),
+        Read::Get(Select::Raw) => ("get", "the raw item as JSON".to_owned()),
+        Read::Get(Select::ListFields) => ("get", "the field names".to_owned()),
+        Read::Get(_) => ("get", "its main value (password, notes, number or public key)".to_owned()),
+        Read::History => ("history", "its password history".to_owned()),
+        Read::Code { .. } => ("code", "a TOTP code".to_owned()),
     };
     let scope = if remember == Scope::Process { " [always (this process only)]" } else { "" };
     format!(
@@ -404,23 +426,44 @@ fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, select: Option<&Select>, 
     )
 }
 
+/// `s` on one line, cut for a question.
+fn tidy(s: &str) -> String {
+    one_line(s).chars().take(80).collect()
+}
+
+/// What a value request reads.
+#[derive(Debug, Clone)]
+pub enum Read {
+    Get(Select),
+    History,
+    /// The TOTP code at `wall`; with `next`, the next one when fewer than [`NEXT_UNDER`] seconds are left.
+    Code {
+        next: bool,
+        wall: SystemTime,
+    },
+}
+
+/// `dybw code --next` waits for the next code when the current one has fewer seconds left than this (profiles §7).
+pub const NEXT_UNDER: u64 = 5;
+
 /// What a request reads: the whole item, its raw JSON and the history are never covered by a grant.
-fn access_of(select: Option<&Select>) -> Access {
-    match select {
-        None | Some(Select::Full | Select::Raw) => Access::Whole,
-        Some(_) => Access::Value,
+fn access_of(read: &Read) -> Access {
+    match read {
+        Read::History | Read::Get(Select::Full | Select::Raw) => Access::Whole,
+        _ => Access::Value,
     }
 }
 
 /// The op, and for `get` what was selected: the kind only, never a field name.
-pub(crate) fn op_of(select: Option<&Select>) -> (&'static str, Option<&'static str>) {
-    match select {
-        None => ("history", None),
-        Some(Select::Field(_)) => ("get", Some("field")),
-        Some(Select::Full) => ("get", Some("full")),
-        Some(Select::Raw) => ("get", Some("raw")),
-        Some(Select::ListFields) => ("get", Some("list-fields")),
-        Some(_) => ("get", Some("password")),
+pub(crate) fn op_of(read: &Read) -> (&'static str, Option<&'static str>) {
+    match read {
+        Read::History => ("history", None),
+        Read::Code { .. } => ("code", None),
+        Read::Get(Select::Field(_)) => ("get", Some("field")),
+        Read::Get(Select::Full) => ("get", Some("full")),
+        Read::Get(Select::Raw) => ("get", Some("raw")),
+        Read::Get(Select::ListFields) => ("get", Some("list-fields")),
+        Read::Get(_) => ("get", Some("password")),
     }
 }
 
@@ -453,13 +496,13 @@ async fn gate<H: Host>(
     ctx: &Ctx,
     caller: &Caller,
     found: &Found,
-    select: Option<&Select>,
+    read: &Read,
 ) -> Result<(), AgentError> {
-    let op = op_of(select);
+    let op = op_of(read);
     let store = Store::new(&ctx.paths.policy, ctx.user.uid);
     let decide = || {
         let held = shared.state.borrow().held.clone();
-        policy::decide(caller, &store.load(), &held, access_of(select))
+        policy::decide(caller, &store.load(), &held, access_of(read))
     };
     let mut decision = decide();
     let _screen = if matches!(decision, Decision::Confirm { .. }) {
@@ -473,7 +516,7 @@ async fn gate<H: Host>(
         Decision::Allow => (Verdict::Granted, Ok(())),
         Decision::Deny => (Verdict::Denied, Err(AgentError::Denied)),
         Decision::Confirm { remember: scope } => {
-            let text = ask_text(ctx, caller, found, select, scope);
+            let text = ask_text(ctx, caller, found, read, scope);
             match session::confirm(host, &text, scope != Scope::Never).await {
                 Ok(true) => (remember(shared, ctx, &store, caller, scope), Ok(())),
                 Ok(false) => (Verdict::Confirmed, Ok(())),
@@ -507,9 +550,47 @@ fn remember(shared: &Shared, ctx: &Ctx, store: &Store, caller: &Caller, scope: S
     }
 }
 
-/// `get` and `history`: find the item from its summary (a missing or ambiguous one ends here, with no prompt), pass
-/// the caller policy (a no or a timeout is `Denied`, and nothing was opened), check the item is still the one asked
-/// about, and only then open it, build the reply and drop it. A lock during the wait cancels this task.
+/// The master password again, for an item that asks for it (ADR 0025), checked here against the unlocked user key and
+/// never sent anywhere. No grant satisfies it. A wrong password is `Denied`, a cancel or a timeout the user's no; each
+/// is audited. The caller holds the screen (`asking`).
+async fn reprompt<H: Host>(
+    shared: &Shared,
+    host: &H,
+    ctx: &Ctx,
+    caller: &Caller,
+    found: &Found,
+    op: (&'static str, Option<&'static str>),
+) -> Result<(), AgentError> {
+    let account = |s: &Session| {
+        let part = |k: &str| s.vault.sync.get(k).cloned().unwrap_or_default();
+        (s.origin.clone(), serde_json::json!({ "profile": part("profile"), "userDecryption": part("userDecryption") }))
+    };
+    let target = shared.state.borrow().slot.as_ref().map(|s| (account(s), s.vault.user_key_id()));
+    let Some(((origin, account), unlocked)) = target else { return Err(AgentError::Locked) };
+    let description = format!(
+        "dybw profile {}: the item \"{}\" asks for the master password again (dybw {} by {})",
+        ctx.profile.name,
+        tidy(&found.name),
+        op.0,
+        policy::who(caller)
+    );
+    let (verdict, why) = match session::ask(host, "Master password:", &description, None).await {
+        Err(e) => (Verdict::Declined, e),
+        Ok(password) => match session::key_id_of(ctx, &origin, account, password).await {
+            Ok(Some(id)) if id == unlocked => return Ok(()),
+            Ok(_) => (Verdict::Denied, AgentError::Denied),
+            Err(e) => (Verdict::Failed, e),
+        },
+    };
+    tracing::warn!(profile = %ctx.profile.name, id = %found.id, "the reprompt was not passed: {why}");
+    audit(ctx, caller, op, Some(&found.id), verdict);
+    Err(why)
+}
+
+/// `get`, `history` and `code`: find the item from its summary (a missing or ambiguous one ends here, with no
+/// prompt), pass the caller policy (a no or a timeout is `Denied`, and nothing was opened), then the reprompt of an
+/// item that asks for one, check the item is still the one asked about, and only then open it, build the reply and
+/// drop it. A lock during a wait cancels this task.
 async fn get<H: Host>(
     shared: &Shared,
     host: &H,
@@ -517,7 +598,7 @@ async fn get<H: Host>(
     caller: &Caller,
     still: &Recheck,
     find: Lookup,
-    select: Option<Select>,
+    read: Read,
 ) -> Reply {
     let found = match with_vault(shared, |v| read::find(v, &find)) {
         Ok(found) => found,
@@ -525,37 +606,59 @@ async fn get<H: Host>(
     };
     // TODO(core): field_names, a names-only decrypt; until then `--list-fields` opens the whole item, so it is a
     // value request like any other.
-    if found.reprompt {
-        // Until P4.3 can ask for the master password again, a reprompt item gives no value and no question, and
-        // no grant satisfies it.
-        tracing::warn!(profile = %ctx.profile.name, id = %found.id, "value request denied: the item needs a reprompt (P4.3)");
-        let op = op_of(select.as_ref());
-        audit(ctx, caller, op, Some(&found.id), Verdict::Denied);
-        return error(AgentError::Denied);
-    }
-    if let Err(e) = gate(shared, host, ctx, caller, &found, select.as_ref()).await {
+    if let Err(e) = gate(shared, host, ctx, caller, &found, &read).await {
         return error(e);
+    }
+    if found.reprompt {
+        let _screen = shared.asking.lock().await;
+        if let Err(e) = reprompt(shared, host, ctx, caller, &found, op_of(&read)).await {
+            return error(e);
+        }
     }
     // The user may have taken a while: the peer must still be the one that asked, before anything is opened.
     if !still.holds() {
         tracing::warn!(profile = %ctx.profile.name, id = %found.id, "the caller changed while the user was asked");
-        let op = op_of(select.as_ref());
-        audit(ctx, caller, op, Some(&found.id), Verdict::Denied);
+        audit(ctx, caller, op_of(&read), Some(&found.id), Verdict::Denied);
         return error(AgentError::Denied);
     }
-    let read = |v: &UnlockedVault| {
-        // The user answered about this item: it must still be the same one (a sync may have run meanwhile).
-        let now = read::find(v, &Lookup { needle: found.id.clone(), user: None, folder: None, ignorecase: false });
-        if now.as_ref().ok() != Some(&found) {
-            tracing::warn!(profile = %ctx.profile.name, id = %found.id, "the item changed while the user was asked");
-            return Err(AgentError::Denied);
-        }
-        match &select {
-            Some(select) => read::value(v, &found.id, select),
-            None => read::history(v, &found.id),
+    if let Read::Code { next, wall } = read {
+        let key = with_vault(shared, |v| same_item(ctx, v, &found).and_then(|()| read::totp(v, &found.id)));
+        return match key {
+            Ok(key) => code(&key, wall, next).await,
+            Err(e) => error(e),
+        };
+    }
+    let open = |v: &UnlockedVault| {
+        same_item(ctx, v, &found)?;
+        match &read {
+            Read::Get(select) => read::value(v, &found.id, select),
+            _ => read::history(v, &found.id),
         }
     };
-    with_vault(shared, read).unwrap_or_else(error)
+    with_vault(shared, open).unwrap_or_else(error)
+}
+
+/// The user answered about `found`: it must still be the same item (a sync may have run meanwhile).
+fn same_item(ctx: &Ctx, v: &UnlockedVault, found: &Found) -> Result<(), AgentError> {
+    let now = read::find(v, &Lookup { needle: found.id.clone(), user: None, folder: None, ignorecase: false });
+    if now.as_ref().ok() == Some(found) {
+        return Ok(());
+    }
+    tracing::warn!(profile = %ctx.profile.name, id = %found.id, "the item changed while the user was asked");
+    Err(AgentError::Denied)
+}
+
+/// The code at `wall`; with `next`, when fewer than [`NEXT_UNDER`] seconds of it are left, the next one once its
+/// period has started (a lock meanwhile cancels the wait).
+async fn code(key: &TotpKey, wall: SystemTime, next: bool) -> Reply {
+    let at = wall.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let mut code = key.generate(at.as_secs());
+    if next && code.seconds_remaining() < NEXT_UNDER {
+        let start = at.as_secs() + code.seconds_remaining();
+        tokio::time::sleep(Duration::from_secs(start).saturating_sub(at)).await;
+        code = key.generate(start);
+    }
+    Reply::Code { code: Secret::new(code.code().to_owned()), seconds_left: code.seconds_remaining() }
 }
 
 /// An absolute path as the policy keys it: canonical when the file exists.
@@ -729,15 +832,26 @@ async fn sync<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, wait: bool) -> Repl
             return error(e);
         }
     };
-    session::save_cache(ctx, &sync).await;
-    // A lock cancels this task, so the slot is there; if it is not, there is no vault to show the copy to.
-    shared.state.borrow_mut().slot.as_mut().map(|session| session.vault.sync = sync).unwrap_or_default();
+    install(shared, ctx, sync).await;
     Reply::Done
+}
+
+/// Keep a fresh `/sync` as the offline copy and show it to the vault.
+async fn install(shared: &Shared, ctx: &Ctx, sync: serde_json::Value) {
+    session::save_cache(ctx, &sync).await;
+    // A lock cancels the task that runs this, so the slot is there; if it is not, there is no vault to show it to.
+    shared.state.borrow_mut().slot.as_mut().map(|session| session.vault.sync = sync).unwrap_or_default();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_write_prints_its_selectors_only() {
+        let find = Lookup { needle: "n".into(), user: None, folder: None, ignorecase: false };
+        assert!(format!("{:?}", Write::Remove { find }).starts_with("Remove { find: Lookup { needle: \"n\""));
+    }
 
     #[test]
     fn a_recheck_answers_and_prints_without_its_closure() {
@@ -756,18 +870,20 @@ mod tests {
     #[test]
     fn the_audit_names_what_was_selected_but_never_a_field() {
         let kinds: Vec<_> = [
-            None,
-            Some(Select::Password),
-            Some(Select::Field("secret field".into())),
-            Some(Select::Full),
-            Some(Select::Raw),
-            Some(Select::ListFields),
+            Read::History,
+            Read::Code { next: true, wall: SystemTime::UNIX_EPOCH },
+            Read::Get(Select::Password),
+            Read::Get(Select::Field("secret field".into())),
+            Read::Get(Select::Full),
+            Read::Get(Select::Raw),
+            Read::Get(Select::ListFields),
         ]
         .iter()
-        .map(|s| op_of(s.as_ref()))
+        .map(op_of)
         .collect();
         let want = [
             ("history", None),
+            ("code", None),
             ("get", Some("password")),
             ("get", Some("field")),
             ("get", Some("full")),

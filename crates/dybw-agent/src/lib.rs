@@ -23,6 +23,8 @@ mod flow_tests;
 mod policy_tests;
 #[cfg(test)]
 mod read_tests;
+#[cfg(test)]
+mod write_tests;
 
 use std::sync::Arc;
 

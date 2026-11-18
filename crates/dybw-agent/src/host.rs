@@ -147,11 +147,53 @@ pub(crate) mod fake {
         pub offered: Vec<bool>,
         /// What an `Answer::Held` confirmation waits for.
         pub release: Arc<tokio::sync::Notify>,
+        /// The server answers every cipher write "out of date".
+        pub out_of_date: bool,
+        /// Each cipher write so far: it dates what it writes.
+        pub writes: u32,
+        /// The body of every cipher write.
+        pub bodies: Vec<Value>,
+        /// `/sync` answers 500 once a cipher write went through.
+        pub sync_fails_after_write: bool,
     }
 
     impl World {
         pub fn count(&self, what: &str) -> usize {
             self.requests.iter().filter(|r| r.ends_with(what)).count()
+        }
+
+        /// The server's side of a create (`POST /api/ciphers`), an update (`PUT /api/ciphers/<id>`) and a trash
+        /// (`PUT /api/ciphers/<id>/delete`), on the ciphers the next `/sync` sends.
+        #[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
+        fn cipher_write(&mut self, method: &str, path: &str, body: Option<&[u8]>) -> (u16, String) {
+            let body: Value = body.and_then(|b| serde_json::from_slice(b).ok()).unwrap_or_default();
+            self.bodies.push(body.clone());
+            if self.out_of_date {
+                let message = "The client copy of this cipher is out of date. Resync the client and try again.";
+                return (400, serde_json::json!({ "message": message }).to_string());
+            }
+            self.writes += 1;
+            let date = serde_json::json!(format!("2026-11-18T00:00:{:02}.000Z", self.writes));
+            let mut list: Vec<Value> = serde_json::from_str(&self.ciphers).unwrap();
+            let id = path.trim_start_matches("/api/ciphers").trim_start_matches('/');
+            let reply = if method == "Post" {
+                let mut c = body;
+                c["id"] = serde_json::json!(format!("new{}", self.writes));
+                c["revisionDate"] = date;
+                list.push(c.clone());
+                c
+            } else if let Some(id) = id.strip_suffix("/delete") {
+                list.iter_mut().filter(|c| c["id"] == id).for_each(|c| c["deletedDate"] = date.clone());
+                serde_json::json!({})
+            } else {
+                let mut c = body;
+                c["id"] = serde_json::json!(id);
+                c["revisionDate"] = date;
+                list.iter_mut().filter(|x| x["id"] == id).for_each(|x| *x = c.clone());
+                c
+            };
+            self.ciphers = Value::Array(list).to_string();
+            (200, reply.to_string())
         }
     }
 
@@ -181,6 +223,10 @@ pub(crate) mod fake {
                 confirmed: Vec::new(),
                 offered: Vec::new(),
                 release: Arc::new(tokio::sync::Notify::new()),
+                out_of_date: false,
+                writes: 0,
+                bodies: Vec::new(),
+                sync_fails_after_write: false,
             })))
         }
 
@@ -253,7 +299,13 @@ pub(crate) mod fake {
                             r#"{{"profile":{profile},"ciphers":{},"folders":{},"marker":{marker}}}"#,
                             w.ciphers, w.folders
                         );
-                        (if w.sync_fails { 500 } else { 200 }, body, w.sync_hangs)
+                        let fails = w.sync_fails || (w.sync_fails_after_write && w.writes > 0);
+                        (if fails { 500 } else { 200 }, body, w.sync_hangs)
+                    }
+                    p if p.starts_with("/api/ciphers") => {
+                        let (status, body) =
+                            w.cipher_write(&format!("{:?}", req.method), p, req.body.as_deref().map(|b| b.as_slice()));
+                        (status, body, false)
                     }
                     // The only other request an unlock makes: `/identity/accounts/prelogin`.
                     _ => (200, r#"{"kdf":0,"kdfIterations":600000}"#.to_owned(), false),

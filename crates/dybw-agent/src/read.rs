@@ -5,6 +5,7 @@
 //! asked. No function here prompts or waits.
 
 use dybw_core::profile::UnlockedVault;
+use dybw_core::totp::TotpKey;
 use dybw_core::vault::folder::{FolderNames, folder_names};
 use dybw_core::vault::item::{self, Data, Identity, Item, Summary, Text};
 use dybw_core::vault::scan::Uninspectable;
@@ -29,7 +30,7 @@ pub struct Found {
     pub id: String,
     pub name: String,
     pub user: Option<String>,
-    /// The cipher asks for the master password again (`reprompt`, a plain field): P4.3 supports that.
+    /// The cipher asks for the master password again (`reprompt`, a plain field) before any value or change.
     pub reprompt: bool,
 }
 
@@ -392,6 +393,51 @@ pub fn value(vault: &UnlockedVault, id: &str, select: &Select) -> Result<Reply, 
             names: item.fields.iter().filter_map(|f| text(&f.name)).map(str::to_owned).collect(),
         }),
     }
+}
+
+/// The cipher `id` as `/sync` sent it, in the trash or not: what a write is planned on.
+pub fn cipher<'a>(vault: &'a UnlockedVault, id: &str) -> Option<&'a Value> {
+    let all = vault.sync.get("ciphers").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    all.iter().find(|c| c.get("id").and_then(Value::as_str) == Some(id))
+}
+
+/// The `revisionDate` of this copy of the item: the base a write of it is planned on (data model §6.5).
+pub fn revision(vault: &UnlockedVault, id: &str) -> String {
+    let date = cipher(vault, id).and_then(|c| c.get("revisionDate")).and_then(Value::as_str);
+    date.unwrap_or_default().to_owned()
+}
+
+/// The login's TOTP key, after the value gate. An item without one is `NoSuchField("totp")`; a key that gives no
+/// code says why, never what it holds.
+pub fn totp(vault: &UnlockedVault, id: &str) -> Result<TotpKey, AgentError> {
+    let item = item_of(vault, id)?;
+    let key = match &item.data {
+        Data::Login(l) => text(&l.totp),
+        _ => None,
+    };
+    let key = key.ok_or_else(|| AgentError::NoSuchField("totp".to_owned()))?;
+    TotpKey::parse(key).map_err(|e| AgentError::Totp(e.to_string()))
+}
+
+/// The namespaces whose `<ns>:id` field marks the item (data model §3), sorted, each once. Field names only.
+pub fn markers(vault: &UnlockedVault, id: &str) -> Result<Vec<String>, AgentError> {
+    let item = item_of(vault, id)?;
+    let mut names: Vec<String> = item
+        .fields
+        .iter()
+        .filter_map(|f| text(&f.name)?.strip_suffix(":id").filter(|ns| !ns.is_empty() && !ns.contains(':')))
+        .map(str::to_owned)
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// The id of the folder named exactly `name`.
+pub fn folder_id(vault: &UnlockedVault, name: &str) -> Result<String, AgentError> {
+    let names = folder_names(&vault.sync, vault.keys.user());
+    let found = names.iter().find(|(_, n)| matches!(n, Ok(n) if *n == name)).map(|(id, _)| id.to_owned());
+    found.ok_or_else(|| AgentError::NoSuchFolder(name.to_owned()))
 }
 
 /// The item's previous passwords, newest first as the server keeps them. An entry without a date says `unknown`.

@@ -32,6 +32,8 @@ pub enum Access {
     Value,
     /// Every value at once (`--full`, `--raw`) or the password history: never covered by a grant.
     Whole,
+    /// A change of the vault (`add`, `edit`, `remove`): asked every time, never offered "always".
+    Write,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +61,8 @@ pub enum Verdict {
     /// that changed).
     Denied,
     /// A request that failed before any decision (no such item, ambiguous, locked, no profile).
-    /// Also a policy change the user approved that could not be written.
+    /// Also a policy change or a vault write the user approved that could not be done, and a reprompt that could
+    /// not be checked.
     Failed,
     /// A names-only request (`list`, `search`) answered.
     Listed,
@@ -95,7 +98,8 @@ impl Audit for NoAudit {
 /// What the policy says about `caller` asking for `access`, given the profile's entries and the per-process grants
 /// the profile holds in memory (`held`).
 ///
-/// An AI-class caller is denied every value. An unknown caller is asked every time. For a named invoker, a deny
+/// An AI-class caller is denied every value and every write; an unknown caller every write, and is asked every time
+/// for a value. A write is asked every time ([`Access::Write`]), whatever is granted. For a named invoker, a deny
 /// entry for its executable (with no script: any script; with one: that script) wins over everything. Then a grant
 /// allows it: for a plain executable an `allow` entry with no script, the hash of the program as it is now and the
 /// same `detached` state; for an interpreter's script a grant held for this very process (entries with a script are
@@ -107,7 +111,7 @@ pub fn decide(caller: &Caller, entries: &[PolicyEntry], held: &[Caller], access:
         return Decision::Allow;
     }
     let Caller::Invoker { at, .. } = caller else {
-        return if matches!(caller, Caller::Ai { .. }) { Decision::Deny } else { never };
+        return if matches!(caller, Caller::Ai { .. }) || access == Access::Write { Decision::Deny } else { never };
     };
     // A path that is not text cannot be told apart from another once written: never matched, never kept.
     let Some((exe, script, hash)) = text_of(caller) else { return never };
@@ -115,7 +119,7 @@ pub fn decide(caller: &Caller, entries: &[PolicyEntry], held: &[Caller], access:
     if entries.iter().filter(denied).any(|e| e.script.is_none() || e.script.as_deref() == script) {
         return Decision::Deny;
     }
-    if access == Access::Whole {
+    if matches!(access, Access::Whole | Access::Write) {
         return never;
     }
     let granted = match caller.scope() {

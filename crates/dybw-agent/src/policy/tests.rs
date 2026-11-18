@@ -101,6 +101,20 @@ fn every_class_by_every_access() {
 }
 
 #[test]
+fn every_write_is_asked_every_time_and_refused_to_an_ai_or_unknown_caller_or_a_denied_one() {
+    let grants = [entry(PolicyRule::Allow, None, "h1")];
+    let held = [script(1), invoker(None, "h1")];
+    for caller in [invoker(None, "h1"), script(1), detached(invoker(None, "h1")), bare_shell(), launcher()] {
+        // A grant or a held "always" never answers a write, and "always" is never offered for one.
+        assert_eq!(decide(&caller, &grants, &held, Access::Write), NEVER, "{caller:?}");
+    }
+    assert_eq!(decide(&ai(), &grants, &[ai()], Access::Write), Decision::Deny);
+    assert_eq!(decide(&unknown(), &grants, &[unknown()], Access::Write), Decision::Deny);
+    let denied = [entry(PolicyRule::Deny, None, "")];
+    assert_eq!(decide(&invoker(None, "h1"), &denied, &[], Access::Write), Decision::Deny);
+}
+
+#[test]
 fn entries_and_held_grants_never_change_what_an_ai_or_unknown_caller_gets() {
     let all = [entry(PolicyRule::Allow, None, "h1"), entry(PolicyRule::Allow, Some("/opt/a.sh"), "h1")];
     assert_eq!(decide(&ai(), &all, &[ai()], Access::Value), Decision::Deny);

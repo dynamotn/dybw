@@ -532,7 +532,7 @@ async fn a_url_names_no_item_and_opens_nothing() {
 }
 
 #[tokio::test]
-async fn a_reprompt_item_gives_no_value_and_no_question_until_p43_but_its_name_and_field_names_show() {
+async fn a_reprompt_item_gives_no_value_without_the_master_password_but_its_name_shows() {
     let (_dir, agent, host) = setup(|v| {
         for c in v["ciphers"].as_array_mut().unwrap() {
             if c["id"] == "c1" {
@@ -541,16 +541,14 @@ async fn a_reprompt_item_gives_no_value_and_no_question_until_p43_but_its_name_a
         }
     })
     .await;
-    for select in [Select::Password, Select::Field("user".into()), Select::Full, Select::Raw] {
+    for select in [Select::Password, Select::Field("user".into()), Select::Full, Select::Raw, Select::ListFields] {
         host.allow();
         assert_eq!(agent.dispatch(get_op("c1", select)).await, err(AgentError::Denied));
     }
     host.allow();
     assert_eq!(agent.dispatch(history_op(MAIL)).await, err(AgentError::Denied));
-    assert!(host.world().confirmed.is_empty(), "the question is not even shown");
+    assert_eq!(host.world().prompts[1..], ["Master password:"; 6], "asked each time, never answered");
     assert_eq!(agent.opens("work").await, 0);
-    host.allow();
-    assert_eq!(agent.dispatch(get_op("c1", Select::ListFields)).await, err(AgentError::Denied));
     let rows = items(agent.dispatch(list_op(&[Field::Name], None)).await);
     assert!(rows.iter().any(|r| r.id == "c1"));
     assert_eq!(text(value_of(&agent, &host, "n1", Select::Password).await), "the note's text", "others are unaffected");
@@ -579,7 +577,7 @@ async fn organization_items_read_like_personal_ones_with_the_organizations_unloc
         "a personal item"
     );
     assert_eq!(text(allowed(&agent, &host, org(get_op("p1", Select::Field("f".into())))).await), "v");
-    // The vectors' o1 and o2 ask for a reprompt.
+    // The vectors' o1 and o2 ask for a reprompt: no master password, no value.
     host.allow();
     assert_eq!(agent.dispatch(org(get_op("o1", Select::Password))).await, err(AgentError::Denied));
     assert_eq!(agent.dispatch(org(get_op("o2", Select::ListFields))).await, err(AgentError::Denied));
