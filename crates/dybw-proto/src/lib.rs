@@ -66,6 +66,17 @@ pub enum Select {
     ListFields,
 }
 
+/// A part of a login whose new value the agent asks for in its own pinentry: a new value never travels over the
+/// socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Part {
+    Password,
+    Notes,
+    /// The TOTP key (`add` only).
+    Totp,
+}
+
 /// What a remembered invoker may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -110,7 +121,8 @@ pub enum PolicyAction {
 }
 
 /// What the client asks. `profile: None` means the agent's default profile.
-/// No op carries a secret: `Login` makes the agent prompt for the API key itself.
+/// No op carries a secret: `Login` makes the agent prompt for the API key itself, and `Add` and `Edit` for the new
+/// values ([`Part`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -150,6 +162,40 @@ pub enum Op {
         select: Select,
     },
     History {
+        profile: Option<String>,
+        needle: String,
+        user: Option<String>,
+        folder: Option<String>,
+    },
+    /// The current TOTP code of a login; the key never leaves the agent. `next`: when fewer than 5 s of the code are
+    /// left, the agent waits for the next one.
+    Code {
+        profile: Option<String>,
+        needle: String,
+        user: Option<String>,
+        folder: Option<String>,
+        ignorecase: bool,
+        next: bool,
+    },
+    /// Create a personal login; the agent asks for the value of each of `ask` in the pinentry.
+    Add {
+        profile: Option<String>,
+        name: String,
+        user: Option<String>,
+        uris: Vec<String>,
+        folder: Option<String>,
+        ask: Vec<Part>,
+    },
+    /// Change parts of one item; the agent asks for the new value of each of `ask` in the pinentry.
+    Edit {
+        profile: Option<String>,
+        needle: String,
+        user: Option<String>,
+        folder: Option<String>,
+        ask: Vec<Part>,
+    },
+    /// Move one item to the trash (never purged).
+    Remove {
         profile: Option<String>,
         needle: String,
         user: Option<String>,
@@ -221,6 +267,17 @@ pub enum AgentError {
     /// The item matched but has no field of this name (a field name is not secret).
     #[error("the item has no field named {0:?}")]
     NoSuchField(String),
+    #[error("no folder is named {0:?}")]
+    NoSuchFolder(String),
+    /// The item's TOTP key gives no code; the text names the problem, never the key.
+    #[error("the TOTP key is not usable: {0}")]
+    Totp(String),
+    /// The item changed on the server since the copy the write was asked about.
+    #[error("the item changed on the server since it was read; nothing was written (sync and try again)")]
+    OutOfDate,
+    /// A write the vault does not allow (a read-only organization item, ...), by a fixed code, never a value.
+    #[error("the write was refused ({0}); nothing was written")]
+    WriteRefused(String),
     #[error("several items match")]
     Ambiguous { candidates: Vec<Candidate> },
     #[error("the request was denied")]
@@ -272,6 +329,11 @@ pub enum Reply {
     /// `Get` with `ListFields`: custom field names only.
     FieldNames {
         names: Vec<String>,
+    },
+    /// `Code`: the code and how many seconds it stays valid.
+    Code {
+        code: Secret,
+        seconds_left: u64,
     },
     /// `History`: previous passwords, newest first.
     History {
@@ -521,6 +583,17 @@ mod tests {
                 select: Select::ListFields,
             },
             Op::History { profile: p(), needle: s("n"), user: None, folder: Some(s("f")) },
+            Op::Code { profile: p(), needle: s("n"), user: Some(s("u")), folder: None, ignorecase: true, next: true },
+            Op::Add {
+                profile: None,
+                name: s("n"),
+                user: Some(s("u")),
+                uris: vec![s("https://a.invalid")],
+                folder: Some(s("f")),
+                ask: vec![Part::Password, Part::Notes, Part::Totp],
+            },
+            Op::Edit { profile: p(), needle: s("n"), user: None, folder: None, ask: vec![Part::Password] },
+            Op::Remove { profile: p(), needle: s("n"), user: Some(s("u")), folder: Some(s("f")) },
             Op::Policy { profile: p(), action: PolicyAction::Show },
             Op::Policy {
                 profile: None,
@@ -578,6 +651,7 @@ mod tests {
             Reply::Full { entries: vec![Entry { name: s("password"), value: Secret::new(s("v")) }] },
             Reply::Raw { json: Secret::new(s("{}")) },
             Reply::FieldNames { names: vec![s("totp")] },
+            Reply::Code { code: Secret::new(s("123456")), seconds_left: 17 },
             Reply::History { entries: vec![HistoryEntry { last_used: s("d"), password: Secret::new(s("old")) }] },
             Reply::Policy {
                 entries: vec![PolicyEntry {
@@ -607,6 +681,13 @@ mod tests {
             (NotLoggedIn, "the profile is not logged in"),
             (NotFound, "no item matches"),
             (NoSuchField(s("totp")), "the item has no field named \"totp\""),
+            (NoSuchFolder(s("Work")), "no folder is named \"Work\""),
+            (
+                Totp(s("the TOTP digits 12 is outside 1..=10")),
+                "the TOTP key is not usable: the TOTP digits 12 is outside 1..=10",
+            ),
+            (OutOfDate, "the item changed on the server since it was read; nothing was written (sync and try again)"),
+            (WriteRefused(s("read-only")), "the write was refused (read-only); nothing was written"),
             (Ambiguous { candidates: vec![] }, "several items match"),
             (Denied, "the request was denied"),
             (Prompt, "the password prompt failed"),
@@ -630,8 +711,9 @@ mod tests {
     #[test]
     fn debug_never_prints_a_value() {
         let r = Reply::Full { entries: vec![Entry { name: s("n"), value: Secret::new(s("hunter2")) }] };
+        let code = Reply::Code { code: Secret::new(s("hunter2")), seconds_left: 3 };
         let out = format!(
-            "{r:?} {:?}",
+            "{r:?} {code:?} {:?}",
             Reply::History { entries: vec![HistoryEntry { last_used: s("d"), password: Secret::new(s("hunter2")) }] }
         );
         assert!(!out.contains("hunter2"), "{out}");
