@@ -220,6 +220,18 @@ async fn an_item_that_lists_but_does_not_open_is_an_internal_error_after_the_con
 }
 
 #[tokio::test]
+async fn an_item_whose_field_names_do_not_read_is_an_internal_error_for_list_fields() {
+    let (_dir, agent, host) = setup(|v| {
+        v["ciphers"].as_array_mut().unwrap().iter_mut().filter(|c| c["id"] == "c1").for_each(|c| {
+            c["fields"][0]["name"] = json!("not a cipher string");
+        });
+    })
+    .await;
+    assert_eq!(agent.dispatch(get_op("c1", Select::ListFields)).await, err(AgentError::Internal));
+    assert!(host.world().confirmed.is_empty());
+}
+
+#[tokio::test]
 async fn get_prints_the_main_value_of_every_item_type() {
     let (_dir, agent, host) = setup(|_| {}).await;
     let cases = [
@@ -583,6 +595,11 @@ async fn an_item_outside_any_folder_wins_and_a_part_of_the_name_is_tried_last_as
     // No item is named exactly that: a part of the name, by the same passes.
     assert_eq!(id_of("ünï 😀", None).await, "c1b");
     assert_eq!(id_of("ünï 😀", Some("Work")).await, "c1");
+    // -i: a part of the name in any case.
+    let mut op = get_op("MAIL ÜNÏ", Select::Field("name".into()));
+    let Op::Get { ignorecase, .. } = &mut op else { panic!() };
+    *ignorecase = true;
+    assert_eq!(text(allowed(&agent, &host, op).await), MAIL);
 }
 
 #[tokio::test]

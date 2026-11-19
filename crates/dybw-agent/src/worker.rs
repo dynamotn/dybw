@@ -412,7 +412,6 @@ fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Sc
         Read::Get(Select::Field(name)) => ("get", format!("its field \"{}\"", tidy(name))),
         Read::Get(Select::Full) => ("get", "the full item (every value)".to_owned()),
         Read::Get(Select::Raw) => ("get", "the raw item as JSON".to_owned()),
-        Read::Get(Select::ListFields) => ("get", "the field names".to_owned()),
         Read::Get(_) => ("get", "its main value (password, notes, number or public key)".to_owned()),
         Read::History => ("history", "its password history".to_owned()),
         Read::Code { .. } => ("code", "a TOTP code".to_owned()),
