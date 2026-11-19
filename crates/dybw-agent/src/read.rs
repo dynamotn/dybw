@@ -75,10 +75,6 @@ fn summaries(vault: &UnlockedVault) -> Vec<(&Value, Summary)> {
     rows
 }
 
-fn same(a: &str, b: &str, ignorecase: bool) -> bool {
-    if ignorecase { a.to_lowercase() == b.to_lowercase() } else { a == b }
-}
-
 /// The name of a summary's folder; `None` for no folder or one that does not read.
 fn folder_of<'a>(names: &'a FolderNames, s: &Summary) -> Option<&'a str> {
     names.get(s.folder_id.as_deref()?)?.ok()
@@ -119,44 +115,113 @@ pub fn list(vault: &UnlockedVault, fields: &[Field], folder: Option<&str>, term:
     Reply::Items { items }
 }
 
-/// rbw's lookup, as far as a summary allows: the cipher id, else the item name; `user` and the folder narrow the
-/// name matches. Several matches are `Ambiguous`, naming id, name and user only. A URL names no item here.
-// TODO(core): rbw also matches a URL against an item's URIs; that needs a core summary that decrypts the URIs only.
+/// rbw's lookup (rbw 1.15 `src/bin/rbw/commands.rs`: `parse_needle`, `find_entry`, `find_entry_raw`,
+/// `DecryptedSearchCipher::matches`, `matches_url`), on what `item::summary_with_uris` decrypts: never a value.
+/// A needle equal to an item's id (or the same UUID) is that item. Otherwise a URL with a special scheme (http, https,
+/// ws, wss, ftp, file) is matched against each login's URIs by their match types, and anything else against the
+/// names. rbw's passes: exact first, then a part; within each, an item with no folder and no user when neither was
+/// given, then one of those two strict, then neither. Several matches are `Ambiguous`, naming id, name and user only.
 pub fn find(vault: &UnlockedVault, q: &Lookup) -> Result<Found, AgentError> {
-    let found = |(c, s): &(&Value, Summary)| Found {
-        id: s.id.clone(),
-        name: s.name.to_string(),
-        user: s.user.as_deref().cloned(),
-        reprompt: c.get("reprompt").and_then(Value::as_u64).is_some_and(|r| r != 0),
-        hidden: s.kind == 1 && c.get("viewPassword") == Some(&Value::Bool(false)),
+    let found = |r: &Row| Found {
+        id: r.summary.id.clone(),
+        name: r.summary.name.to_string(),
+        user: r.summary.user.as_deref().cloned(),
+        reprompt: r.cipher.get("reprompt").and_then(Value::as_u64).is_some_and(|n| n != 0),
+        hidden: r.summary.kind == 1 && r.cipher.get("viewPassword") == Some(&Value::Bool(false)),
     };
-    let rows = summaries(vault);
-    if let Some(row) = rows.iter().find(|(_, s)| s.id == q.needle) {
+    let rows = lookups(vault);
+    let uuid = uuid::Uuid::parse_str(&q.needle).ok();
+    let by_id =
+        |r: &&Row| r.summary.id == q.needle || uuid.is_some_and(|u| uuid::Uuid::parse_str(&r.summary.id) == Ok(u));
+    if let Some(row) = rows.iter().find(by_id) {
         return Ok(found(row));
     }
-    let names = q.folder.is_some().then(|| folder_names(&vault.sync, vault.keys.user()));
-    let narrowed = |s: &Summary| {
-        let user = q.user.as_deref().is_none_or(|u| s.user.as_deref().is_some_and(|su| same(su, u, q.ignorecase)));
-        let folder = q.folder.as_deref().is_none_or(|f| {
-            names.as_ref().and_then(|n| folder_of(n, s)).is_some_and(|name| same(name, f, q.ignorecase))
-        });
-        user && folder
+    let url = url::Url::parse(&q.needle).ok().filter(|u| uuid.is_none() && u.is_special());
+    let folders = folder_names(&vault.sync, vault.keys.user());
+    let matches = |r: &Row, strict_user: bool, strict_folder: bool, exact: bool| {
+        let same = |field: &str, term: &str| match (q.ignorecase, exact) {
+            (true, true) => field.to_lowercase() == term.to_lowercase(),
+            (true, false) => field.to_lowercase().contains(&term.to_lowercase()),
+            (false, true) => field == term,
+            (false, false) => field.contains(term),
+        };
+        let given = |have: Option<&str>, want: Option<&str>, strict: bool| match (have, want) {
+            (Some(have), Some(want)) => same(have, want),
+            (Some(_), None) => !strict,
+            (None, Some(_)) => false,
+            (None, None) => true,
+        };
+        given(folder_of(&folders, &r.summary), q.folder.as_deref(), strict_folder)
+            && given(r.summary.user.as_deref().map(|u| u.as_str()), q.user.as_deref(), strict_user)
+            && match &url {
+                Some(url) => r.uris.iter().any(|u| text(&u.uri).is_some_and(|uri| matches_url(uri, u.match_type, url))),
+                None => same(&r.summary.name, &q.needle),
+            }
     };
-    let rows: Vec<_> = rows.into_iter().filter(|(_, s)| narrowed(s)).collect();
-    let hits: Vec<_> = rows.iter().filter(|(_, s)| same(&s.name, &q.needle, q.ignorecase)).collect();
-    match hits.as_slice() {
-        [] => Err(AgentError::NotFound),
-        [one] => Ok(found(one)),
-        many => Err(AgentError::Ambiguous {
-            candidates: many
-                .iter()
-                .map(|(_, s)| Candidate {
-                    id: s.id.clone(),
-                    name: s.name.to_string(),
-                    user: s.user.as_deref().cloned(),
-                })
-                .collect(),
-        }),
+    let pick = |strict_user, strict_folder, exact| -> Vec<&Row> {
+        rows.iter().filter(|r| matches(r, strict_user, strict_folder, exact)).collect()
+    };
+    let mut hits = Vec::new();
+    for exact in [true, false] {
+        hits = pick(true, true, exact);
+        if let [one] = hits.as_slice() {
+            return Ok(found(one));
+        }
+        match (pick(false, true, exact).as_slice(), pick(true, false, exact).as_slice()) {
+            ([one], other) | (other, [one]) if other.len() != 1 => return Ok(found(one)),
+            _ => {}
+        }
+        hits = pick(false, false, exact);
+        if let [one] = hits.as_slice() {
+            return Ok(found(one));
+        }
+    }
+    if hits.is_empty() {
+        return Err(AgentError::NotFound);
+    }
+    let candidates = hits
+        .iter()
+        .map(|r| Candidate {
+            id: r.summary.id.clone(),
+            name: r.summary.name.to_string(),
+            user: r.summary.user.as_deref().cloned(),
+        })
+        .collect();
+    Err(AgentError::Ambiguous { candidates })
+}
+
+/// A readable cipher with what a lookup may decrypt of it.
+struct Row<'a> {
+    cipher: &'a Value,
+    summary: Summary,
+    uris: Vec<item::Uri>,
+}
+
+/// Every readable cipher with its summary and URIs; one that cannot be read is left out, as in [`summaries`].
+fn lookups(vault: &UnlockedVault) -> Vec<Row<'_>> {
+    let read = |c| item::summary_with_uris(c, vault.keys.user(), vault.keys.orgs()).ok();
+    ciphers(&vault.sync)
+        .filter_map(|cipher| read(cipher).map(|l| Row { cipher, summary: l.summary, uris: l.uris }))
+        .collect()
+}
+
+/// Whether a stored URI with its Bitwarden match type (0 domain, the default; 1 host; 2 starts with; 3 exact;
+/// 4 regular expression; 5 never) matches `given`, as rbw 1.15's `matches_url` (`src/bin/rbw/commands.rs`) does. A
+/// match type rbw does not know matches nothing.
+fn matches_url(uri: &str, match_type: Option<u64>, given: &url::Url) -> bool {
+    let host_port = |u: &url::Url| u.host_str().map(|h| u.port().map_or_else(|| h.to_owned(), |p| format!("{h}:{p}")));
+    let stored = url::Url::parse(uri).ok().filter(|s| s.scheme() == given.scheme()).and_then(|s| host_port(&s));
+    match match_type.unwrap_or(0) {
+        0 | 1 => {
+            let Some(given_host) = host_port(given) else { return false };
+            let under = |h: &str| match_type.unwrap_or(0) == 0 && given_host.ends_with(&format!(".{h}"));
+            stored.as_deref().is_some_and(|h| h == given_host || under(h)) || uri == given_host || under(uri)
+        }
+        2 => given.as_str().starts_with(uri),
+        3 if given.path() == "/" => given.as_str().trim_end_matches('/') == uri.trim_end_matches('/'),
+        3 => given.as_str() == uri,
+        4 => regex_automata::meta::Regex::new(uri).is_ok_and(|rx| rx.is_match(given.as_str())),
+        _ => false,
     }
 }
 
@@ -267,11 +332,25 @@ fn field<'a>(item: &'a Item, name: &str) -> Option<&'a str> {
         .or_else(|| item.fields.iter().find(|f| text(&f.name) == Some(name)).and_then(|f| text(&f.value)))
 }
 
-/// Whether `--field name` of the item `id` gives a custom field of the hidden type (1). Field names and types only.
+/// The item's custom fields' names and types, decrypting nothing else (`item::field_names`).
+fn names_of(vault: &UnlockedVault, id: &str) -> Result<Vec<item::FieldName>, AgentError> {
+    let cipher = ciphers(&vault.sync).find(|c| c.get("id").and_then(Value::as_str) == Some(id));
+    item::field_names(cipher.ok_or(AgentError::NotFound)?, vault.keys.user(), vault.keys.orgs()).map_err(|e| {
+        tracing::warn!(id, "the item's field names cannot be read: {e:?}");
+        AgentError::Internal
+    })
+}
+
+/// `get --list-fields`: the custom fields' names, in order; the item is not opened.
+pub fn field_names(vault: &UnlockedVault, id: &str) -> Result<Reply, AgentError> {
+    let names = names_of(vault, id)?.iter().filter_map(|f| text(&f.name)).map(str::to_owned).collect();
+    Ok(Reply::FieldNames { names })
+}
+
+/// Whether the item `id` has a custom field of the hidden type (1) named `name`. Names and types only, so it does not
+/// know whether a property of that name would answer `--field` first: it errs on the side of hiding.
 pub fn hidden_field(vault: &UnlockedVault, id: &str, name: &str) -> Result<bool, AgentError> {
-    let item = item_of(vault, id)?;
-    let custom = item.fields.iter().find(|f| text(&f.name) == Some(name));
-    Ok(builtin(&item, name).is_none() && custom.is_some_and(|f| f.kind == 1))
+    Ok(names_of(vault, id)?.iter().any(|f| f.kind == 1 && text(&f.name) == Some(name)))
 }
 
 fn entry(name: &str, value: &str) -> Entry {
@@ -391,21 +470,20 @@ impl Serialize for RawItem<'_> {
     }
 }
 
-/// What `get` was asked for, after the value gate.
+/// What `get` was asked for, after the value gate (none for `--list-fields`).
 pub fn value(vault: &UnlockedVault, id: &str, select: &Select) -> Result<Reply, AgentError> {
-    let item = item_of(vault, id)?;
+    let item = || item_of(vault, id);
     let value = |v: &str| Reply::Value { value: Secret::new(v.to_owned()) };
     match select {
         Select::Password => {
-            let (what, v) = primary(&item);
+            let (what, v) = primary(&item()?);
             v.map(|v| value(&v)).ok_or_else(|| AgentError::NoSuchField(what.to_owned()))
         }
-        Select::Field(name) => field(&item, name).map(value).ok_or_else(|| AgentError::NoSuchField(name.clone())),
-        Select::Full => Ok(Reply::Full { entries: full(&item) }),
-        Select::Raw => Ok(Reply::Raw { json: raw(&item) }),
-        Select::ListFields => Ok(Reply::FieldNames {
-            names: item.fields.iter().filter_map(|f| text(&f.name)).map(str::to_owned).collect(),
-        }),
+        Select::Field(name) => field(&item()?, name).map(value).ok_or_else(|| AgentError::NoSuchField(name.clone())),
+        Select::Full => Ok(Reply::Full { entries: full(&item()?) }),
+        Select::Raw => Ok(Reply::Raw { json: raw(&item()?) }),
+        // Names only: the item is not opened.
+        Select::ListFields => field_names(vault, id),
     }
 }
 
@@ -472,6 +550,32 @@ pub fn history(vault: &UnlockedVault, id: &str) -> Result<Reply, AgentError> {
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_url_matches_a_stored_uri_by_its_match_type_as_rbw_does() {
+        let at = |given: &str, uri: &str, kind: Option<u64>| matches_url(uri, kind, &url::Url::parse(given).unwrap());
+        // Domain (the default): the host and its subdomains, same scheme; or a bare host stored.
+        assert!(at("https://x.example.com:8443/p", "https://example.com:8443", None));
+        assert!(!at("https://example.com:8443", "https://example.com", Some(0)), "the port is part of the host");
+        assert!(at("https://www.example.com", "example.com", Some(0)));
+        assert!(!at("https://notexample.com", "example.com", Some(0)));
+        // Host: exactly the host (and port), no subdomain.
+        assert!(at("https://example.com/x", "https://example.com", Some(1)));
+        assert!(!at("https://www.example.com", "https://example.com", Some(1)));
+        assert!(at("https://example.com", "example.com", Some(1)));
+        // Starts with, exact (a bare "/" path ignores the trailing slash), regular expression, never.
+        assert!(at("https://example.com/login?a=1", "https://example.com/login", Some(2)));
+        assert!(!at("https://example.com/other", "https://example.com/login", Some(2)));
+        assert!(at("https://example.com/", "https://example.com", Some(3)));
+        assert!(at("https://example.com/a", "https://example.com/a", Some(3)));
+        assert!(!at("https://example.com/a/", "https://example.com/a", Some(3)));
+        assert!(at("https://example.com/a", r"^https://example\.com/", Some(4)));
+        assert!(!at("https://example.com/a", "(", Some(4)), "a pattern that does not compile matches nothing");
+        assert!(!at("https://example.com", "https://example.com", Some(5)));
+        assert!(!at("https://example.com", "https://example.com", Some(9)), "an unknown match type matches nothing");
+        // A URL with no host matches no domain or host rule.
+        assert!(!at("file:///etc/hosts", "file:///etc/hosts", Some(0)));
+    }
 
     #[test]
     fn the_counting_writer_counts_what_it_is_given() {

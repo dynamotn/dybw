@@ -510,6 +510,7 @@ dependencies = [
  "dybw-native",
  "dybw-peer",
  "dybw-proto",
+ "regex-automata",
  "rustix",
  "serde",
  "serde_json",
@@ -520,6 +521,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "zeroize",
 ]

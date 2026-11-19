@@ -4,8 +4,8 @@ The `dybw` command line client and the `dybw-agent` that holds the vault session
 [dybw-core](https://gitlab.com/dynamo-tools/dybw-core). MIT licensed.
 
 **Status: P4.3.** `dybw` logs in with an API key, unlocks, lists, searches and reads items through the agent, gives
-TOTP codes, copies to the clipboard, and adds, edits, generates and trashes logins; URI lookup, the rbw shim and
-the SSH and git integrations come in later phases.
+TOTP codes, copies to the clipboard, finds items by id, name or URI as rbw does, and adds, edits, generates and
+trashes logins; the rbw shim and the SSH and git integrations come in later phases.
 
 | Crate | What |
 |-------|------|
@@ -57,9 +57,10 @@ only says "see the agent log" is explained there.
 ## Limits
 
 - API-key login only (`auth = "password"` profiles are refused).
-- Reading a value (including `get --list-fields` and `history`) follows the caller policy: an AI-class caller is
+- Reading a value (including `history`) follows the caller policy: an AI-class caller is
   denied, an unknown caller (for example a `dybw` whose own parent exited) is asked every time, any other invoker is
-  asked once or "always". `list` and `search` show only names and never ask. An AI-class caller also cannot stop
+  asked once or "always". `list`, `search` and `get --list-fields` show only names and never ask (only the names
+  are decrypted; a reprompt item's field names still need the master password, so an AI-class caller gets none). An AI-class caller also cannot stop
   the agent, unlock, log in or use `dybw policy` (even `show`), and never raises a master-password prompt: a locked
   profile answers "locked" to its `list` and `search`.
 - Grants are a convenience for honest programs, not a boundary: code running as you can defeat them (a script's
@@ -101,7 +102,10 @@ only says "see the agent log" is explained there.
 - On macOS the agent calls `ptrace(PT_DENY_ATTACH)` first thing, so a debugger cannot attach to read the unlocked
   vault: running `dybw-agent` under lldb kills it. (Linux sets `PR_SET_DUMPABLE=0` instead.) A failure is reported
   on stderr and the agent keeps running.
-- No lookup by URI yet.
+- An item is found as rbw 1.15 finds it: by id (any UUID spelling), else a URL with a scheme such as `https://` is
+  matched against the logins' URIs by their match types (domain by default, host, starts with, exact, regular
+  expression, never), else by name; an exact name before a part of one, and an item with no folder or user before
+  one with when `--folder` or the user is not given. Only names, users, folders and URIs are decrypted to find it.
 - An item that asks for a master-password reprompt gives no value (a code included) and takes no change until the
   master password is typed again in the agent's pinentry, after the confirmation; a grant never skips it. The password
   is checked against the unlocked key and sent nowhere; a wrong one is refused and audited.

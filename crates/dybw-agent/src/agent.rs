@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use dybw_native::fsutil::User;
-use dybw_proto::{AgentError, Op, PolicyAction, Reply, Target};
+use dybw_proto::{AgentError, Op, PolicyAction, Reply, Select, Target};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
@@ -200,6 +200,8 @@ impl Agent {
         // on its behalf), no policy, no stop (it could restart the agent under its own environment). An unknown caller
         // writes nothing either. Refused before anything.
         let refused = match &op {
+            // Field names are names (ADR 0012); the worker still refuses an AI caller a reprompt item's.
+            Op::Get { select: Select::ListFields, .. } => None,
             Op::Get { .. }
             | Op::History { .. }
             | Op::Code { .. }

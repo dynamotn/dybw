@@ -373,15 +373,13 @@ async fn get_raw_is_the_decrypted_item_as_json() {
 }
 
 #[tokio::test]
-async fn list_fields_names_the_custom_fields_after_a_confirmation_like_any_value() {
+async fn list_fields_names_the_custom_fields_with_no_question_and_without_opening_the_item() {
     let (_dir, agent, host) = setup(|_| {}).await;
-    assert_eq!(agent.dispatch(get_op("c1", Select::ListFields)).await, err(AgentError::Denied));
-    assert_eq!(agent.opens("work").await, 0, "a no opens nothing");
-    let reply = allowed(&agent, &host, get_op("c1", Select::ListFields)).await;
+    let reply = agent.dispatch(get_op("c1", Select::ListFields)).await;
     assert_eq!(reply, Reply::FieldNames { names: ["text", "hidden", "flag", "linked", ""].map(String::from).to_vec() });
-    assert_eq!(host.world().confirmed[1], format!("{WHO} (dybw get) to read the field names of the item \"{MAIL}\"?"));
-    assert_eq!(agent.opens("work").await, 1);
-    assert_eq!(allowed(&agent, &host, get_op("c2", Select::ListFields)).await, Reply::FieldNames { names: vec![] });
+    assert_eq!(agent.dispatch(get_op("c2", Select::ListFields)).await, Reply::FieldNames { names: vec![] });
+    assert!(host.world().confirmed.is_empty(), "names only, as rbw: nobody is asked");
+    assert_eq!(agent.opens("work").await, 0, "only the names are decrypted, the item is never opened");
 }
 
 #[tokio::test]
@@ -522,13 +520,69 @@ async fn several_matches_are_ambiguous_by_id_name_and_user_only_with_no_prompt_a
 }
 
 #[tokio::test]
-async fn a_url_names_no_item_and_opens_nothing() {
+async fn a_url_finds_the_login_whose_uris_match_it_as_rbw_does_and_opens_nothing_before_the_yes() {
     let (_dir, agent, host) = setup(|_| {}).await;
-    for url in ["https://a.example.invalid/some/path", "https://b.example.invalid", "a.example.invalid"] {
+    // c1's URIs: https://a.example.invalid (default match: domain), https://b.example.invalid (domain), and the
+    // regular expression ^https://c\.example\.invalid/.
+    for url in [
+        "https://a.example.invalid/some/path",
+        "https://www.a.example.invalid",
+        "https://b.example.invalid/x?y=1",
+        "https://c.example.invalid/anything",
+    ] {
+        assert_eq!(agent.dispatch(get_op(url, Select::Password)).await, err(AgentError::Denied), "{url}");
+    }
+    let asked = host.world().confirmed.clone();
+    assert_eq!(asked.len(), 4);
+    assert!(asked.iter().all(|q| q.ends_with(&format!("of the item \"{MAIL}\"?"))), "{asked:?}");
+    for url in
+        ["http://a.example.invalid", "https://example.invalid", "https://xa.example.invalid", "a.example.invalid"]
+    {
         assert_eq!(agent.dispatch(get_op(url, Select::Password)).await, err(AgentError::NotFound), "{url}");
     }
-    assert!(host.world().confirmed.is_empty());
-    assert_eq!(agent.opens("work").await, 0, "no URI matching: lookup never goes beyond the summary");
+    assert_eq!(host.world().confirmed.len(), 4, "no question for a URL that names nothing");
+    assert_eq!(agent.opens("work").await, 0, "the URIs are decrypted for the lookup, nothing else");
+    assert_eq!(text(value_of(&agent, &host, "https://a.example.invalid", Select::Password).await), "pw-ünï-😀");
+}
+
+#[tokio::test]
+async fn a_uuid_needle_is_the_item_with_that_id_in_any_spelling_then_a_name_as_rbw_does() {
+    const ID: &str = "0b3c6f0e-6a3e-4c55-9a59-1c2d3e4f5a6b";
+    let (_dir, agent, host) = setup(|v| {
+        v["ciphers"].as_array_mut().unwrap().iter_mut().filter(|c| c["id"] == "c1").for_each(|c| c["id"] = json!(ID));
+    })
+    .await;
+    assert_eq!(text(value_of(&agent, &host, &ID.to_uppercase(), Select::Field("name".into())).await), MAIL);
+    let other = "0b3c6f0e-6a3e-4c55-9a59-000000000000";
+    assert_eq!(agent.dispatch(get_op(other, Select::Password)).await, err(AgentError::NotFound), "then the names");
+}
+
+#[tokio::test]
+async fn an_item_outside_any_folder_wins_and_a_part_of_the_name_is_tried_last_as_rbw_does() {
+    let (_dir, agent, host) = setup(|v| {
+        let list = v["ciphers"].as_array_mut().unwrap();
+        let mut twin = list.iter().find(|c| c["id"] == "c1").unwrap().clone();
+        twin["id"] = json!("c1b");
+        twin["folderId"] = Value::Null;
+        list.push(twin);
+    })
+    .await;
+    let id_of = |needle: &str, folder: Option<&str>| {
+        let mut op = get_op(needle, Select::Raw);
+        let Op::Get { folder: f, .. } = &mut op else { panic!() };
+        *f = folder.map(Into::into);
+        let (agent, host) = (agent.clone(), host.clone());
+        async move {
+            let Reply::Raw { json } = allowed(&agent, &host, op).await else { panic!() };
+            serde_json::from_str::<Value>(json.expose()).unwrap()["id"].as_str().unwrap().to_owned()
+        }
+    };
+    // c1 is in a folder, its twin is not: with no --folder, the twin is the one (rbw's strict-folder pass).
+    assert_eq!(id_of(MAIL, None).await, "c1b");
+    assert_eq!(id_of(MAIL, Some("Work ünï 😀")).await, "c1");
+    // No item is named exactly that: a part of the name, by the same passes.
+    assert_eq!(id_of("ünï 😀", None).await, "c1b");
+    assert_eq!(id_of("ünï 😀", Some("Work")).await, "c1");
 }
 
 #[tokio::test]

@@ -90,7 +90,7 @@ fn entries(reply: Reply) -> Vec<PolicyEntry> {
 async fn an_ai_class_caller_gets_no_value_and_no_question_but_still_lists() {
     let (_dir, rig) = setup(|_| {}).await;
     let agent = &rig.agent;
-    for select in [Select::Password, Select::Field("user".into()), Select::Full, Select::Raw, Select::ListFields] {
+    for select in [Select::Password, Select::Field("user".into()), Select::Full, Select::Raw] {
         rig.host.allow();
         assert_eq!(agent.dispatch_as(get_op(NOTE, select), ai()).await, err(AgentError::Denied));
     }
@@ -98,7 +98,7 @@ async fn an_ai_class_caller_gets_no_value_and_no_question_but_still_lists() {
     assert_eq!(agent.dispatch_as(history_op(NOTE), ai()).await, err(AgentError::Denied));
     assert!(rig.host.world().confirmed.is_empty(), "nobody is asked on behalf of an AI agent");
     assert_eq!(agent.opens("work").await, 0);
-    assert_eq!(verdicts(&rig), vec![Verdict::Denied; 6]);
+    assert_eq!(verdicts(&rig), vec![Verdict::Denied; 5]);
     // Refused before the vault is opened, so there is no item to name.
     assert!(rig.audit.events().iter().all(|e| e.item.is_none() && matches!(e.caller, Caller::Ai { .. })));
     // Names are for every class.
@@ -109,6 +109,42 @@ async fn an_ai_class_caller_gets_no_value_and_no_question_but_still_lists() {
     assert!(!items(agent.dispatch_as(search, ai()).await).is_empty());
     let status = agent.dispatch_as(Op::Status { profile: Some("work".into()) }, ai()).await;
     assert!(format!("{status:?}").contains("unlocked: true"));
+    // Field names are names (ADR 0012): no question, no open, and the answer is audited with the item.
+    let names = agent.dispatch_as(get_op("c1", Select::ListFields), ai()).await;
+    assert!(matches!(names, Reply::FieldNames { names } if names.len() == 5));
+    assert!(rig.host.world().confirmed.is_empty());
+    assert_eq!(agent.opens("work").await, 0);
+    let last = rig.audit.events().last().cloned().unwrap();
+    assert_eq!(
+        (last.op, last.kind, last.item.as_deref(), last.verdict),
+        ("get", Some("list-fields"), Some("c1"), Verdict::Listed)
+    );
+}
+
+#[tokio::test]
+async fn the_field_names_of_a_reprompt_item_need_the_master_password_which_is_never_asked_for_an_ai_caller() {
+    let (_dir, rig) = setup(|v| {
+        v["ciphers"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .filter(|c| c["id"] == "c1")
+            .for_each(|c| c["reprompt"] = json!(1));
+    })
+    .await;
+    let agent = &rig.agent;
+    let asked = rig.host.world().asked.len();
+    assert_eq!(agent.dispatch_as(get_op("c1", Select::ListFields), ai()).await, err(AgentError::Denied));
+    assert_eq!(rig.host.world().asked.len(), asked, "no prompt on behalf of an AI agent");
+    assert_eq!(verdicts(&rig), [Verdict::Denied]);
+    // An invoker is asked for it (here: no answer), and gets nothing without it.
+    assert_eq!(
+        agent.dispatch_as(get_op("c1", Select::ListFields), tool("/opt/a.sh", "h1")).await,
+        err(AgentError::Denied)
+    );
+    assert_eq!(rig.host.world().asked.len(), asked + 1);
+    assert!(rig.host.world().confirmed.is_empty(), "the names need no confirmation, only the reprompt");
+    assert_eq!(agent.opens("work").await, 0);
 }
 
 #[tokio::test]
@@ -153,8 +189,7 @@ async fn an_always_is_remembered_for_that_program_until_its_content_changes() {
 
     // The same program is let through without a question, for any single value.
     assert_eq!(text(password(&rig, a()).await), "the note's text");
-    rig.host.allow();
-    assert!(!matches!(rig.agent.dispatch_as(get_op(NOTE, Select::ListFields), a()).await, Reply::Error { .. }));
+    assert_eq!(text(rig.agent.dispatch_as(get_op(NOTE, Select::Field("notes".into())), a()).await), "the note's text");
     assert_eq!(rig.host.world().confirmed.len(), 1, "no second question");
 
     // The program was replaced: the grant is revoked, and the question comes back.

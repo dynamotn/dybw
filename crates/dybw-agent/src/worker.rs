@@ -619,14 +619,19 @@ async fn get<H: Host>(
         Ok(found) => found,
         Err(e) => return error(e),
     };
-    // TODO(core): field_names, a names-only decrypt; until then `--list-fields` opens the whole item, so it is a
-    // value request like any other.
     if found.hidden && shows_password(&read) {
         tracing::warn!(profile = %ctx.profile.name, id = %found.id, "denied: the organization hides this item's password");
         audit(ctx, caller, op_of(&read), Some(&found.id), Verdict::Denied);
         return error(AgentError::Denied);
     }
-    if let Err(e) = gate(shared, host, ctx, caller, &found, &read).await {
+    // Field names are names (ADR 0012): no question for any caller, but a reprompt item still asks for the master
+    // password, which is never asked on behalf of an AI agent.
+    let names = matches!(read, Read::Get(Select::ListFields));
+    if names && found.reprompt && matches!(caller, Caller::Ai { .. }) {
+        audit(ctx, caller, op_of(&read), Some(&found.id), Verdict::Denied);
+        return error(AgentError::Denied);
+    }
+    if !names && let Err(e) = gate(shared, host, ctx, caller, &found, &read).await {
         return error(e);
     }
     if found.reprompt {
@@ -641,8 +646,8 @@ async fn get<H: Host>(
         audit(ctx, caller, op_of(&read), Some(&found.id), Verdict::Denied);
         return error(AgentError::Denied);
     }
-    // A hidden-type custom field is hidden with the password. Telling it apart opens the item, so it is checked only
-    // now, after the user's yes: an unconfirmed caller learns nothing from how fast it is refused.
+    // A hidden-type custom field is hidden with the password. It is checked only now, after the user's yes, as
+    // ruled in P4.3: an unconfirmed caller learns nothing from the refusal (no oracle on field types).
     if found.hidden
         && let Read::Get(Select::Field(name)) = &read
         && with_vault(shared, |v| same_item(ctx, v, &found).and_then(|()| read::hidden_field(v, &found.id, name)))
@@ -666,7 +671,11 @@ async fn get<H: Host>(
             _ => read::history(v, &found.id),
         }
     };
-    with_vault(shared, open).unwrap_or_else(error)
+    let reply = with_vault(shared, open).unwrap_or_else(error);
+    if names && matches!(reply, Reply::FieldNames { .. }) {
+        audit(ctx, caller, op_of(&read), Some(&found.id), Verdict::Listed);
+    }
+    reply
 }
 
 /// Whether `read` gives a login's password, TOTP key or history, or the whole item (which holds them).
