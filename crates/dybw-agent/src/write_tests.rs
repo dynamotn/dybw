@@ -582,11 +582,10 @@ async fn a_reprompt_item_needs_the_master_password_before_any_value() {
     rig.host.answer(Answer::Text(PASSWORD));
     assert_eq!(text(rig.agent.dispatch(get_op("c1", Select::Password)).await), "pw-ünï-😀");
     let (desc, _) = rig.host.world().asked.last().unwrap().clone();
-    assert!(
-        desc.starts_with(
-            "dybw profile work: the item \"Mail ünï 😀\" asks for the master password again (dybw get by "
-        )
-    );
+    assert!(desc.starts_with(
+        "dybw profile work: the item \"Mail ünï 😀\" (user \"me@example.invalid\", folder \"Work ünï 😀\", id c1) asks \
+             for the master password again (dybw get by "
+    ));
     assert_eq!(rig.host.world().prompts.last().unwrap(), "Master password:");
     // Wrong, cancelled, failed: nothing is opened, for a code, the history or a value.
     rig.host.allow();

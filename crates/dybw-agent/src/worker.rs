@@ -428,14 +428,20 @@ fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Sc
 /// The item a question is about, told apart from any other of the same name: its name, user, folder or
 /// organization, and the start of its id.
 pub(crate) fn item_text(found: &Found) -> String {
-    let user = found.user.as_deref().map_or_else(|| "no user".to_owned(), |u| format!("user \"{}\"", tidy(u)));
+    let user = found.user.as_deref().map_or_else(|| "no user".to_owned(), |u| format!("user {}", quoted(u)));
     let place = match (&found.org, &found.folder) {
-        (Some(org), _) => format!("organization item \"{}\"", tidy(org)),
-        (None, Some(folder)) => format!("folder \"{}\"", tidy(folder)),
+        (Some(org), _) => format!("organization item {}", quoted(org)),
+        (None, Some(folder)) => format!("folder {}", quoted(folder)),
         (None, None) => "no folder".to_owned(),
     };
     let id: String = found.id.chars().take(8).collect();
-    format!("\"{}\" ({user}, {place}, id {})", tidy(&found.name), tidy(&id))
+    format!("{} ({user}, {place}, id {})", quoted(&found.name), tidy(&id))
+}
+
+/// `s` [`tidy`] in double quotes, with its own quotes and backslashes escaped: a name cannot close the quote and
+/// fake what follows it.
+fn quoted(s: &str) -> String {
+    format!("\"{}\"", tidy(s).replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// `s` on one line, cut for a question.
@@ -592,9 +598,9 @@ async fn reprompt<H: Host>(
     let target = shared.state.borrow().slot.as_ref().map(|s| (account(s), s.vault.user_key_id()));
     let Some(((origin, account), unlocked)) = target else { return Err(AgentError::Locked) };
     let description = format!(
-        "dybw profile {}: the item \"{}\" asks for the master password again (dybw {} by {})",
+        "dybw profile {}: the item {} asks for the master password again (dybw {} by {})",
         ctx.profile.name,
-        tidy(&found.name),
+        item_text(found),
         op.0,
         policy::who(caller)
     );
@@ -925,6 +931,14 @@ mod tests {
         assert_eq!(mine, "\"GitHub\" (user \"me\", folder \"Dev\", id 0b3c6f0e)");
         assert_eq!(theirs, "\"GitHub\" (no user, organization item \"Acme\", id 9f00aa11)");
         assert_eq!(item_text(&item(None, None, None, "x1")), "\"GitHub\" (no user, no folder, id x1)");
+        // A name cannot fake the suffix: its quotes and backslashes are escaped.
+        let mut fake = item(None, None, Some("Acme"), "9f00aa11");
+        fake.name = r#"GitHub" (user "me", folder "Dev", id 0b3c6f0e)"#.into();
+        fake.user = Some(r"a\".into());
+        assert_eq!(
+            item_text(&fake),
+            r#""GitHub\" (user \"me\", folder \"Dev\", id 0b3c6f0e)" (user "a\\", organization item "Acme", id 9f00aa11)"#
+        );
     }
 
     #[test]
