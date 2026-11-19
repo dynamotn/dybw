@@ -280,11 +280,13 @@ async fn a_deny_entry_refuses_every_write_of_that_program_without_asking() {
     rig.host.allow();
     let deny = dybw_proto::PolicyAction::Deny { invoker: "/usr/local/bin/mytool".into(), script: None };
     assert_eq!(rig.agent.dispatch(Op::Policy { profile: w(), action: deny }).await, Reply::Done);
-    for op in [add_op("New", None, &[]), edit_op("x1", &[Part::Notes]), remove_op("x1")] {
+    for op in [add_op("New", None, &[]), edit_op("x1", &[Part::Notes]), remove_op("m1")] {
         rig.host.allow();
         assert_eq!(rig.agent.dispatch_as(op, program()).await, err(AgentError::Denied));
     }
     assert_eq!(rig.host.world().confirmed.len(), 1, "only the policy change was asked");
+    // Refused before the plan: not even a marked item's field names were opened.
+    assert_eq!(rig.agent.opens("work").await, 0);
     assert_eq!(writes(&rig), 0);
     let verdicts: Vec<_> = audited(&rig).into_iter().map(|(op, _, v)| (op, v)).collect();
     let denied = |op| (op, Verdict::Denied);
@@ -706,14 +708,18 @@ async fn an_organization_login_that_hides_its_password_gives_no_password_totp_or
     }
     assert!(rig.host.world().confirmed.is_empty(), "refused before any question");
     assert_eq!(rig.agent.opens("org").await, 0);
-    // A custom field of the hidden type is hidden with the password, as the official clients hide it.
-    rig.host.allow();
-    assert_eq!(rig.agent.dispatch(org(get_op("o1", Select::Field("hidden".into())))).await, err(AgentError::Denied));
-    assert!(rig.host.world().confirmed.is_empty(), "refused before any question");
-    assert!(audited(&rig).iter().all(|(_, item, v)| item.as_deref() == Some("o1") && *v == Verdict::Denied));
-    assert_eq!(audited(&rig).len(), 8);
-    // What the organization shows is still given.
+    assert_eq!(audited(&rig).len(), 7);
+    // A custom field of the hidden type is hidden with the password, as the official clients hide it. Telling it from
+    // a shown one needs the item opened, so the user is asked first (no instant answer tells it apart), then refused.
     rig.host.world().confirms.clear();
+    let hidden = || org(get_op("o1", Select::Field("hidden".into())));
+    assert_eq!(rig.agent.dispatch(hidden()).await, err(AgentError::Denied), "declined");
+    assert_eq!(rig.agent.opens("org").await, 0, "nothing opened before the yes");
+    rig.host.allow();
+    assert_eq!(rig.agent.dispatch(hidden()).await, err(AgentError::Denied));
+    assert_eq!(rig.host.world().confirmed.len(), 2, "asked both times");
+    assert_eq!(audited(&rig).last().unwrap().2, Verdict::Denied);
+    // What the organization shows is still given.
     rig.host.allow();
     assert!(matches!(rig.agent.dispatch(org(get_op("o1", Select::ListFields))).await, Reply::FieldNames { .. }));
     rig.host.allow();

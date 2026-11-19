@@ -621,9 +621,7 @@ async fn get<H: Host>(
     };
     // TODO(core): field_names, a names-only decrypt; until then `--list-fields` opens the whole item, so it is a
     // value request like any other.
-    // A hidden-type custom field is hidden with the password; telling which field it is opens the item's field names.
-    let hidden_field = |name: &str| with_vault(shared, |v| read::hidden_field(v, &found.id, name)).unwrap_or(true);
-    if found.hidden && (shows_password(&read) || matches!(&read, Read::Get(Select::Field(n)) if hidden_field(n))) {
+    if found.hidden && shows_password(&read) {
         tracing::warn!(profile = %ctx.profile.name, id = %found.id, "denied: the organization hides this item's password");
         audit(ctx, caller, op_of(&read), Some(&found.id), Verdict::Denied);
         return error(AgentError::Denied);
@@ -640,6 +638,17 @@ async fn get<H: Host>(
     // The user may have taken a while: the peer must still be the one that asked, before anything is opened.
     if !still.holds() {
         tracing::warn!(profile = %ctx.profile.name, id = %found.id, "the caller changed while the user was asked");
+        audit(ctx, caller, op_of(&read), Some(&found.id), Verdict::Denied);
+        return error(AgentError::Denied);
+    }
+    // A hidden-type custom field is hidden with the password. Telling it apart opens the item, so it is checked only
+    // now, after the user's yes: an unconfirmed caller learns nothing from how fast it is refused.
+    if found.hidden
+        && let Read::Get(Select::Field(name)) = &read
+        && with_vault(shared, |v| same_item(ctx, v, &found).and_then(|()| read::hidden_field(v, &found.id, name)))
+            .unwrap_or(true)
+    {
+        tracing::warn!(profile = %ctx.profile.name, id = %found.id, "denied: the organization hides this field");
         audit(ctx, caller, op_of(&read), Some(&found.id), Verdict::Denied);
         return error(AgentError::Denied);
     }

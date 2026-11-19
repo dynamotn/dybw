@@ -27,8 +27,8 @@ the SSH and git integrations come in later phases.
 | `dybw get <item> [user]` | The main value; `-f <field>`, `--full`, `--raw`, `-l` (`--list-fields`), `--folder`, `-i`, `-c` (copy instead of print) |
 | `dybw history <item>` | Previous passwords, newest first |
 | `dybw code <item> [user]` | The current TOTP code; `--next` waits for the next one when fewer than 5 s are left; `--folder`, `-i`, `-c` |
-| `dybw add <name> [user]` | A new login: `--uri U` (repeatable), `--folder F` (created if missing); the password, and with `--notes` the notes, are typed in the agent's pinentry |
-| `dybw edit <item> [user]` | A new password (the old one goes to the history), and with `--notes` new notes (`--no-password`: notes only), typed in the agent's pinentry; `--folder` |
+| `dybw add <name> [user]` | A new login: `--uri U` (repeatable), `--folder F` (created if missing); the password (unless `--no-password`), and with `--notes` the notes, are typed in the agent's pinentry |
+| `dybw edit <item> [user]` | A new password (the old one goes to the history), and with `--notes` new notes (`--no-password`: notes only), typed in the agent's pinentry; `--folder` (to find the item) |
 | `dybw remove <item> [user]` | Move the item to the trash (never purged); `--folder` |
 | `dybw generate <len>` | Print a random password made here (OS random numbers, no agent): `--no-symbols`, `--only-numbers`, `--nonconfusables`, `--diceware` (`<len>` words of the EFF large list) |
 | `dybw generate <len> <name> [user]` | The agent makes the password and saves it as a new login (`--uri`, `--folder`); nothing is printed |
@@ -112,7 +112,8 @@ only says "see the agent log" is explained there.
   socket: the agent asks for them in its own pinentry, one line each, so notes are a single line (multi-line notes
   through `$EDITOR` come with the rbw shim, P4.4). An empty answer cancels. `edit` changes the password and the notes
   only (no rename, user, URIs, folder or TOTP key). An item changed on the server since the last sync is refused
-  ("sync and try again") and nothing is written. New logins are personal (no creating into an organization).
+  ("sync and try again") and nothing is written. New logins are personal (no creating into an organization). A
+  folder that `add` or `generate` created stays when the login create then fails, as with rbw.
 - `generate <len> <name>` prints nothing: unlike rbw it does not show the new password, which the agent made and
   kept. Read it with `dybw get <name>`, which goes through the confirmation like any other value.
 - `-c` copies in the `dybw` process and clears the clipboard after `clipboard_clear_seconds` (default 30) only if it

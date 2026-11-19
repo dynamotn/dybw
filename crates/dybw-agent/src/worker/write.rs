@@ -330,6 +330,12 @@ pub(super) async fn write<H: Host>(
     write: Write,
 ) -> Reply {
     let op = (write.op(), None);
+    // Before the plan: a caller the policy refuses makes the agent open nothing.
+    let store = Store::new(&ctx.paths.policy, ctx.user.uid);
+    if policy::decide(caller, &store.load(), &[], Access::Write) == Decision::Deny {
+        audit(ctx, caller, op, None, Verdict::Denied);
+        return error(AgentError::Denied);
+    }
     let planned = match with_vault(shared, |v| plan(v, &write)) {
         Ok(planned) => planned,
         Err(e) => return error(e),
@@ -339,10 +345,6 @@ pub(super) async fn write<H: Host>(
         audit(ctx, caller, op, item.as_deref(), verdict);
         error(e)
     };
-    let store = Store::new(&ctx.paths.policy, ctx.user.uid);
-    if policy::decide(caller, &store.load(), &[], Access::Write) == Decision::Deny {
-        return end(Verdict::Denied, AgentError::Denied);
-    }
     let values = {
         let _screen = shared.asking.lock().await;
         if let Err(e) = session::confirm(host, &question(ctx, caller, &write, &planned), false).await {
@@ -355,7 +357,7 @@ pub(super) async fn write<H: Host>(
         }
         match values(host, ctx, &planned.name, &write).await {
             Ok(values) => values,
-            Err(e @ AgentError::Totp(_)) => return end(Verdict::Failed, e),
+            Err(e @ (AgentError::Totp(_) | AgentError::Internal)) => return end(Verdict::Failed, e),
             Err(e) => return end(Verdict::Declined, e),
         }
     };
