@@ -617,19 +617,36 @@ impl From<serde_json::Error> for FrameError {
 
 /// Serialise `value` into one frame: 4-byte big-endian length, then the JSON body.
 ///
-/// The frame is zeroed on drop. Growing the `Vec` while serde_json writes can still leave freed,
-/// unzeroed copies of the early part of a large body; only the final buffer is wiped.
+/// The body is measured first and written once into a buffer of exactly its size, so the `Vec` never grows (a growing
+/// one would leave freed, unzeroed copies of what it held); the frame is zeroed on drop.
 pub fn encode<T: Serialize>(value: &T) -> Result<Zeroizing<Vec<u8>>, FrameError> {
-    let mut frame = Zeroizing::new(vec![0; 4]);
-    serde_json::to_writer(&mut *frame, value)?;
-    let len = frame.len() - 4;
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value)?;
+    let len = count.0;
     if len > MAX_FRAME {
         return Err(FrameError::TooLarge(len));
     }
+    let mut frame = Zeroizing::new(Vec::with_capacity(4 + len));
+    frame.extend_from_slice(&[0; 4]);
+    serde_json::to_writer(&mut *frame, value)?;
     // The length fits: it is at most MAX_FRAME. Four bytes for four, so the buffer is not reallocated (nothing
     // unzeroed is left behind).
     frame.splice(..4, (len as u32).to_be_bytes());
     Ok(frame)
+}
+
+/// A writer that only counts.
+struct Count(usize);
+
+impl std::io::Write for Count {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0 += b.len();
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// The body of the first frame of `buf`: `Ok(None)` while it is incomplete.
@@ -708,6 +725,15 @@ mod tests {
     fn oversize_header_is_refused_without_the_body() {
         let header = (MAX_FRAME as u32 + 1).to_be_bytes();
         assert!(matches!(decode_request(&header), Err(FrameError::TooLarge(n)) if n == MAX_FRAME + 1));
+    }
+
+    #[test]
+    fn a_frame_is_written_into_a_buffer_of_its_exact_size() {
+        let res = Response::new(Reply::Value { value: Secret::new("x".repeat(100_000)) });
+        let frame = encode(&res).unwrap();
+        assert_eq!(frame.capacity(), frame.len(), "never grown, so nothing was left behind");
+        let mut count = Count(0);
+        std::io::Write::flush(&mut count).unwrap();
     }
 
     #[test]
