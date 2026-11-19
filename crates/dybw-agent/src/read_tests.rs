@@ -15,6 +15,8 @@ use crate::host::fake::{Answer, FakeHost};
 
 pub(crate) const VAULT: &str = include_str!("../tests/fixtures/vault.json");
 pub(crate) const MAIL: &str = "Mail ünï 😀";
+/// How a question names c1, the login `MAIL`.
+pub(crate) const C1: &str = "\"Mail ünï 😀\" (user \"me@example.invalid\", folder \"Work ünï 😀\", id c1)";
 /// How every question starts: the profile and the stock caller of the tests.
 pub(crate) const WHO: &str =
     "dybw profile work: allow /usr/local/bin/mytool which claims to run /opt/scripts/backup.sh";
@@ -426,7 +428,7 @@ async fn history_lists_the_old_passwords_newest_first_after_a_confirmation() {
     assert_eq!(got, [("2025-02-01T00:00:00Z", "old-2"), ("unknown", "old-1")]);
     assert_eq!(allowed(&agent, &host, history_op("n1")).await, Reply::History { entries: vec![] });
     let asked = host.world().confirmed.clone();
-    assert_eq!(asked[0], format!("{WHO} (dybw history) to read its password history of the item \"{MAIL}\"?"));
+    assert_eq!(asked[0], format!("{WHO} (dybw history) to read its password history of the item {C1}?"));
     // No confirmation, no history.
     assert_eq!(agent.dispatch(history_op("c1")).await, err(AgentError::Denied));
 }
@@ -440,7 +442,7 @@ async fn every_value_request_is_confirmed_first_naming_the_profile_the_item_and_
     value_of(&agent, &host, "c1", Select::Raw).await;
     let asked = host.world().confirmed.clone();
     let lead = format!("{WHO} (dybw get) to read ");
-    let tail = format!(" of the item \"{MAIL}\"?");
+    let tail = format!(" of the item {C1}?");
     let what = [
         "its main value (password, notes, number or public key)",
         "its field \"hidden\"",
@@ -546,7 +548,7 @@ async fn a_url_finds_the_login_whose_uris_match_it_as_rbw_does_and_opens_nothing
     }
     let asked = host.world().confirmed.clone();
     assert_eq!(asked.len(), 4);
-    assert!(asked.iter().all(|q| q.ends_with(&format!("of the item \"{MAIL}\"?"))), "{asked:?}");
+    assert!(asked.iter().all(|q| q.ends_with(&format!("of the item {C1}?"))), "{asked:?}");
     for url in
         ["http://a.example.invalid", "https://example.invalid", "https://xa.example.invalid", "a.example.invalid"]
     {

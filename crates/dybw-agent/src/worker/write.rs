@@ -130,6 +130,7 @@ fn label(part: Part) -> (&'static str, &'static str) {
 /// item, the namespaces that lose it.
 fn question(ctx: &Ctx, caller: &Caller, write: &Write, planned: &Planned) -> String {
     let name = tidy(&planned.name);
+    let item = planned.found.as_ref().map_or_else(|| format!("\"{name}\""), item_text);
     let what = match write {
         Write::Add { user, folder, uris, generate, .. } => {
             let user = user.as_deref().map(|u| format!(" for the user \"{}\"", tidy(u))).unwrap_or_default();
@@ -140,13 +141,13 @@ fn question(ctx: &Ctx, caller: &Caller, write: &Write, planned: &Planned) -> Str
         }
         Write::Edit { ask, .. } => {
             let parts: Vec<_> = ask.iter().map(|p| label(*p).1).collect();
-            format!("change {} of the item \"{name}\"", parts.join(" and "))
+            format!("change {} of the item {item}", parts.join(" and "))
         }
         Write::Remove { .. } if !planned.markers.is_empty() => format!(
-            "move the item \"{name}\" to the trash; it is marked for {}, whose tools lose it",
+            "move the item {item} to the trash; it is marked for {}, whose tools lose it",
             policy::shown(&planned.markers.join(", "), 200)
         ),
-        Write::Remove { .. } => format!("move the item \"{name}\" to the trash"),
+        Write::Remove { .. } => format!("move the item {item} to the trash"),
     };
     format!(
         "dybw profile {}: allow {} (dybw {}) to {what}? (asked for every change)",

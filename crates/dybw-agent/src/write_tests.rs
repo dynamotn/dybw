@@ -185,7 +185,10 @@ async fn a_code_is_a_value_read_behind_the_same_gate_and_never_the_key() {
     let Reply::Code { code, seconds_left } = rig.agent.dispatch(code_op("c1", false)).await else { panic!() };
     assert_eq!((code.expose(), seconds_left), (code_at(PERIOD_START + 7).as_str(), 23));
     let asked = rig.host.world().confirmed[1].clone();
-    assert!(asked.ends_with("(dybw code) to read a TOTP code of the item \"Mail ünï 😀\"?"), "{asked}");
+    assert!(
+        asked.ends_with(&format!("(dybw code) to read a TOTP code of the item {}?", crate::read_tests::C1)),
+        "{asked}"
+    );
     let id = Some("c1".to_owned());
     assert_eq!(audited(&rig), [("code", id.clone(), Verdict::Declined), ("code", id, Verdict::Confirmed)]);
     // A grant of a program covers codes, as any single value.
@@ -238,7 +241,11 @@ async fn edit_asks_the_new_password_in_the_pinentry_keeps_the_old_one_and_syncs(
         let world = rig.host.world();
         let confirm = world.confirmed[0].clone();
         assert!(
-            confirm.ends_with("(dybw edit) to change the password of the item \"Plain\"? (asked for every change)")
+            confirm.ends_with(
+                "(dybw edit) to change the password of the item \"Plain\" (user \"me\", no folder, id x1)? (asked for \
+                 every change)"
+            ),
+            "{confirm}"
         );
         let (desc, _) = world.asked.last().unwrap().clone();
         assert!(
@@ -403,17 +410,28 @@ async fn a_write_on_an_item_that_changed_on_the_server_is_refused_and_nothing_is
 #[tokio::test]
 async fn remove_moves_to_the_trash_and_names_the_namespaces_marking_the_item() {
     let (_dir, rig) = setup(|_| {}).await;
+    // The question names the markers from the field names alone: a no opens nothing.
+    assert_eq!(rig.agent.dispatch(remove_op("m1")).await, err(AgentError::Denied));
+    assert!(rig.host.world().confirmed[0].contains("it is marked for obsidian, other"));
+    assert_eq!(rig.agent.opens("work").await, 0);
+    rig.host.world().confirmed.clear();
     rig.host.allow();
     assert_eq!(rig.agent.dispatch(remove_op("m1")).await, Reply::Done);
     rig.host.allow();
     assert_eq!(rig.agent.dispatch(remove_op("x1")).await, Reply::Done);
     {
         let world = rig.host.world();
-        assert!(world.confirmed[0].ends_with(
-            "(dybw remove) to move the item \"API token\" to the trash; it is marked for obsidian, other, whose tools lose \
-             it? (asked for every change)"
+        assert!(
+            world.confirmed[0].ends_with(
+                "(dybw remove) to move the item \"API token\" (user \"bot\", no folder, id m1) to the trash; it is marked for \
+                 obsidian, other, whose tools lose it? (asked for every change)"
+            ),
+            "{}",
+            world.confirmed[0]
+        );
+        assert!(world.confirmed[1].ends_with(
+            "to move the item \"Plain\" (user \"me\", no folder, id x1) to the trash? (asked for every change)"
         ));
-        assert!(world.confirmed[1].ends_with("to move the item \"Plain\" to the trash? (asked for every change)"));
         assert_eq!((world.count("/api/ciphers/m1/delete"), world.count("/api/ciphers/x1/delete")), (1, 1));
     }
     assert!(cipher(&rig, "m1")["deletedDate"].is_string(), "in the trash, not purged");

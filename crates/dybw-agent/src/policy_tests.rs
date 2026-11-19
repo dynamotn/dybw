@@ -122,7 +122,7 @@ async fn an_ai_class_caller_gets_no_value_and_no_question_but_still_lists() {
 }
 
 #[tokio::test]
-async fn the_field_names_of_a_reprompt_item_need_the_master_password_which_is_never_asked_for_an_ai_caller() {
+async fn the_field_names_of_a_reprompt_item_need_the_master_password_never_asked_for_an_ai_or_unknown_caller() {
     let (_dir, rig) = setup(|v| {
         v["ciphers"]
             .as_array_mut()
@@ -135,8 +135,9 @@ async fn the_field_names_of_a_reprompt_item_need_the_master_password_which_is_ne
     let agent = &rig.agent;
     let asked = rig.host.world().asked.len();
     assert_eq!(agent.dispatch_as(get_op("c1", Select::ListFields), ai()).await, err(AgentError::Denied));
-    assert_eq!(rig.host.world().asked.len(), asked, "no prompt on behalf of an AI agent");
-    assert_eq!(verdicts(&rig), [Verdict::Denied]);
+    assert_eq!(agent.dispatch_as(get_op("c1", Select::ListFields), unknown()).await, err(AgentError::Denied));
+    assert_eq!(rig.host.world().asked.len(), asked, "no prompt on behalf of an AI agent or an unidentified caller");
+    assert_eq!(verdicts(&rig), [Verdict::Denied, Verdict::Denied]);
     // An invoker is asked for it (here: no answer), and gets nothing without it.
     assert_eq!(
         agent.dispatch_as(get_op("c1", Select::ListFields), tool("/opt/a.sh", "h1")).await,

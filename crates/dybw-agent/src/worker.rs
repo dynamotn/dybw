@@ -418,11 +418,24 @@ fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Sc
     };
     let scope = if remember == Scope::Process { " [always (this process only)]" } else { "" };
     format!(
-        "dybw profile {}: allow {} (dybw {command}) to read {what} of the item \"{}\"?{scope}",
+        "dybw profile {}: allow {} (dybw {command}) to read {what} of the item {}?{scope}",
         ctx.profile.name,
         policy::who(caller),
-        tidy(&found.name)
+        item_text(found)
     )
+}
+
+/// The item a question is about, told apart from any other of the same name: its name, user, folder or
+/// organization, and the start of its id.
+pub(crate) fn item_text(found: &Found) -> String {
+    let user = found.user.as_deref().map_or_else(|| "no user".to_owned(), |u| format!("user \"{}\"", tidy(u)));
+    let place = match (&found.org, &found.folder) {
+        (Some(org), _) => format!("organization item \"{}\"", tidy(org)),
+        (None, Some(folder)) => format!("folder \"{}\"", tidy(folder)),
+        (None, None) => "no folder".to_owned(),
+    };
+    let id: String = found.id.chars().take(8).collect();
+    format!("\"{}\" ({user}, {place}, id {})", tidy(&found.name), tidy(&id))
 }
 
 /// `s` on one line, cut for a question.
@@ -624,9 +637,9 @@ async fn get<H: Host>(
         return error(AgentError::Denied);
     }
     // Field names are names (ADR 0012): no question for any caller, but a reprompt item still asks for the master
-    // password, which is never asked on behalf of an AI agent.
+    // password, which is never asked on behalf of an AI agent or an unidentified caller.
     let names = matches!(read, Read::Get(Select::ListFields));
-    if names && found.reprompt && matches!(caller, Caller::Ai { .. }) {
+    if names && found.reprompt && matches!(caller, Caller::Ai { .. } | Caller::Unknown { .. }) {
         audit(ctx, caller, op_of(&read), Some(&found.id), Verdict::Denied);
         return error(AgentError::Denied);
     }
@@ -895,6 +908,24 @@ async fn install(shared: &Shared, ctx: &Ctx, sync: serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_tells_apart_two_items_of_the_same_name() {
+        let item = |user: Option<&str>, folder: Option<&str>, org: Option<&str>, id: &str| Found {
+            id: id.into(),
+            name: "GitHub".into(),
+            user: user.map(Into::into),
+            folder: folder.map(Into::into),
+            org: org.map(Into::into),
+            reprompt: false,
+            hidden: false,
+        };
+        let mine = item_text(&item(Some("me"), Some("Dev"), None, "0b3c6f0e-6a3e-4c55-9a59-1c2d3e4f5a6b"));
+        let theirs = item_text(&item(None, Some("Dev"), Some("Acme"), "9f00aa11-0000-4000-8000-000000000000"));
+        assert_eq!(mine, "\"GitHub\" (user \"me\", folder \"Dev\", id 0b3c6f0e)");
+        assert_eq!(theirs, "\"GitHub\" (no user, organization item \"Acme\", id 9f00aa11)");
+        assert_eq!(item_text(&item(None, None, None, "x1")), "\"GitHub\" (no user, no folder, id x1)");
+    }
 
     #[test]
     fn a_write_prints_its_selectors_only() {

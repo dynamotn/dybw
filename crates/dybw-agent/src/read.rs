@@ -30,6 +30,10 @@ pub struct Found {
     pub id: String,
     pub name: String,
     pub user: Option<String>,
+    /// The name of its folder, when it is in one that reads.
+    pub folder: Option<String>,
+    /// An organization item: the organization's name, or its id when `/sync` gives no name.
+    pub org: Option<String>,
     /// The cipher asks for the master password again (`reprompt`, a plain field) before any value or change.
     pub reprompt: bool,
     /// A login whose organization hides its password (`viewPassword: false`): its password, TOTP key and history are
@@ -122,22 +126,24 @@ pub fn list(vault: &UnlockedVault, fields: &[Field], folder: Option<&str>, term:
 /// names. rbw's passes: exact first, then a part; within each, an item with no folder and no user when neither was
 /// given, then one of those two strict, then neither. Several matches are `Ambiguous`, naming id, name and user only.
 pub fn find(vault: &UnlockedVault, q: &Lookup) -> Result<Found, AgentError> {
+    let uuid = uuid::Uuid::parse_str(&q.needle).ok();
+    let url = url::Url::parse(&q.needle).ok().filter(|u| uuid.is_none() && u.is_special());
+    let rows = rows(vault, url.as_ref());
+    let folders = folder_names(&vault.sync, vault.keys.user());
     let found = |r: &Row| Found {
         id: r.summary.id.clone(),
         name: r.summary.name.to_string(),
         user: r.summary.user.as_deref().cloned(),
+        folder: folder_of(&folders, &r.summary).map(str::to_owned),
+        org: r.cipher.get("organizationId").and_then(Value::as_str).map(|id| org_name(vault, id)),
         reprompt: r.cipher.get("reprompt").and_then(Value::as_u64).is_some_and(|n| n != 0),
         hidden: r.summary.kind == 1 && r.cipher.get("viewPassword") == Some(&Value::Bool(false)),
     };
-    let rows = lookups(vault);
-    let uuid = uuid::Uuid::parse_str(&q.needle).ok();
     let by_id =
         |r: &&Row| r.summary.id == q.needle || uuid.is_some_and(|u| uuid::Uuid::parse_str(&r.summary.id) == Ok(u));
     if let Some(row) = rows.iter().find(by_id) {
         return Ok(found(row));
     }
-    let url = url::Url::parse(&q.needle).ok().filter(|u| uuid.is_none() && u.is_special());
-    let folders = folder_names(&vault.sync, vault.keys.user());
     let matches = |r: &Row, strict_user: bool, strict_folder: bool, exact: bool| {
         let same = |field: &str, term: &str| match (q.ignorecase, exact) {
             (true, true) => field.to_lowercase() == term.to_lowercase(),
@@ -153,10 +159,7 @@ pub fn find(vault: &UnlockedVault, q: &Lookup) -> Result<Found, AgentError> {
         };
         given(folder_of(&folders, &r.summary), q.folder.as_deref(), strict_folder)
             && given(r.summary.user.as_deref().map(|u| u.as_str()), q.user.as_deref(), strict_user)
-            && match &url {
-                Some(url) => r.uris.iter().any(|u| text(&u.uri).is_some_and(|uri| matches_url(uri, u.match_type, url))),
-                None => same(&r.summary.name, &q.needle),
-            }
+            && if url.is_some() { r.uri_hit } else { same(&r.summary.name, &q.needle) }
     };
     let pick = |strict_user, strict_folder, exact| -> Vec<&Row> {
         rows.iter().filter(|r| matches(r, strict_user, strict_folder, exact)).collect()
@@ -190,20 +193,36 @@ pub fn find(vault: &UnlockedVault, q: &Lookup) -> Result<Found, AgentError> {
     Err(AgentError::Ambiguous { candidates })
 }
 
-/// A readable cipher with what a lookup may decrypt of it.
+/// The name `/sync` gives the organization `id`, else the id.
+fn org_name(vault: &UnlockedVault, id: &str) -> String {
+    let orgs = vault.sync.pointer("/profile/organizations").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let org = orgs.iter().find(|o| o.get("id").and_then(Value::as_str) == Some(id));
+    org.and_then(|o| o.get("name")).and_then(Value::as_str).unwrap_or(id).to_owned()
+}
+
+/// A readable cipher with what a lookup decrypts of it, and whether one of its URIs matches the URL needle.
 struct Row<'a> {
     cipher: &'a Value,
     summary: Summary,
-    uris: Vec<item::Uri>,
+    uri_hit: bool,
 }
 
-/// Every readable cipher with its summary and URIs; one that cannot be read is left out, as in [`summaries`].
-fn lookups(vault: &UnlockedVault) -> Vec<Row<'_>> {
+/// Every readable cipher with its summary; one that cannot be read is left out. The URIs are decrypted only for a
+/// URL needle (`item::summary_with_uris`), and matched once per item here: the passes do not change that match.
+fn rows<'a>(vault: &'a UnlockedVault, url: Option<&url::Url>) -> Vec<Row<'a>> {
+    let Some(url) = url else {
+        return summaries(vault).into_iter().map(|(cipher, summary)| Row { cipher, summary, uri_hit: false }).collect();
+    };
     let read = |c| item::summary_with_uris(c, vault.keys.user(), vault.keys.orgs()).ok();
+    let hit =
+        |uris: &[item::Uri]| uris.iter().any(|u| text(&u.uri).is_some_and(|uri| matches_url(uri, u.match_type, url)));
     ciphers(&vault.sync)
-        .filter_map(|cipher| read(cipher).map(|l| Row { cipher, summary: l.summary, uris: l.uris }))
+        .filter_map(|cipher| read(cipher).map(|l| Row { cipher, uri_hit: hit(&l.uris), summary: l.summary }))
         .collect()
 }
+
+/// The most a stored regular expression may compile to: a bigger one matches nothing.
+const REGEX_NFA_LIMIT: usize = 1 << 20;
 
 /// Whether a stored URI with its Bitwarden match type (0 domain, the default; 1 host; 2 starts with; 3 exact;
 /// 4 regular expression; 5 never) matches `given`, as rbw 1.15's `matches_url` (`src/bin/rbw/commands.rs`) does. A
@@ -220,7 +239,11 @@ fn matches_url(uri: &str, match_type: Option<u64>, given: &url::Url) -> bool {
         2 => given.as_str().starts_with(uri),
         3 if given.path() == "/" => given.as_str().trim_end_matches('/') == uri.trim_end_matches('/'),
         3 => given.as_str() == uri,
-        4 => regex_automata::meta::Regex::new(uri).is_ok_and(|rx| rx.is_match(given.as_str())),
+        4 => {
+            use regex_automata::meta::Regex;
+            let rx = Regex::builder().configure(Regex::config().nfa_size_limit(Some(REGEX_NFA_LIMIT))).build(uri);
+            rx.is_ok_and(|rx| rx.is_match(given.as_str()))
+        }
         _ => false,
     }
 }
@@ -513,9 +536,7 @@ pub fn totp(vault: &UnlockedVault, id: &str) -> Result<TotpKey, AgentError> {
 
 /// The namespaces whose `<ns>:id` field marks the item (data model §3), sorted, each once. Field names only.
 pub fn markers(vault: &UnlockedVault, id: &str) -> Result<Vec<String>, AgentError> {
-    let item = item_of(vault, id)?;
-    let mut names: Vec<String> = item
-        .fields
+    let mut names: Vec<String> = names_of(vault, id)?
         .iter()
         .filter_map(|f| text(&f.name)?.strip_suffix(":id").filter(|ns| !ns.is_empty() && !ns.contains(':')))
         .map(str::to_owned)
@@ -573,6 +594,11 @@ mod tests {
         assert!(!at("https://example.com/a", "(", Some(4)), "a pattern that does not compile matches nothing");
         assert!(!at("https://example.com", "https://example.com", Some(5)));
         assert!(!at("https://example.com", "https://example.com", Some(9)), "an unknown match type matches nothing");
+        // A pattern that compiles beyond the size limit matches nothing, though it would match without the limit.
+        let big = format!("^https://e{}", "(?:x?)".repeat(50_000));
+        let unlimited = regex_automata::meta::Regex::new(&big).unwrap();
+        assert!(unlimited.is_match("https://example.com"));
+        assert!(!at("https://example.com", &big, Some(4)));
         // A URL with no host matches no domain or host rule.
         assert!(!at("file:///etc/hosts", "file:///etc/hosts", Some(0)));
     }
