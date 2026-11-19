@@ -44,6 +44,7 @@ pub(crate) fn env_in(base: &Path, profile: Option<&'static str>, exe_dir: Option
         start_wait: Duration::from_secs(3),
         started_log: Default::default(),
         clip: ClipLog::default().clip(None),
+        stdin_tty: true,
     }
 }
 

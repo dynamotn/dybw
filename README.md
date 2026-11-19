@@ -120,6 +120,16 @@ only says "see the agent log" is explained there.
   folder that `add` or `generate` created stays when the login create then fails, as with rbw.
 - `generate <len> <name>` prints nothing: unlike rbw it does not show the new password, which the agent made and
   kept. Read it with `dybw get <name>`, which goes through the confirmation like any other value.
+- Invoked as `rbw` (a symlink to `dybw`), the binary is the rbw 1.15 shim; its command line and help are rbw's (MIT,
+  see `crates/dybw/src/rbw_completion/LICENSE-rbw`). `RBW_PROFILE=x` picks the profile; `DYBW_PROFILE` and `-p` are
+  not read. `rbw config set|unset` edits the profile in `~/.config/dybw/config.toml` (comments and layout are kept, a
+  symlinked file stays a link) and says what changed on stderr. Changing `base_url` or `pinentry` is refused when
+  stdin is not a terminal, so a script or an AI harness cannot redirect the server or the prompt through the shim.
+  This is a guard against accidents, not a barrier: any process of the same user can still edit `config.toml`; what
+  protects the API key is that it stays bound to the identity origin it was stored for.
+- Migration from rbw: `rbw config set identity_url` is refused (dybw derives the identity URL from `base_url`; use
+  `base_url`), as are `sso_id`, `ui_url`, `notifications_url` and `client_cert_path`. `lock_timeout` (seconds) is
+  rounded up to whole minutes; `sync_interval` 0 means no periodic sync.
 - `-c` copies in the `dybw` process and clears the clipboard after `clipboard_clear_seconds` (default 30) only if it
   still holds the copy. On macOS the copy is marked concealed and transient; on Wayland it is marked secret
   (`wl-copy --sensitive`, wl-clipboard 2.2+); on X11 (`xclip`, `xsel`) it cannot be marked, so a clipboard manager

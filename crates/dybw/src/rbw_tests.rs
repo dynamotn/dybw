@@ -889,3 +889,90 @@ fn the_editor_unsets_in_inline_tables_and_keeps_the_rest() {
     assert_eq!(code, 0);
     assert!(err.contains("nothing to change"), "{err}");
 }
+
+#[test]
+fn gen_completions_keeps_the_fragments_of_rbws_real_scripts() {
+    let (_, fish, _) = alone(&[], &["gen-completions", "fish"]);
+    for line in [
+        "complete -c rbw -n \"__fish_rbw_needs_command\" -f -a \"get\" -d 'Display the password for a given entry'",
+        "complete -c rbw -n \"__fish_rbw_using_subcommand get\" -s f -l field -d 'Field to get' -r",
+        "complete -c rbw -n \"__fish_rbw_using_subcommand get\" -s c -l clipboard -d 'Copy result to clipboard'",
+        "complete -c rbw -n \"__fish_rbw_using_subcommand code\" -l clipboard -d 'Copy result to clipboard'",
+        "complete -c rbw -n \"__fish_rbw_using_subcommand totp\" -l clipboard -d 'Copy result to clipboard'",
+    ] {
+        assert!(fish.lines().any(|l| l == line), "{line}");
+    }
+    let (_, bash, _) = alone(&[], &["gen-completions", "bash"]);
+    assert!(bash.contains("            rbw,get)\n"), "{bash}");
+    let (_, zsh, _) = alone(&[], &["gen-completions", "zsh"]);
+    assert!(zsh.starts_with("#compdef rbw\n") && zsh.contains("'-f+[Field to get]:FIELD:_default' \\\n"), "{zsh}");
+}
+
+// the shim cannot move the server or the prompt from a script
+
+#[test]
+fn base_url_and_pinentry_need_a_terminal() {
+    for args in [
+        &["config", "set", "base_url", "https://x"][..],
+        &["config", "set", "pinentry", "/bin/sh"],
+        &["config", "unset", "pinentry"],
+    ] {
+        let f = new_base();
+        write_config(f.path(), FILE);
+        let mut env = renv(f.path(), &[]);
+        env.stdin_tty = false;
+        let (code, out, err) = rbw_in(&env, args);
+        assert_eq!((code, out.as_str()), (1, ""), "{args:?}");
+        assert_eq!(
+            err,
+            "rbw config set: changing base_url/pinentry needs an interactive terminal\n".replace("set", args[1]),
+            "{args:?}"
+        );
+        assert_eq!(read_config(f.path()), FILE);
+    }
+    // Other keys are unchanged without a terminal.
+    let f = new_base();
+    write_config(f.path(), FILE);
+    let mut env = renv(f.path(), &[]);
+    env.stdin_tty = false;
+    assert_eq!(rbw_in(&env, &["config", "set", "email", "x"]).0, 0);
+    assert_eq!(rbw_in(&env, &["config", "set", "lock_timeout", "60"]).0, 0);
+    assert_eq!(rbw_in(&env, &["config", "unset", "lock_timeout"]).0, 0);
+}
+
+// writing the file
+
+#[test]
+fn config_set_follows_a_symlinked_file_and_makes_private_directories() {
+    let f = new_base();
+    let real = f.path().join("managed.toml");
+    std::fs::write(&real, FILE).unwrap();
+    std::fs::create_dir_all(f.path().join(".config/dybw")).unwrap();
+    std::os::unix::fs::symlink(&real, home_file(f.path())).unwrap();
+    assert_eq!(rbw_in(&renv(f.path(), &[]), &["config", "set", "email", "z"]).0, 0);
+    assert!(std::fs::symlink_metadata(home_file(f.path())).unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), FILE.replace("w@example.org", "z"));
+    assert!(!f.path().join("managed.toml.new").exists());
+    // A fresh home: the directories are 0700, the file 0600.
+    let g = new_base();
+    assert_eq!(rbw_in(&renv(g.path(), &[]), &["config", "set", "email", "z"]).0, 0);
+    for d in [".config", ".config/dybw"] {
+        assert_eq!(std::fs::metadata(g.path().join(d)).unwrap().permissions().mode() & 0o777, 0o700, "{d}");
+    }
+}
+
+#[test]
+fn a_failed_write_leaves_no_temporary_file() {
+    let f = new_base();
+    write_config(f.path(), FILE);
+    // The target is replaced by a directory only after it was read, so the rename fails.
+    let dir = f.path().join(".config/dybw");
+    let tmp = dir.join("config.toml.new");
+    std::fs::create_dir(&tmp).unwrap();
+    std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o555)).unwrap();
+    let (code, _, err) = rbw_in(&renv(f.path(), &[]), &["config", "set", "email", "x"]);
+    std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o755)).unwrap();
+    assert_eq!(code, 1);
+    assert!(err.contains("cannot write "), "{err}");
+    assert_eq!(read_config(f.path()), FILE);
+}

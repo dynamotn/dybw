@@ -2,7 +2,7 @@
 //! profile. The file is edited line by line so its comments, order and other tables stay as they are.
 
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use dybw_proto::Op;
@@ -57,7 +57,17 @@ fn refuse(key: &str) -> Fail {
     )
 }
 
+/// `base_url` picks the server the API key is sent to and `pinentry` the program that asks for the master password:
+/// a script or an AI harness must not move either through the shim.
+fn needs_terminal(env: &Env, key: &str) -> Result<(), Fail> {
+    if matches!(key, "base_url" | "pinentry") && !env.stdin_tty {
+        return Err(log("changing base_url/pinentry needs an interactive terminal"));
+    }
+    Ok(())
+}
+
 pub fn set(env: &Env, profile: Option<&str>, key: &str, value: &str, err: &mut dyn Write) -> Result<u8, Fail> {
+    needs_terminal(env, key)?;
     let change = match key {
         "email" => Some(("email", Value::from(value))),
         "base_url" => Some(("server_url", Value::from(value))),
@@ -89,6 +99,7 @@ pub fn set(env: &Env, profile: Option<&str>, key: &str, value: &str, err: &mut d
 }
 
 pub fn unset(env: &Env, profile: Option<&str>, key: &str, err: &mut dyn Write) -> Result<u8, Fail> {
+    needs_terminal(env, key)?;
     let profile_key = match key {
         "lock_timeout" => "lock_timeout_minutes",
         "pinentry" => "pinentry",
@@ -175,16 +186,23 @@ fn put(table: &mut dyn TableLike, profile: Option<&str>, key: &str, mut new: Val
     shown.push(format!("{place} + {new_text}"));
 }
 
-/// Write beside the file and rename over it; an existing file keeps its permissions.
+/// Write beside the file and rename over it. An existing file keeps its permissions and a symlink (chezmoi's) stays
+/// a symlink: the target is replaced. Missing directories are made 0700. The temporary file never outlives a failure.
 fn write_file(path: &Path, text: &str) -> Result<(), Fail> {
+    let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     let mode = std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777);
     let tmp = path.with_extension("toml.new");
     let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(path.parent().unwrap_or(path))?;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path.parent().unwrap_or(path))?;
         let _ = std::fs::remove_file(&tmp);
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
+        // The umask may have narrowed the mode: say it outright.
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         file.write_all(text.as_bytes())?;
         std::fs::rename(&tmp, path)
     };
-    write().map_err(|e| log(format!("cannot write {}: {e}", path.display())))
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        log(format!("cannot write {}: {e}", path.display()))
+    })
 }

@@ -1,5 +1,5 @@
 //! The `rbw` personality: `dybw` invoked as `rbw` parses rbw 1.15's command line and maps each command onto the
-//! requests `dybw` sends. The clap model below follows rbw's `src/bin/rbw/main.rs` (rbw 1.15.0, MIT).
+//! requests `dybw` sends. The clap model below follows rbw's `src/bin/rbw/main.rs` (rbw 1.15.0, MIT; the licence is in `rbw_completion/LICENSE-rbw`).
 //!
 //! TODO(Task 4): rbw's output formatting and its own error messages; for now every command prints what `dybw` prints
 //! and fails with `rbw <command>: <dybw message>`.
@@ -13,7 +13,8 @@ use crate::rbw_config;
 use crate::{Ask, Cmd, Env, Fail, Shape, execute, parse_field, report};
 use dybw_proto::Field;
 
-// Help and usage texts below are copied from rbw 1.15.0 (MIT, https://github.com/doy/rbw).
+// Help and usage texts below are copied from rbw 1.15.0 (MIT, https://github.com/doy/rbw; see
+// `rbw_completion/LICENSE-rbw`).
 #[derive(Debug, clap::Args)]
 pub(crate) struct FindArgs {
     #[arg(help = "Name, URI or UUID of the entry to display")]

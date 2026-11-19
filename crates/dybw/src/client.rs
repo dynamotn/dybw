@@ -36,6 +36,8 @@ pub struct Env {
     /// The log of the agent this process started, once it has started one.
     pub started_log: RefCell<Option<PathBuf>>,
     pub clip: crate::clip::Clip,
+    /// Whether stdin is a terminal: a person is typing, not a script or an AI harness.
+    pub stdin_tty: bool,
 }
 
 impl Env {
@@ -49,6 +51,7 @@ impl Env {
             start_wait: START_WAIT,
             started_log: RefCell::new(None),
             clip: crate::clip::Clip::real(),
+            stdin_tty: std::io::IsTerminal::is_terminal(&std::io::stdin()),
         }
     }
 
