@@ -31,3 +31,10 @@ fn unlocked_without_an_agent_exits_1_silently() {
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty() && out.stderr.is_empty());
 }
+
+#[test]
+fn the_clipboard_clearer_reads_its_job_from_stdin_and_refuses_an_empty_one() {
+    let out = dybw(&["__clear-clipboard"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "dybw: not a clipboard job\n");
+}

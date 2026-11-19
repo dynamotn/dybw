@@ -96,7 +96,20 @@ impl Config {
             pinentry: s.pinentry,
         })
     }
+
+    /// How long a `-c` copy stays on the clipboard (a top-level key only; the CLI reads it).
+    pub fn clipboard_clear_seconds(&self) -> anyhow::Result<u64> {
+        match self.doc.get("clipboard_clear_seconds") {
+            None => Ok(DEFAULT_CLIPBOARD_CLEAR_SECONDS),
+            Some(v) => v.as_integer().and_then(|n| u64::try_from(n).ok()).with_context(|| {
+                format!("`clipboard_clear_seconds` in {} must be a whole number of seconds, not {v}", self.shown)
+            }),
+        }
+    }
 }
+
+/// profiles §1.
+pub const DEFAULT_CLIPBOARD_CLEAR_SECONDS: u64 = 30;
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
@@ -116,6 +129,16 @@ mod tests {
         [profiles.work]\nserver_url = \"https://w.example.org\"\nemail = \"w@example.org\"\n\
         [profiles.home]\nserver_url = \"https://h.example.org\"\nemail = \"h@example.org\"\n\
         auth = \"api-key\"\nlock_timeout_minutes = 0\nsync_interval_seconds = 9\npinentry = \"/bin/sh\"\n";
+
+    #[test]
+    fn clipboard_clear_seconds_defaults_to_30_and_must_be_a_count() {
+        assert_eq!(config("").clipboard_clear_seconds().unwrap(), 30);
+        assert_eq!(config("clipboard_clear_seconds = 5").clipboard_clear_seconds().unwrap(), 5);
+        for bad in ["clipboard_clear_seconds = -1", "clipboard_clear_seconds = \"5\""] {
+            let e = format!("{:#}", config(bad).clipboard_clear_seconds().unwrap_err());
+            assert!(e.contains("clipboard_clear_seconds") && e.contains("config.toml"), "{e}");
+        }
+    }
 
     #[test]
     fn explicit_profile_beats_default_and_default_beats_nothing() {

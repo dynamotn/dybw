@@ -35,6 +35,7 @@ pub struct Env {
     pub start_wait: Duration,
     /// The log of the agent this process started, once it has started one.
     pub started_log: RefCell<Option<PathBuf>>,
+    pub clip: crate::clip::Clip,
 }
 
 impl Env {
@@ -47,6 +48,7 @@ impl Env {
             exe_dir: exe_dir_of(std::env::current_exe()),
             start_wait: START_WAIT,
             started_log: RefCell::new(None),
+            clip: crate::clip::Clip::real(),
         }
     }
 

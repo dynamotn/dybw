@@ -1,6 +1,6 @@
 [package]
 name = "dybw-peer"
-description = "Who is on the other end of a Unix socket: peer identity and process ancestry (the only crate with unsafe)"
+description = "The platform layer: who is on the other end of a Unix socket, and the secret clipboard (the only crate with unsafe)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -23,6 +23,14 @@ fake = []
 [dependencies]
 libc.workspace = true
 thiserror.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+# The pasteboard through typed bindings: no unsafe needed for the calls made.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.5", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSString"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem"] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -8,6 +8,8 @@
 //! audit token (pid + pidversion) and the process start time; Linux keeps the
 //! pidfd when the kernel offers one (`SO_PEERPIDFD`) and always the start
 //! time. [`still_same`] re-checks it.
+//!
+//! [`clipboard`] copies a value marked as secret and clears it later if it is unchanged.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -18,6 +20,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub mod clipboard;
 #[cfg(feature = "fake")]
 mod fake;
 #[cfg(all(feature = "fake", not(debug_assertions)))]

@@ -14,6 +14,8 @@ use dybw_proto::{
     Reply, Request, Response, Secret, Select, Target, decode_request, encode,
 };
 
+use zeroize::Zeroizing;
+
 use super::*;
 
 /// What the fake agent does with one connection.
@@ -41,6 +43,7 @@ fn env_in(base: &Path, profile: Option<&'static str>, exe_dir: Option<PathBuf>) 
         exe_dir,
         start_wait: Duration::from_secs(3),
         started_log: Default::default(),
+        clip: ClipLog::default().clip(None),
     }
 }
 
@@ -1101,4 +1104,175 @@ fn a_logged_failure_names_the_log_when_there_is_one() {
     let log = Some(std::path::PathBuf::from("/x/agent.log"));
     assert_eq!(Fail::Logged { what: "denied", log }.to_string(), "denied (see /x/agent.log)");
     assert_eq!(Fail::Logged { what: "denied", log: None }.to_string(), "denied (see the agent log)");
+}
+
+// clipboard
+
+/// What the fake clipboard and clearer saw, in order.
+#[derive(Default, Clone)]
+struct ClipLog(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+
+impl ClipLog {
+    fn push(&self, event: String) {
+        self.0.borrow_mut().push(event);
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.0.borrow().clone()
+    }
+
+    /// Copy gives `count:7`; `job` is the clearer's stdin (`None`: unreadable). Failing parts are set after.
+    fn clip(&self, job: Option<&'static str>) -> clip::Clip {
+        let (a, b, c, d) = (self.clone(), self.clone(), self.clone(), self.clone());
+        clip::Clip {
+            copy: Box::new(move |v| {
+                a.push(format!("copy:{}", String::from_utf8_lossy(v)));
+                Ok(clip::Token::Count(7))
+            }),
+            clear: Box::new(move |t| {
+                b.push(format!("clear:{}", t.encode()));
+                Ok(true)
+            }),
+            spawn: Box::new(move |job| {
+                c.push(format!("spawn:{job}"));
+                Ok(())
+            }),
+            sleep: Box::new(move |d_| d.push(format!("sleep:{}", d_.as_secs()))),
+            job: Box::new(move || {
+                job.map(|j| Zeroizing::new(j.to_owned())).ok_or(std::io::ErrorKind::BrokenPipe.into())
+            }),
+        }
+    }
+}
+
+/// `args` against a fake agent giving `reply`, with the fake clipboard, and `config` as the config file.
+fn clip_run(args: &[&str], reply: Reply, config: Option<&str>) -> ((u8, String, String), Vec<String>) {
+    let f = fake(vec![Act::Reply(reply)]);
+    if let Some(text) = config {
+        std::fs::create_dir_all(f.base.path().join(".config/dybw")).unwrap();
+        std::fs::write(f.base.path().join(".config/dybw/config.toml"), text).unwrap();
+    }
+    let log = ClipLog::default();
+    let mut env = env_in(f.base.path(), None, None);
+    env.clip = log.clip(None);
+    let result = run_in(&env, args);
+    drop(env);
+    f.ops();
+    (result, log.events())
+}
+
+#[test]
+fn get_c_copies_instead_of_printing_and_the_clearer_gets_no_value() {
+    let ((code, out, err), events) = clip_run(&["get", "n", "-c"], Reply::Value { value: secret("hunter2") }, None);
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(events, ["copy:hunter2", "spawn:30 count:7\n"]);
+    assert!(events.iter().filter(|e| e.starts_with("spawn:")).all(|e| !e.contains("hunter2")));
+    // The whole output of `--full`, without its last newline.
+    let entries =
+        vec![Entry { name: s("password"), value: secret("pw") }, Entry { name: s("notes"), value: secret("n") }];
+    let (_, events) = clip_run(&["get", "n", "--full", "--clipboard"], Reply::Full { entries }, None);
+    assert_eq!(events[0], "copy:pw\n\nn");
+}
+
+#[test]
+fn the_clear_delay_comes_from_the_config_and_a_bad_one_copies_nothing() {
+    let reply = || Reply::Value { value: secret("v") };
+    let (_, events) = clip_run(&["get", "n", "-c"], reply(), Some("clipboard_clear_seconds = 5\n"));
+    assert_eq!(events, ["copy:v", "spawn:5 count:7\n"]);
+    let ((code, _, err), events) = clip_run(&["get", "n", "-c"], reply(), Some("clipboard_clear_seconds = -5\n"));
+    assert_eq!(code, 1);
+    assert!(err.contains("clipboard_clear_seconds"), "{err}");
+    assert!(events.is_empty());
+}
+
+#[test]
+fn clipboard_failures_are_reported() {
+    let f =
+        fake(vec![Act::Reply(Reply::Value { value: secret("v") }), Act::Reply(Reply::Value { value: secret("v") })]);
+    let log = ClipLog::default();
+    let mut env = env_in(f.base.path(), None, None);
+    env.clip = log.clip(None);
+    env.clip.copy = Box::new(|_| Err(clip::Error::Unavailable));
+    let (code, _, err) = run_in(&env, &["get", "n", "-c"]);
+    assert_eq!(code, 1);
+    assert!(err.starts_with("dybw: clipboard: no clipboard here"), "{err}");
+    assert!(log.events().is_empty(), "no clearer without a copy");
+    env.clip = log.clip(None);
+    env.clip.spawn = Box::new(|_| Err(std::io::ErrorKind::NotFound.into()));
+    let (code, _, err) = run_in(&env, &["get", "n", "-c"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("the copy was taken back"), "{err}");
+    assert_eq!(log.events(), ["copy:v", "clear:count:7"]);
+    drop(env);
+    f.ops();
+}
+
+#[test]
+fn copy_without_a_home_is_refused_before_copying() {
+    let f = fake(vec![Act::Reply(Reply::Value { value: secret("v") })]);
+    let log = ClipLog::default();
+    let mut env = env_in(f.base.path(), None, None);
+    env.home = None;
+    env.clip = log.clip(None);
+    let (code, _, err) = run_in(&env, &["get", "n", "-c"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("no home directory"), "{err}");
+    assert!(log.events().is_empty());
+    f.ops();
+}
+
+/// The clearer waits the delay (a fake clock), then clears only through `clear_if_unchanged`.
+#[test]
+fn the_clearer_sleeps_then_clears_if_unchanged() {
+    let env_with = |job| {
+        let log = ClipLog::default();
+        let mut env = env_in(base().path(), None, None);
+        env.clip = log.clip(job);
+        (env, log)
+    };
+    let (env, log) = env_with(Some("7 count:3\n"));
+    assert_eq!(run_in(&env, &[clip::CLEAR_COMMAND]), (0, s(""), s("")));
+    assert_eq!(log.events(), ["sleep:7", "clear:count:3"]);
+    // Changed meanwhile: nothing to do, and no error.
+    let (mut env, _) = env_with(Some("1 count:3"));
+    env.clip.clear = Box::new(|_| Ok(false));
+    assert_eq!(run_in(&env, &[clip::CLEAR_COMMAND]).0, 0);
+    env.clip.clear = Box::new(|_| Err(clip::Error::Refused));
+    assert_eq!(run_in(&env, &[clip::CLEAR_COMMAND]).0, 1);
+    for job in [Some("7"), Some("x count:3"), Some("7 hunter2"), None] {
+        let (env, log) = env_with(job);
+        assert_eq!(run_in(&env, &[clip::CLEAR_COMMAND]).0, 1, "{job:?}");
+        assert!(log.events().is_empty(), "{job:?}");
+    }
+    // Hidden from the help.
+    assert!(!run_in(&env_in(base().path(), None, None), &["--help"]).1.contains(clip::CLEAR_COMMAND));
+}
+
+/// The clearer's argv is the subcommand alone and the job travels on stdin; its environment is this process's.
+#[test]
+fn the_clearer_gets_its_job_on_stdin_not_in_argv_or_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = dir.path().join("seen");
+    let program = dir.path().join("clearer");
+    let script = format!(
+        "#!/bin/sh\n{{ printf 'argv:%s\\n' \"$*\"; env; printf 'stdin:'; cat; }} > '{}.tmp'; mv '{0}.tmp' '{0}'\n",
+        seen.display()
+    );
+    std::fs::write(&program, script).unwrap();
+    std::fs::set_permissions(&program, PermissionsExt::from_mode(0o700)).unwrap();
+    let token = clip::Token::Count(42);
+    let job = clip::job(30, &token);
+    clip::spawn_clearer(&program, &job).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !seen.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let seen = std::fs::read_to_string(&seen).unwrap();
+    let (before, stdin) = seen.split_once("stdin:").unwrap();
+    assert_eq!(stdin, job);
+    assert!(before.starts_with(&format!("argv:{}\n", clip::CLEAR_COMMAND)), "{before}");
+    assert!(!before.contains(&token.encode()), "{before}");
+    assert_eq!(clip::parse_job(stdin), Some((Duration::from_secs(30), token)));
+    // The real clearer starts this test binary, which takes the subcommand for a test filter and exits.
+    (clip::Clip::real().spawn)("").unwrap();
 }

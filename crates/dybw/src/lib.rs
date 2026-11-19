@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod client;
+mod clip;
 mod doctor;
 
 use std::io::Write;
@@ -13,6 +14,7 @@ use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand};
 use dybw_proto::{AgentError, Field, ItemSummary, Op, PolicyAction, PolicyRule, Reply, Select, Target};
 use serde_json::{Map, Value};
+use zeroize::Zeroizing;
 
 pub use client::{Env, Error as ClientError, START_WAIT};
 
@@ -83,6 +85,10 @@ enum Cmd {
         /// Print the names of the custom fields.
         #[arg(short = 'l', long, group = "select")]
         list_fields: bool,
+        /// Copy to the clipboard, marked as secret, instead of printing; cleared after `clipboard_clear_seconds`
+        /// if it still holds the value.
+        #[arg(short = 'c', long)]
+        clipboard: bool,
     },
     /// Print the previous passwords of an item, newest first.
     History {
@@ -112,6 +118,9 @@ enum Cmd {
         #[command(subcommand)]
         command: AgentCmd,
     },
+    /// The clipboard clearer `-c` starts: the job comes on stdin.
+    #[command(name = clip::CLEAR_COMMAND, hide = true)]
+    ClearClipboard,
 }
 
 #[derive(Subcommand, Debug)]
@@ -190,6 +199,8 @@ enum Fail {
     Log(String),
     #[error("cannot write the output: {0}")]
     Output(#[from] std::io::Error),
+    #[error("clipboard: {0}")]
+    Clip(#[from] clip::Error),
 }
 
 fn agent_text(e: &AgentError) -> String {
@@ -282,7 +293,7 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
             let reply = ask_started(env, Op::Search { profile, term, folder, fields: fields.clone() })?;
             items(out, reply, &fields, false)
         }
-        Cmd::Get { item, user, folder, ignorecase, field, full, raw, list_fields } => {
+        Cmd::Get { item, user, folder, ignorecase, field, full, raw, list_fields, clipboard } => {
             let select = match (field, full, raw, list_fields) {
                 (Some(f), ..) => Select::Field(f),
                 (_, true, ..) => Select::Full,
@@ -291,19 +302,26 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
                 _ => Select::Password,
             };
             let op = Op::Get { profile, needle: item, user, folder, ignorecase, select };
-            match ask_started(env, op)? {
-                Reply::Value { value } | Reply::Raw { json: value } => writeln!(out, "{}", value.expose())?,
+            let reply = ask_started(env, op)?;
+            // shortcut: a value longer than this leaves a copy in the freed buffer when it grows; rare for a password.
+            let mut copied = Zeroizing::new(Vec::with_capacity(4096));
+            let to: &mut dyn Write = if clipboard { &mut *copied } else { out };
+            match reply {
+                Reply::Value { value } | Reply::Raw { json: value } => writeln!(to, "{}", value.expose())?,
                 Reply::Full { entries } => {
                     for (i, e) in entries.iter().enumerate() {
                         match (i, e.name.as_str()) {
-                            (0, _) => writeln!(out, "{}", e.value.expose())?,
-                            (_, "notes") => writeln!(out, "\n{}", e.value.expose())?,
-                            (_, name) => writeln!(out, "{}: {}", escape(name), e.value.expose())?,
+                            (0, _) => writeln!(to, "{}", e.value.expose())?,
+                            (_, "notes") => writeln!(to, "\n{}", e.value.expose())?,
+                            (_, name) => writeln!(to, "{}: {}", escape(name), e.value.expose())?,
                         }
                     }
                 }
-                Reply::FieldNames { names } => names.iter().try_for_each(|n| writeln!(out, "{}", escape(n)))?,
+                Reply::FieldNames { names } => names.iter().try_for_each(|n| writeln!(to, "{}", escape(n)))?,
                 _ => return Err(Fail::Unexpected),
+            }
+            if clipboard {
+                copy_out(env, &copied)?;
             }
             Ok(0)
         }
@@ -356,13 +374,41 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
         }
         // Nothing to stop when no agent runs, and none is started to be stopped.
         Cmd::Agent { command: AgentCmd::Stop } => done(ask(env, Op::StopAgent, false)?.unwrap_or(Reply::Done)),
+        Cmd::ClearClipboard => clear_later(env),
     }
+}
+
+/// Copy the output (its last newline dropped) and start the clearer. The delay is read first: a bad config leaves
+/// nothing on the clipboard.
+fn copy_out(env: &Env, text: &[u8]) -> Result<(), Fail> {
+    let config = dybw_agent::paths::config_path(&doctor::home_of(env).ok_or_else(no_home)?);
+    let seconds = dybw_agent::config::Config::load(&config)
+        .and_then(|c| c.clipboard_clear_seconds())
+        .map_err(|e| Fail::Log(format!("{e:#}")))?;
+    let token = (env.clip.copy)(text.strip_suffix(b"\n").unwrap_or(text))?;
+    // No clearer, no copy left behind.
+    (env.clip.spawn)(&clip::job(seconds, &token)).map_err(|e| {
+        let _ = (env.clip.clear)(&token);
+        Fail::Log(format!("cannot start the clipboard clearer, so the copy was taken back: {e}"))
+    })
+}
+
+/// The clearer: wait, then clear the clipboard if it still holds the copy.
+fn clear_later(env: &Env) -> Result<u8, Fail> {
+    let job = (env.clip.job)()?;
+    let (delay, token) = clip::parse_job(&job).ok_or_else(|| Fail::Log("not a clipboard job".into()))?;
+    (env.clip.sleep)(delay);
+    (env.clip.clear)(&token)?;
+    Ok(0)
+}
+
+fn no_home() -> Fail {
+    Fail::Log("this user has no home directory in the password database".into())
 }
 
 /// The last `n` lines of the audit log (the file is read directly: same user, no agent needed).
 fn audit(env: &Env, ai: bool, n: usize, out: &mut dyn Write) -> Result<u8, Fail> {
-    let home = doctor::home_of(env)
-        .ok_or_else(|| Fail::Log("this user has no home directory in the password database".into()))?;
+    let home = doctor::home_of(env).ok_or_else(no_home)?;
     let path = dybw_agent::paths::audit_path(&home);
     let log = match dybw_agent::audit::read(&path, env.uid) {
         Ok(log) => log,
