@@ -3,8 +3,9 @@
 The `dybw` command line client and the `dybw-agent` that holds the vault session, built on
 [dybw-core](https://gitlab.com/dynamo-tools/dybw-core). MIT licensed.
 
-**Status: P4.1, a read-only CLI and agent.** `dybw` logs in with an API key, unlocks, lists, searches and reads
-items through the agent; writes, URI lookup and the SSH and git integrations come in later phases.
+**Status: P4.3.** `dybw` logs in with an API key, unlocks, lists, searches and reads items through the agent, gives
+TOTP codes, copies to the clipboard, and adds, edits, generates and trashes logins; URI lookup, the rbw shim and
+the SSH and git integrations come in later phases.
 
 | Crate | What |
 |-------|------|
@@ -23,8 +24,14 @@ items through the agent; writes, URI lookup and the SSH and git integrations com
 | `dybw status` | `profile`, logged in, locked or unlocked, last sync (unix seconds); never unlocks |
 | `dybw sync [--all]` | Fetch the vault now |
 | `dybw list`, `dybw search <term>` | Names, or `--fields id,name,user,folder,type`, `--folder`, `--raw` (list only, JSON) |
-| `dybw get <item> [user]` | The main value; `-f <field>`, `--full`, `--raw`, `-l` (`--list-fields`), `--folder`, `-i` |
+| `dybw get <item> [user]` | The main value; `-f <field>`, `--full`, `--raw`, `-l` (`--list-fields`), `--folder`, `-i`, `-c` (copy instead of print) |
 | `dybw history <item>` | Previous passwords, newest first |
+| `dybw code <item> [user]` | The current TOTP code; `--next` waits for the next one when fewer than 5 s are left; `--folder`, `-i`, `-c` |
+| `dybw add <name> [user]` | A new login: `--uri U` (repeatable), `--folder F` (created if missing); the password, and with `--notes` the notes, are typed in the agent's pinentry |
+| `dybw edit <item> [user]` | A new password (the old one goes to the history), and with `--notes` new notes (`--no-password`: notes only), typed in the agent's pinentry; `--folder` |
+| `dybw remove <item> [user]` | Move the item to the trash (never purged); `--folder` |
+| `dybw generate <len>` | Print a random password made here (OS random numbers, no agent): `--no-symbols`, `--only-numbers`, `--nonconfusables`, `--diceware` (`<len>` words of the EFF large list) |
+| `dybw generate <len> <name> [user]` | The agent makes the password and saves it as a new login (`--uri`, `--folder`); nothing is printed |
 | `dybw policy show\|allow\|deny\|forget` | Show or change which programs may read values (changes are confirmed in pinentry) |
 | `dybw audit [--ai] [-n N]` | The latest N audit lines (default 50) as tab-separated columns; `--ai` keeps AI-class callers. Read straight from the file, no agent needed |
 | `dybw doctor` | Check the socket directory, the agent (reachable, same version), config, pinentry, `policy.json` and `audit.log`; exit 0 when all pass, 1 otherwise. Under an AI harness it also warns that the harness sandbox must not reach the agent |
@@ -95,8 +102,24 @@ only says "see the agent log" is explained there.
   vault: running `dybw-agent` under lldb kills it. (Linux sets `PR_SET_DUMPABLE=0` instead.) A failure is reported
   on stderr and the agent keeps running.
 - No lookup by URI yet.
-- Items that ask for a master-password reprompt are denied until P4.3.
-- Organization items are readable.
+- An item that asks for a master-password reprompt gives no value (a code included) and takes no change until the
+  master password is typed again in the agent's pinentry, after the confirmation; a grant never skips it. The password
+  is checked against the unlocked key and sent nowhere; a wrong one is refused and audited.
+- Organization items are readable; one whose organization hides the password (`viewPassword: false`) gives no
+  password, TOTP key or code, history, `--full`, `--raw`, nor any custom field of the hidden type.
+- Writes (`add`, `edit`, `remove`, `generate <len> <name>`) are confirmed in the pinentry every time: no grant
+  counts and "always" is never offered. AI-class and unknown callers are refused. New values never travel over the
+  socket: the agent asks for them in its own pinentry, one line each, so notes are a single line (multi-line notes
+  through `$EDITOR` come with the rbw shim, P4.4). An empty answer cancels. `edit` changes the password and the notes
+  only (no rename, user, URIs, folder or TOTP key). An item changed on the server since the last sync is refused
+  ("sync and try again") and nothing is written. New logins are personal (no creating into an organization).
+- `generate <len> <name>` prints nothing: unlike rbw it does not show the new password, which the agent made and
+  kept. Read it with `dybw get <name>`, which goes through the confirmation like any other value.
+- `-c` copies in the `dybw` process and clears the clipboard after `clipboard_clear_seconds` (default 30) only if it
+  still holds the copy. On macOS the copy is marked concealed and transient; on Wayland it is marked secret
+  (`wl-copy --sensitive`, wl-clipboard 2.2+); on X11 (`xclip`, `xsel`) it cannot be marked, so a clipboard manager
+  may keep it (`dybw` says so on stderr).
+- `--diceware` uses the EFF large wordlist (Electronic Frontier Foundation, CC BY 3.0 US).
 - Every file of the agent lives under its trusted home, your home in the password database: the config
   (`~/.config/dybw/config.toml`), the state (credentials, device id, `policy.json`, `harnesses.toml`, the audit log,
   in `~/.local/state/dybw`) and the vault cache (`~/.cache/dybw`). The agent refuses to start when `HOME` names

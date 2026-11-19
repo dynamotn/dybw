@@ -10,8 +10,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use dybw_proto::{
-    AgentError, Candidate, Entry, HistoryEntry, ItemSummary, Op, PolicyAction, PolicyEntry, PolicyRule, ProfileStatus,
-    Reply, Request, Response, Secret, Select, Target, decode_request, encode,
+    AgentError, Candidate, Charset, Entry, HistoryEntry, ItemSummary, Op, Part, PolicyAction, PolicyEntry, PolicyRule,
+    ProfileStatus, Reply, Request, Response, Secret, Select, Target, decode_request, encode,
 };
 
 use zeroize::Zeroizing;
@@ -211,6 +211,76 @@ fn every_command_maps_to_its_op() {
             vec!["history", "n", "me", "--folder", "f"],
             Reply::History { entries: vec![] },
             Op::History { profile: Some(s("p")), needle: s("n"), user: Some(s("me")), folder: Some(s("f")) },
+        ),
+        (
+            vec!["code", "n", "me", "--folder", "f", "-i", "--next"],
+            Reply::Code { code: secret("123456"), seconds_left: 9 },
+            Op::Code {
+                profile: Some(s("p")),
+                needle: s("n"),
+                user: Some(s("me")),
+                folder: Some(s("f")),
+                ignorecase: true,
+                next: true,
+            },
+        ),
+        (
+            vec!["add", "n", "me", "--uri", "https://a", "--uri", "https://b", "--folder", "f"],
+            Reply::Done,
+            Op::Add {
+                profile: Some(s("p")),
+                name: s("n"),
+                user: Some(s("me")),
+                uris: vec![s("https://a"), s("https://b")],
+                folder: Some(s("f")),
+                ask: vec![Part::Password],
+            },
+        ),
+        (
+            vec!["add", "n", "--notes"],
+            Reply::Done,
+            Op::Add {
+                profile: Some(s("p")),
+                name: s("n"),
+                user: None,
+                uris: vec![],
+                folder: None,
+                ask: vec![Part::Password, Part::Notes],
+            },
+        ),
+        (
+            vec!["edit", "n", "me", "--folder", "f"],
+            Reply::Done,
+            Op::Edit {
+                profile: Some(s("p")),
+                needle: s("n"),
+                user: Some(s("me")),
+                folder: Some(s("f")),
+                ask: vec![Part::Password],
+            },
+        ),
+        (
+            vec!["edit", "n", "--notes", "--no-password"],
+            Reply::Done,
+            Op::Edit { profile: Some(s("p")), needle: s("n"), user: None, folder: None, ask: vec![Part::Notes] },
+        ),
+        (
+            vec!["remove", "n", "me", "--folder", "f"],
+            Reply::Done,
+            Op::Remove { profile: Some(s("p")), needle: s("n"), user: Some(s("me")), folder: Some(s("f")) },
+        ),
+        (
+            vec!["generate", "20", "n", "me", "--uri", "https://a", "--folder", "f"],
+            Reply::Done,
+            Op::Generate {
+                profile: Some(s("p")),
+                name: s("n"),
+                user: Some(s("me")),
+                uris: vec![s("https://a")],
+                folder: Some(s("f")),
+                length: 20,
+                charset: Charset::All,
+            },
         ),
     ];
     for (args, reply, want) in cases {
@@ -1309,4 +1379,68 @@ fn the_clearer_gets_its_job_on_stdin_not_in_argv_or_env() {
     assert_eq!(clip::parse_job(stdin), Some((Duration::from_secs(30), token)));
     // The real clearer starts this test binary, which takes the subcommand for a test filter and exits.
     (clip::Clip::real().spawn)("").unwrap();
+}
+
+#[test]
+fn code_prints_the_code_or_copies_it_and_writes_print_nothing() {
+    let ((code, out, err), _) = one(&["code", "n"], Reply::Code { code: secret("123456"), seconds_left: 3 });
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "123456\n", ""));
+    let ((code, out, _), events) =
+        clip_run(&["code", "n", "-c"], Reply::Code { code: secret("654321"), seconds_left: 3 }, None);
+    assert_eq!((code, out.as_str()), (0, ""));
+    assert_eq!(events, ["copy:654321", "spawn:30 count:7\n"]);
+    for args in [&["add", "n"][..], &["edit", "n"], &["remove", "n"], &["generate", "8", "n"]] {
+        let ((code, out, err), _) = one(args, Reply::Done);
+        assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""), "{args:?}");
+    }
+    // Any other reply does not fit.
+    let ((code, _, err), _) = one(&["code", "n"], Reply::Done);
+    assert_eq!((code, err.as_str()), (1, "dybw: the agent sent a reply that does not fit the request\n"));
+    let ((code, _, _), _) = one(&["remove", "n"], Reply::Items { items: vec![] });
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn generate_without_a_name_prints_a_password_made_here_without_the_agent() {
+    // No socket and no agent to start: nothing is asked.
+    let env = env_in(base().path(), None, None);
+    type Case<'a> = (&'a [&'a str], fn(char) -> bool);
+    let cases: [Case; 4] = [
+        (&["generate", "40"], |c| c.is_ascii_graphic()),
+        (&["generate", "40", "--no-symbols"], |c| c.is_ascii_alphanumeric()),
+        (&["generate", "40", "--only-numbers"], |c| c.is_ascii_digit()),
+        (&["generate", "40", "--nonconfusables"], |c| "34678abcdefhjkmnpqrtuwxy".contains(c)),
+    ];
+    for (args, ok) in cases {
+        let (code, out, err) = run_in(&env, args);
+        assert_eq!((code, err.as_str()), (0, ""), "{args:?}");
+        let pw = out.strip_suffix('\n').unwrap();
+        assert!(pw.chars().count() == 40 && pw.chars().all(ok), "{args:?}: {pw}");
+    }
+    let (code, out, _) = run_in(&env, &["generate", "4", "--diceware"]);
+    assert_eq!((code, out.trim_end().split(' ').count()), (0, 4));
+    let (code, out, err) = run_in(&env, &["generate", "0"]);
+    assert_eq!((code, out.as_str(), err.as_str()), (1, "", "dybw: the length must be 1 to 1024\n"));
+    for args in [
+        &["generate", "8", "--diceware", "--no-symbols"][..],
+        &["generate", "8", "--uri", "https://a"],
+        &["generate", "8", "--folder", "f"],
+        &["generate", "x"],
+    ] {
+        let (code, out, _) = run_in(&env, args);
+        assert_eq!((code, out.as_str()), (1, ""), "{args:?}");
+    }
+}
+
+#[test]
+fn generate_and_save_sends_the_charset_and_never_a_password() {
+    for (flag, charset) in [
+        ("--no-symbols", Charset::NoSymbols),
+        ("--only-numbers", Charset::Numbers),
+        ("--nonconfusables", Charset::Nonconfusables),
+        ("--diceware", Charset::Diceware),
+    ] {
+        let (_, op) = one(&["generate", "6", "n", flag], Reply::Done);
+        assert!(matches!(op, Op::Generate { charset: c, length: 6, .. } if c == charset), "{flag}");
+    }
 }

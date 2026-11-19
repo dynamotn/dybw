@@ -77,6 +77,20 @@ pub enum Part {
     Totp,
 }
 
+/// The characters a generated password is made of (rbw's `generate` options). `Diceware`: words of the EFF large
+/// list, the length counting words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Charset {
+    /// Letters, digits and symbols.
+    All,
+    NoSymbols,
+    Numbers,
+    /// Letters and digits that cannot be mistaken for one another.
+    Nonconfusables,
+    Diceware,
+}
+
 /// What a remembered invoker may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -193,6 +207,16 @@ pub enum Op {
         user: Option<String>,
         folder: Option<String>,
         ask: Vec<Part>,
+    },
+    /// Create a personal login whose password the agent generates: the password never travels over the socket.
+    Generate {
+        profile: Option<String>,
+        name: String,
+        user: Option<String>,
+        uris: Vec<String>,
+        folder: Option<String>,
+        length: u32,
+        charset: Charset,
     },
     /// Move one item to the trash (never purged).
     Remove {
@@ -593,6 +617,24 @@ mod tests {
                 ask: vec![Part::Password, Part::Notes, Part::Totp],
             },
             Op::Edit { profile: p(), needle: s("n"), user: None, folder: None, ask: vec![Part::Password] },
+            Op::Generate {
+                profile: p(),
+                name: s("n"),
+                user: Some(s("u")),
+                uris: vec![s("https://a.invalid")],
+                folder: None,
+                length: 20,
+                charset: Charset::All,
+            },
+            Op::Generate {
+                profile: None,
+                name: s("n"),
+                user: None,
+                uris: vec![],
+                folder: Some(s("f")),
+                length: 4,
+                charset: Charset::Diceware,
+            },
             Op::Remove { profile: p(), needle: s("n"), user: Some(s("u")), folder: Some(s("f")) },
             Op::Policy { profile: p(), action: PolicyAction::Show },
             Op::Policy {

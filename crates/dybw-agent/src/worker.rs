@@ -621,7 +621,9 @@ async fn get<H: Host>(
     };
     // TODO(core): field_names, a names-only decrypt; until then `--list-fields` opens the whole item, so it is a
     // value request like any other.
-    if found.hidden && shows_password(&read) {
+    // A hidden-type custom field is hidden with the password; telling which field it is opens the item's field names.
+    let hidden_field = |name: &str| with_vault(shared, |v| read::hidden_field(v, &found.id, name)).unwrap_or(true);
+    if found.hidden && (shows_password(&read) || matches!(&read, Read::Get(Select::Field(n)) if hidden_field(n))) {
         tracing::warn!(profile = %ctx.profile.name, id = %found.id, "denied: the organization hides this item's password");
         audit(ctx, caller, op_of(&read), Some(&found.id), Verdict::Denied);
         return error(AgentError::Denied);

@@ -1,28 +1,39 @@
 //! The writes, `add`, `edit` and `remove`, as a vault client (ADR 0025, data model §1.1). Each is confirmed by the
 //! user every time (no grant counts and "always" is never offered) and refused to an AI-class or an unknown caller.
 //! The new values are asked for here, in the trusted pinentry, so they never travel over the socket. An edit or a
-//! remove of an item that asks for a reprompt needs the master password first.
+//! remove of an item that asks for a reprompt needs the master password first. `generate` is an `add` whose password the
+//! agent makes itself. A new login's folder that does not exist yet is created with it, as rbw does.
 //!
 //! The body is the core's (`vault::client`), planned on the server's copy fetched right before it is sent and based
 //! on the revision the user was asked about: a copy that changed since is refused (`OutOfDate`) and nothing is
 //! written (§6.5). Everything the edit does not change passes through as the server holds it (§6.3). A remove moves
 //! the item to the trash, never purges it. A sync follows every write.
 
-use dybw_core::api::ApiError;
+use dybw_core::api::{ApiError, Client};
+use dybw_core::ports::Http;
 use dybw_core::vault::client::{self, ClientEdit, NewEntry, NewKind, NewLogin, NewUri};
 use dybw_core::vault::write::WriteError;
+use dybw_native::ports::clock::SystemClock;
 use dybw_native::ports::random::OsRandom;
-use dybw_proto::Part;
+use dybw_proto::{Charset, Part};
 use serde_json::{Map, Value};
 use zeroize::Zeroizing;
 
 use super::*;
+use crate::pwgen;
 
 /// A change of the vault, with only the non-secret parts the client sent.
 #[derive(Debug)]
 pub enum Write {
-    /// A new personal login; the agent asks for each of `ask`.
-    Add { name: String, user: Option<String>, uris: Vec<String>, folder: Option<String>, ask: Vec<Part> },
+    /// A new personal login; the agent asks for each of `ask`, and with `generate` makes the password itself.
+    Add {
+        name: String,
+        user: Option<String>,
+        uris: Vec<String>,
+        folder: Option<String>,
+        ask: Vec<Part>,
+        generate: Option<(Charset, u32)>,
+    },
     /// New values for `ask` (the password, the notes) of one item.
     Edit { find: Lookup, ask: Vec<Part> },
     /// Move one item to the trash.
@@ -32,6 +43,7 @@ pub enum Write {
 impl Write {
     fn op(&self) -> &'static str {
         match self {
+            Write::Add { generate: Some(_), .. } => "generate",
             Write::Add { .. } => "add",
             Write::Edit { .. } => "edit",
             Write::Remove { .. } => "remove",
@@ -55,8 +67,8 @@ struct Planned {
     base: String,
     /// The item's name, or the new login's.
     name: String,
-    /// The folder a new login goes to.
-    folder: Option<String>,
+    /// The folder a new login goes to: its id, or the name of one to create (it did not exist at the plan).
+    folder: Option<Result<String, String>>,
     /// The namespaces that mark the item a remove is about.
     markers: Vec<String>,
 }
@@ -85,12 +97,13 @@ fn plan(v: &UnlockedVault, write: &Write) -> Result<Planned, AgentError> {
         markers,
     };
     match write {
+        Write::Add { generate: Some((_, n)), .. } if !(1..=pwgen::MAX_LENGTH).contains(n) => Err(refused_as("length")),
         Write::Add { name, folder, .. } => Ok(Planned {
             found: None,
             id: String::new(),
             base: String::new(),
             name: name.clone(),
-            folder: folder.as_deref().map(|f| read::folder_id(v, f)).transpose()?,
+            folder: folder.as_deref().map(|f| read::folder_id(v, f).map_err(|_| f.to_owned())),
             markers: Vec::new(),
         }),
         // The core edits the name, notes, user, password, URIs and folder: no TOTP key.
@@ -118,10 +131,12 @@ fn label(part: Part) -> (&'static str, &'static str) {
 fn question(ctx: &Ctx, caller: &Caller, write: &Write, planned: &Planned) -> String {
     let name = tidy(&planned.name);
     let what = match write {
-        Write::Add { user, folder, uris, .. } => {
+        Write::Add { user, folder, uris, generate, .. } => {
             let user = user.as_deref().map(|u| format!(" for the user \"{}\"", tidy(u))).unwrap_or_default();
-            let folder = folder.as_deref().map(|f| format!(" in the folder \"{}\"", tidy(f))).unwrap_or_default();
-            format!("add the login \"{name}\"{user}{folder}{}", uri_list(uris))
+            let new = if matches!(planned.folder, Some(Err(_))) { "new " } else { "" };
+            let folder = folder.as_deref().map(|f| format!(" in the {new}folder \"{}\"", tidy(f))).unwrap_or_default();
+            let made = generate.map(|(_, n)| format!(" and a generated password ({n} {})", unit(generate)));
+            format!("add the login \"{name}\"{user}{folder}{}{}", uri_list(uris), made.unwrap_or_default())
         }
         Write::Edit { ask, .. } => {
             let parts: Vec<_> = ask.iter().map(|p| label(*p).1).collect();
@@ -141,6 +156,11 @@ fn question(ctx: &Ctx, caller: &Caller, write: &Write, planned: &Planned) -> Str
     )
 }
 
+/// What a generated password's length counts.
+fn unit(generate: &Option<(Charset, u32)>) -> &'static str {
+    if matches!(generate, Some((Charset::Diceware, _))) { "words" } else { "characters" }
+}
+
 /// How many URIs a question names; the others are counted.
 const URIS_SHOWN: usize = 3;
 
@@ -155,14 +175,20 @@ fn uri_list(uris: &[String]) -> String {
     format!(" with the URIs {}{more}", shown.join(", "))
 }
 
-/// The new values, each from the pinentry. A TOTP key that gives no code is refused here, before anything is sent.
+/// The new values: a generated password, then each asked part from the pinentry. A TOTP key that gives no code is
+/// refused here, before anything is sent.
 async fn values<H: Host>(
     host: &H,
     ctx: &Ctx,
     name: &str,
-    ask: &[Part],
+    write: &Write,
 ) -> Result<Vec<(Part, Zeroizing<String>)>, AgentError> {
-    let mut out = Vec::with_capacity(ask.len());
+    let ask = write.asked();
+    let mut out = Vec::with_capacity(ask.len() + 1);
+    if let Write::Add { generate: Some((charset, length)), .. } = write {
+        // The length was checked in the plan, and the OS random source does not fail.
+        out.push((Part::Password, pwgen::generate(&OsRandom, *charset, *length).ok().ok_or(AgentError::Internal)?));
+    }
     for part in ask {
         let (prompt, what) = label(*part);
         let description = format!(
@@ -191,6 +217,7 @@ fn body(
     v: &UnlockedVault,
     write: &Write,
     planned: &Planned,
+    folder_id: Option<String>,
     values: &[(Part, Zeroizing<String>)],
     now_ms: i64,
 ) -> Result<Body, AgentError> {
@@ -203,7 +230,7 @@ fn body(
             let entry = NewEntry {
                 name: text(name),
                 notes: value(Part::Notes).unwrap_or_default(),
-                folder_id: planned.folder.clone(),
+                folder_id,
                 kind: NewKind::Login(NewLogin {
                     username: text(login.as_deref().unwrap_or_default()),
                     password: value(Part::Password).unwrap_or_default(),
@@ -226,6 +253,18 @@ fn body(
             client::check_trash(cipher()?, &planned.base, user, orgs).map(|()| Body::Trash).map_err(refused)
         }
     }
+}
+
+/// Make the folder `name` (encrypted under the user key) on the server: its id.
+async fn new_folder<H: Http>(
+    shared: &Shared,
+    api: &mut Client<H, SystemClock>,
+    name: &str,
+) -> Result<String, AgentError> {
+    let encrypted =
+        with_vault(shared, |v| v.keys.user().encrypt_str(name, &OsRandom).ok().ok_or(AgentError::Internal))?;
+    let made = api.create_folder(&encrypted).await.map_err(|e| session::map_api(&e))?;
+    made.get("id").and_then(Value::as_str).map(str::to_owned).ok_or(AgentError::Server)
 }
 
 /// Fetch the server's copy, plan the body on it, send it, then sync. The item's id (a new login's from the server).
@@ -251,8 +290,17 @@ async fn send<H: Host>(
     install(shared, ctx, fresh).await;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let now_ms = i64::try_from(now.as_millis()).unwrap_or(i64::MAX);
-    let body = with_vault(shared, |v| body(v, write, planned, values, now_ms))?;
     let sent = |e: ApiError| if e.is_out_of_date() { AgentError::OutOfDate } else { session::map_api(&e) };
+    // A folder that did not exist at the plan may have been made meanwhile (it is on the fresh copy); else make it.
+    let found = |name: &str| with_vault(shared, |v| read::folder_id(v, name)).ok();
+    let folder_id = match &planned.folder {
+        None => None,
+        Some(Ok(id)) => Some(id.clone()),
+        Some(Err(name)) => {
+            Some(if let Some(id) = found(name) { id } else { new_folder(shared, &mut api, name).await? })
+        }
+    };
+    let body = with_vault(shared, |v| body(v, write, planned, folder_id, values, now_ms))?;
     let id = match body {
         Body::Create(b) => {
             api.create_cipher(b).await.map_err(sent)?.get("id").and_then(Value::as_str).map(str::to_owned)
@@ -305,7 +353,7 @@ pub(super) async fn write<H: Host>(
         {
             return error(e);
         }
-        match values(host, ctx, &planned.name, write.asked()).await {
+        match values(host, ctx, &planned.name, &write).await {
             Ok(values) => values,
             Err(e @ AgentError::Totp(_)) => return end(Verdict::Failed, e),
             Err(e) => return end(Verdict::Declined, e),

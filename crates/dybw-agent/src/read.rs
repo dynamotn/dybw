@@ -249,19 +249,29 @@ fn primary(item: &Item) -> (&'static str, Option<Zeroizing<String>>) {
     }
 }
 
-/// A property by name (or its alias), `name`, `notes`, `uri` (the first), else a custom field by exact name.
-fn field<'a>(item: &'a Item, name: &str) -> Option<&'a str> {
+/// A property by name (or its alias), `name`, `notes`, `uri` (the first).
+fn builtin<'a>(item: &'a Item, name: &str) -> Option<&'a str> {
     let property = |n: &str| props(item).into_iter().find(|(_, cli, _)| *cli == n).and_then(|(_, _, v)| text(v));
     let alias = ALIASES.iter().find(|(a, _)| *a == name).map_or(name, |(_, p)| *p);
-    property(name)
-        .or_else(|| property(alias))
-        .or_else(|| match (name, &item.data) {
-            ("notes", _) => text(&item.notes),
-            ("name", _) => Some(item.name.as_str()),
-            ("uri", Data::Login(l)) => l.uris.first().and_then(|u| text(&u.uri)),
-            _ => None,
-        })
+    property(name).or_else(|| property(alias)).or_else(|| match (name, &item.data) {
+        ("notes", _) => text(&item.notes),
+        ("name", _) => Some(item.name.as_str()),
+        ("uri", Data::Login(l)) => l.uris.first().and_then(|u| text(&u.uri)),
+        _ => None,
+    })
+}
+
+/// What `--field name` gives: [`builtin`], else a custom field by exact name.
+fn field<'a>(item: &'a Item, name: &str) -> Option<&'a str> {
+    builtin(item, name)
         .or_else(|| item.fields.iter().find(|f| text(&f.name) == Some(name)).and_then(|f| text(&f.value)))
+}
+
+/// Whether `--field name` of the item `id` gives a custom field of the hidden type (1). Field names and types only.
+pub fn hidden_field(vault: &UnlockedVault, id: &str, name: &str) -> Result<bool, AgentError> {
+    let item = item_of(vault, id)?;
+    let custom = item.fields.iter().find(|f| text(&f.name) == Some(name));
+    Ok(builtin(&item, name).is_none() && custom.is_some_and(|f| f.kind == 1))
 }
 
 fn entry(name: &str, value: &str) -> Entry {

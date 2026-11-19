@@ -10,6 +10,7 @@ pub mod hardening;
 pub mod host;
 pub mod paths;
 pub mod policy;
+pub mod pwgen;
 pub mod read;
 pub mod server;
 pub mod session;

@@ -155,6 +155,8 @@ pub(crate) mod fake {
         pub bodies: Vec<Value>,
         /// `/sync` answers 500 once a cipher write went through.
         pub sync_fails_after_write: bool,
+        /// What `POST /api/folders` answers instead of making the folder.
+        pub folder_reply: Option<u16>,
     }
 
     impl World {
@@ -227,6 +229,7 @@ pub(crate) mod fake {
                 writes: 0,
                 bodies: Vec::new(),
                 sync_fails_after_write: false,
+                folder_reply: None,
             })))
         }
 
@@ -301,6 +304,19 @@ pub(crate) mod fake {
                         );
                         let fails = w.sync_fails || (w.sync_fails_after_write && w.writes > 0);
                         (if fails { 500 } else { 200 }, body, w.sync_hangs)
+                    }
+                    // A new folder, in what the next `/sync` sends.
+                    "/api/folders" if w.folder_reply.is_some() => (w.folder_reply.unwrap(), "{}".to_owned(), false),
+                    "/api/folders" => {
+                        let mut folders: Vec<Value> = serde_json::from_str(&w.folders).unwrap();
+                        let name = req.body.as_deref().and_then(|b| serde_json::from_slice::<Value>(b).ok());
+                        let folder = serde_json::json!({
+                            "id": format!("made-{}", folders.len()),
+                            "name": name.and_then(|n| n.get("name").cloned()),
+                        });
+                        folders.push(folder.clone());
+                        w.folders = Value::Array(folders).to_string();
+                        (200, folder.to_string(), false)
                     }
                     p if p.starts_with("/api/ciphers") => {
                         let (status, body) =

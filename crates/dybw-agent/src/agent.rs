@@ -54,6 +54,7 @@ fn kind(op: &Op) -> &'static str {
         Op::Code { .. } => "code",
         Op::Add { .. } => "add",
         Op::Edit { .. } => "edit",
+        Op::Generate { .. } => "generate",
         Op::Remove { .. } => "remove",
         Op::Policy { .. } => "policy",
         Op::StopAgent => "stop_agent",
@@ -185,6 +186,7 @@ impl Agent {
             | Op::Code { profile, .. }
             | Op::Add { profile, .. }
             | Op::Edit { profile, .. }
+            | Op::Generate { profile, .. }
             | Op::Remove { profile, .. }
             | Op::Policy { profile, .. } => Some((kind(&op), None, profile.clone())),
             _ => None,
@@ -193,7 +195,7 @@ impl Agent {
             Op::List { profile, .. } | Op::Search { profile, .. } => Some((kind(&op), None, profile.clone())),
             _ => None,
         });
-        let write = matches!(op, Op::Add { .. } | Op::Edit { .. } | Op::Remove { .. });
+        let write = matches!(op, Op::Add { .. } | Op::Edit { .. } | Op::Generate { .. } | Op::Remove { .. });
         // An AI-class caller reads names and status only: no value, no write, no unlock or login (no prompt is raised
         // on its behalf), no policy, no stop (it could restart the agent under its own environment). An unknown caller
         // writes nothing either. Refused before anything.
@@ -203,6 +205,7 @@ impl Agent {
             | Op::Code { .. }
             | Op::Add { .. }
             | Op::Edit { .. }
+            | Op::Generate { .. }
             | Op::Remove { .. } => sensitive.clone(),
             Op::StopAgent => Some((kind(&op), None, None)),
             Op::Unlock { profile } | Op::Login { profile } => Some((kind(&op), None, profile.clone())),
@@ -340,7 +343,11 @@ impl Agent {
                 self.on_unlocked(profile.as_deref(), cmd, ai).await
             }
             Op::Add { profile, name, user, uris, folder, ask } => {
-                let write = Write::Add { name, user, uris, folder, ask };
+                let write = Write::Add { name, user, uris, folder, ask, generate: None };
+                self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
+            }
+            Op::Generate { profile, name, user, uris, folder, length, charset } => {
+                let write = Write::Add { name, user, uris, folder, ask: vec![], generate: Some((charset, length)) };
                 self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
             }
             Op::Edit { profile, needle, user, folder, ask } => {
@@ -714,6 +721,15 @@ mod tests {
             Op::Code { profile: None, needle: "n".into(), user: None, folder: None, ignorecase: false, next: false },
             Op::Add { profile: None, name: "n".into(), user: None, uris: vec![], folder: None, ask: vec![] },
             Op::Edit { profile: None, needle: "n".into(), user: None, folder: None, ask: vec![] },
+            Op::Generate {
+                profile: None,
+                name: "n".into(),
+                user: None,
+                uris: vec![],
+                folder: None,
+                length: 8,
+                charset: dybw_proto::Charset::All,
+            },
             Op::Remove { profile: None, needle: "n".into(), user: None, folder: None },
             Op::StopAgent,
             Op::Unknown,
@@ -734,6 +750,7 @@ mod tests {
                 "code",
                 "add",
                 "edit",
+                "generate",
                 "remove",
                 "stop_agent",
                 "other"

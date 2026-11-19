@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand};
-use dybw_proto::{AgentError, Field, ItemSummary, Op, PolicyAction, PolicyRule, Reply, Select, Target};
+use dybw_proto::{AgentError, Charset, Field, ItemSummary, Op, Part, PolicyAction, PolicyRule, Reply, Select, Target};
 use serde_json::{Map, Value};
 use zeroize::Zeroizing;
 
@@ -100,6 +100,73 @@ enum Cmd {
         #[arg(long)]
         folder: Option<String>,
     },
+    /// Print the current TOTP code of a login (the key never leaves the agent).
+    Code {
+        item: String,
+        user: Option<String>,
+        #[arg(long)]
+        folder: Option<String>,
+        #[arg(short, long)]
+        ignorecase: bool,
+        /// When fewer than 5 seconds of the code are left, wait for the next one.
+        #[arg(long)]
+        next: bool,
+        /// Copy to the clipboard, marked as secret, instead of printing.
+        #[arg(short = 'c', long)]
+        clipboard: bool,
+    },
+    /// Add a login; its password (and with `--notes` its notes) is typed in the agent's pinentry, one line each.
+    Add {
+        name: String,
+        user: Option<String>,
+        /// A URI of the login (repeatable).
+        #[arg(long)]
+        uri: Vec<String>,
+        /// The folder; one that does not exist is created.
+        #[arg(long)]
+        folder: Option<String>,
+        #[command(flatten)]
+        ask: Ask,
+    },
+    /// Change an item's password (and with `--notes` its notes), typed in the agent's pinentry; the old password goes
+    /// to the history.
+    Edit {
+        item: String,
+        user: Option<String>,
+        #[arg(long)]
+        folder: Option<String>,
+        #[command(flatten)]
+        ask: Ask,
+    },
+    /// Move an item to the trash.
+    Remove {
+        item: String,
+        user: Option<String>,
+        #[arg(long)]
+        folder: Option<String>,
+    },
+    /// Print a new random password; with a name, the agent makes one and saves it as a new login instead, and nothing
+    /// is printed (`dybw get <name>` shows it).
+    Generate {
+        /// Characters, or words with `--diceware`.
+        length: u32,
+        name: Option<String>,
+        user: Option<String>,
+        #[arg(long, requires = "name")]
+        uri: Vec<String>,
+        #[arg(long, requires = "name")]
+        folder: Option<String>,
+        #[arg(long, group = "charset")]
+        no_symbols: bool,
+        #[arg(long, group = "charset")]
+        only_numbers: bool,
+        /// Letters and digits that cannot be mistaken for one another.
+        #[arg(long, group = "charset")]
+        nonconfusables: bool,
+        /// Words of the EFF large list, separated by spaces.
+        #[arg(long, group = "charset")]
+        diceware: bool,
+    },
     /// Show or change which programs may read values (changes are confirmed in the pinentry).
     Policy {
         #[command(subcommand)]
@@ -154,6 +221,28 @@ enum PolicyCmd {
     },
     /// Drop what is remembered for a program or a script.
     Forget { invoker: String },
+}
+
+/// Which values `add` and `edit` ask for in the pinentry: the password unless `--no-password`, the notes with
+/// `--notes`.
+#[derive(Args, Debug)]
+struct Ask {
+    /// Also ask for the notes (one line; they replace the old ones).
+    #[arg(long)]
+    notes: bool,
+    /// Do not ask for the password.
+    #[arg(long)]
+    no_password: bool,
+}
+
+impl Ask {
+    fn parts(&self) -> Vec<Part> {
+        [(!self.no_password, Part::Password), (self.notes, Part::Notes)]
+            .into_iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, p)| p)
+            .collect()
+    }
 }
 
 /// The absolute, symlink-free path the agent sees a program or script under; a relative path means nothing to it.
@@ -337,6 +426,46 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Res
                     Ok(0)
                 }
                 _ => Err(Fail::Unexpected),
+            }
+        }
+        Cmd::Code { item, user, folder, ignorecase, next, clipboard } => {
+            let op = Op::Code { profile, needle: item, user, folder, ignorecase, next };
+            let Reply::Code { code, .. } = ask_started(env, op)? else { return Err(Fail::Unexpected) };
+            if clipboard {
+                copy_out(env, code.expose().as_bytes(), err)?;
+            } else {
+                writeln!(out, "{}", code.expose())?;
+            }
+            Ok(0)
+        }
+        Cmd::Add { name, user, uri, folder, ask } => {
+            done(ask_started(env, Op::Add { profile, name, user, uris: uri, folder, ask: ask.parts() })?)
+        }
+        Cmd::Edit { item, user, folder, ask } => {
+            done(ask_started(env, Op::Edit { profile, needle: item, user, folder, ask: ask.parts() })?)
+        }
+        Cmd::Remove { item, user, folder } => {
+            done(ask_started(env, Op::Remove { profile, needle: item, user, folder })?)
+        }
+        Cmd::Generate { length, name, user, uri, folder, no_symbols, only_numbers, nonconfusables, diceware } => {
+            let charset = match (no_symbols, only_numbers, nonconfusables, diceware) {
+                (true, ..) => Charset::NoSymbols,
+                (_, true, ..) => Charset::Numbers,
+                (_, _, true, _) => Charset::Nonconfusables,
+                (.., true) => Charset::Diceware,
+                _ => Charset::All,
+            };
+            match name {
+                // Made and kept by the agent: the password never crosses the socket, so there is none to print.
+                Some(name) => {
+                    done(ask_started(env, Op::Generate { profile, name, user, uris: uri, folder, length, charset })?)
+                }
+                None => {
+                    let password = dybw_agent::pwgen::generate(&dybw_agent::pwgen::OsRandom, charset, length)
+                        .map_err(|e| Fail::Log(e.to_string()))?;
+                    writeln!(out, "{}", password.as_str())?;
+                    Ok(0)
+                }
             }
         }
         Cmd::Policy { command } => {

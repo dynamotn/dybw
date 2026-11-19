@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use dybw_core::crypto::SymmetricKey;
 use dybw_core::totp::TotpKey;
 use dybw_native::ports::random::OsRandom;
-use dybw_proto::{AgentError, Field, Op, Part, Reply, Select};
+use dybw_proto::{AgentError, Charset, Field, Op, Part, Reply, Select};
 use serde_json::{Value, json};
 
 use crate::agent::testing::{Rig, rig, unlock};
@@ -453,11 +453,8 @@ async fn add_creates_a_login_whose_values_come_from_the_pinentry_only() {
 }
 
 #[tokio::test]
-async fn add_refuses_an_unknown_folder_and_a_totp_key_that_gives_no_code_before_anything_is_sent() {
+async fn add_refuses_a_totp_key_that_gives_no_code_before_anything_is_sent() {
     let (_dir, rig) = setup(|_| {}).await;
-    let reply = rig.agent.dispatch(add_op("New", Some("Nope"), &[Part::Password])).await;
-    assert_eq!(reply, err(AgentError::NoSuchFolder("Nope".into())));
-    assert!(rig.host.world().confirmed.is_empty(), "not even asked");
     for (key, why) in [
         ("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&digits=12", "the TOTP digits 12 is outside 1..=10"),
         ("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&period=0", "the TOTP period 0 is outside 1..=4294967295 seconds"),
@@ -709,11 +706,138 @@ async fn an_organization_login_that_hides_its_password_gives_no_password_totp_or
     }
     assert!(rig.host.world().confirmed.is_empty(), "refused before any question");
     assert_eq!(rig.agent.opens("org").await, 0);
+    // A custom field of the hidden type is hidden with the password, as the official clients hide it.
+    rig.host.allow();
+    assert_eq!(rig.agent.dispatch(org(get_op("o1", Select::Field("hidden".into())))).await, err(AgentError::Denied));
+    assert!(rig.host.world().confirmed.is_empty(), "refused before any question");
     assert!(audited(&rig).iter().all(|(_, item, v)| item.as_deref() == Some("o1") && *v == Verdict::Denied));
+    assert_eq!(audited(&rig).len(), 8);
     // What the organization shows is still given.
     rig.host.world().confirms.clear();
     rig.host.allow();
     assert!(matches!(rig.agent.dispatch(org(get_op("o1", Select::ListFields))).await, Reply::FieldNames { .. }));
     rig.host.allow();
     assert_eq!(text(rig.agent.dispatch(org(get_op("o1", Select::Field("user".into())))).await), "me@example.invalid");
+    rig.host.allow();
+    assert_eq!(text(rig.agent.dispatch(org(get_op("o1", Select::Field("text".into())))).await), "shown");
+}
+
+fn generate_op(name: &str, folder: Option<&str>, length: u32, charset: Charset) -> Op {
+    Op::Generate {
+        profile: w(),
+        name: name.into(),
+        user: Some("robot".into()),
+        uris: vec![],
+        folder: folder.map(Into::into),
+        length,
+        charset,
+    }
+}
+
+#[tokio::test]
+async fn add_creates_a_missing_folder_under_the_same_confirmation_once() {
+    let (_dir, rig) = setup(|_| {}).await;
+    // Declined: no folder is made either.
+    rig.host.answer(Answer::Text("pw"));
+    assert_eq!(rig.agent.dispatch(add_op("New", Some("Fresh"), &[Part::Password])).await, err(AgentError::Denied));
+    assert_eq!(rig.host.world().count("/api/folders"), 0);
+    rig.host.allow();
+    assert_eq!(rig.agent.dispatch(add_op("New", Some("Fresh"), &[Part::Password])).await, Reply::Done);
+    {
+        let world = rig.host.world();
+        assert!(
+            world.confirmed[1].contains("to add the login \"New\" for the user \"robot\" in the new folder \"Fresh\"")
+        );
+        assert_eq!(world.count("/api/folders"), 1);
+        let made = world.bodies[0]["folderId"].as_str().unwrap().to_owned();
+        assert!(made.starts_with("made-"), "{made}");
+        assert!(!world.folders.contains("Fresh"), "the folder name is sent encrypted");
+    }
+    // The folder exists now: a second add goes into it and makes none.
+    rig.host.allow();
+    rig.host.answer(Answer::Text("pw2"));
+    assert_eq!(rig.agent.dispatch(add_op("Newer", Some("Fresh"), &[Part::Password])).await, Reply::Done);
+    {
+        let world = rig.host.world();
+        assert!(world.confirmed[2].contains(" in the folder \"Fresh\""), "{}", world.confirmed[2]);
+        assert_eq!(world.count("/api/folders"), 1);
+        assert_eq!(world.bodies[1]["folderId"], world.bodies[0]["folderId"]);
+    }
+    let list = Op::List { profile: w(), fields: vec![Field::Name], folder: Some("Fresh".into()) };
+    let names: Vec<_> = items(rig.agent.dispatch(list).await).into_iter().filter_map(|r| r.name).collect();
+    assert_eq!(names, ["New", "Newer"]);
+}
+
+#[tokio::test]
+async fn a_folder_made_elsewhere_while_the_user_was_asked_is_used_not_made_again() {
+    let (_dir, rig) = setup(|_| {}).await;
+    rig.host.world().confirms.push_back(Answer::Held);
+    rig.host.answer(Answer::Text("pw"));
+    let agent = rig.agent.clone();
+    let pending = tokio::spawn(async move { agent.dispatch(add_op("New", Some("Fresh"), &[Part::Password])).await });
+    until(|| rig.host.world().confirmed.len() == 1).await;
+    rig.host.world().folders = json!([{ "id": "elsewhere", "name": enc("Fresh") }]).to_string();
+    rig.host.world().release.notify_one();
+    assert_eq!(pending.await.unwrap(), Reply::Done);
+    let world = rig.host.world();
+    assert_eq!((world.count("/api/folders"), world.bodies[0]["folderId"].as_str()), (0, Some("elsewhere")));
+}
+
+#[tokio::test]
+async fn a_folder_the_server_will_not_make_fails_the_add_and_writes_no_login() {
+    let (_dir, rig) = setup(|_| {}).await;
+    // Refused, or answered without an id.
+    for status in [500, 200] {
+        rig.host.allow();
+        rig.host.answer(Answer::Text("pw"));
+        rig.host.world().folder_reply = Some(status);
+        let reply = rig.agent.dispatch(add_op("New", Some("Fresh"), &[Part::Password])).await;
+        assert_eq!(reply, err(AgentError::Server));
+    }
+    assert_eq!(writes(&rig), 0);
+    assert_eq!(audited(&rig).iter().map(|e| e.2).collect::<Vec<_>>(), [Verdict::Failed; 2]);
+}
+
+#[tokio::test]
+async fn generate_makes_the_password_in_the_agent_and_asks_for_none() {
+    let (_dir, rig) = setup(|_| {}).await;
+    let prompts = rig.host.world().prompts.len();
+    rig.host.allow();
+    assert_eq!(rig.agent.dispatch(generate_op("Made", None, 24, Charset::NoSymbols)).await, Reply::Done);
+    {
+        let world = rig.host.world();
+        assert!(world.confirmed[0].ends_with(
+            "(dybw generate) to add the login \"Made\" for the user \"robot\" and a generated password (24 characters)? \
+             (asked for every change)"
+        ));
+        assert_eq!(world.prompts.len(), prompts, "no value asked for");
+    }
+    assert_eq!(audited(&rig), [("generate", Some("new1".to_owned()), Verdict::Confirmed)]);
+    rig.host.allow();
+    let pw = text(rig.agent.dispatch(get_op("Made", Select::Password)).await);
+    assert!(pw.len() == 24 && pw.chars().all(|c| c.is_ascii_alphanumeric()), "{pw}");
+    assert!(!rig.host.world().bodies[0].to_string().contains(&pw));
+    rig.host.allow();
+    assert_eq!(rig.agent.dispatch(generate_op("Words", Some("Fresh"), 5, Charset::Diceware)).await, Reply::Done);
+    assert!(rig.host.world().confirmed[2].contains("in the new folder \"Fresh\" and a generated password (5 words)"));
+    rig.host.allow();
+    assert_eq!(text(rig.agent.dispatch(get_op("Words", Select::Password)).await).split(' ').count(), 5);
+}
+
+#[tokio::test]
+async fn generate_refuses_a_bad_length_before_asking_and_an_ai_caller_outright() {
+    let (_dir, rig) = setup(|_| {}).await;
+    for n in [0, 1025] {
+        rig.host.allow();
+        let reply = rig.agent.dispatch(generate_op("Made", None, n, Charset::All)).await;
+        assert_eq!(reply, err(AgentError::WriteRefused("length".into())));
+    }
+    rig.host.allow();
+    assert_eq!(rig.agent.dispatch_as(generate_op("Made", None, 8, Charset::All), ai()).await, err(AgentError::Denied));
+    rig.host.allow();
+    let reply = rig.agent.dispatch_as(generate_op("Made", None, 8, Charset::All), unknown()).await;
+    assert_eq!(reply, err(AgentError::Denied));
+    assert!(rig.host.world().confirmed.is_empty(), "never asked");
+    assert_eq!(writes(&rig), 0);
+    assert_eq!(audited(&rig), [("generate", None, Verdict::Denied), ("generate", None, Verdict::Denied)]);
 }

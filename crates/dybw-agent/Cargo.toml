@@ -24,6 +24,7 @@ tracing.workspace = true
 rustix.workspace = true
 dybw-peer.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
