@@ -527,7 +527,7 @@ dependencies = [
 [[package]]
 name = "dybw-core"
 version = "0.1.0"
-source = "git+https://gitlab.com/dynamo-tools/dybw-core.git?rev=4c5ae763a903f0877d418ffcc74fc72fc5707f6d#4c5ae763a903f0877d418ffcc74fc72fc5707f6d"
+source = "git+https://gitlab.com/dynamo-tools/dybw-core.git?rev=4cc86ca44173712401f9b2d672a4d2637636aafc#4cc86ca44173712401f9b2d672a4d2637636aafc"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -555,7 +555,7 @@ dependencies = [
 [[package]]
 name = "dybw-native"
 version = "0.1.0"
-source = "git+https://gitlab.com/dynamo-tools/dybw-core.git?rev=4c5ae763a903f0877d418ffcc74fc72fc5707f6d#4c5ae763a903f0877d418ffcc74fc72fc5707f6d"
+source = "git+https://gitlab.com/dynamo-tools/dybw-core.git?rev=4cc86ca44173712401f9b2d672a4d2637636aafc#4cc86ca44173712401f9b2d672a4d2637636aafc"
 dependencies = [
  "anyhow",
  "dybw-core",

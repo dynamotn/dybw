@@ -18,8 +18,8 @@ indexing_slicing = "warn"
 
 [workspace.dependencies]
 # Pinned by rev on its public URL, like bwss.
-dybw-core = { git = "https://gitlab.com/dynamo-tools/dybw-core.git", rev = "4c5ae763a903f0877d418ffcc74fc72fc5707f6d", features = ["totp", "vault-client"] }
-dybw-native = { git = "https://gitlab.com/dynamo-tools/dybw-core.git", rev = "4c5ae763a903f0877d418ffcc74fc72fc5707f6d" }
+dybw-core = { git = "https://gitlab.com/dynamo-tools/dybw-core.git", rev = "4cc86ca44173712401f9b2d672a4d2637636aafc", features = ["totp", "vault-client"] }
+dybw-native = { git = "https://gitlab.com/dynamo-tools/dybw-core.git", rev = "4cc86ca44173712401f9b2d672a4d2637636aafc" }
 dybw-proto = { path = "crates/dybw-proto" }
 dybw-peer = { path = "crates/dybw-peer" }
 dybw-agent = { path = "crates/dybw-agent" }
