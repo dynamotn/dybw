@@ -287,6 +287,30 @@ fn fields(names: &[String], raw: bool) -> Result<Vec<Field>, Fail> {
     names.iter().map(|n| parse_field(n).map_err(|_| Fail::Log(format!("unknown field {n}")))).collect()
 }
 
+/// rbw's `gen-completions`: clap's script for the model, then rbw's own additions for bash, fish and zsh.
+pub(crate) fn completions(shell: CompletionShell, out: &mut dyn Write) -> Result<(), Fail> {
+    use clap::CommandFactory as _;
+    use clap_complete::Shell;
+    let mut cmd = Opt::command();
+    match shell {
+        CompletionShell::Bash => clap_complete::generate(Shell::Bash, &mut cmd, "rbw", out),
+        CompletionShell::Fish => clap_complete::generate(Shell::Fish, &mut cmd, "rbw", out),
+        CompletionShell::Zsh => clap_complete::generate(Shell::Zsh, &mut cmd, "rbw", out),
+        CompletionShell::Powershell => clap_complete::generate(Shell::PowerShell, &mut cmd, "rbw", out),
+        CompletionShell::Elvish => clap_complete::generate(Shell::Elvish, &mut cmd, "rbw", out),
+        CompletionShell::Nushell => clap_complete::generate(clap_complete_nushell::Nushell, &mut cmd, "rbw", out),
+        CompletionShell::Fig => clap_complete::generate(clap_complete_fig::Fig, &mut cmd, "rbw", out),
+    }
+    let extra = match shell {
+        CompletionShell::Bash => include_str!("rbw_completion/rbw.bash"),
+        CompletionShell::Fish => include_str!("rbw_completion/rbw.fish"),
+        CompletionShell::Zsh => include_str!("rbw_completion/rbw.zsh"),
+        _ => return Ok(()),
+    };
+    // rbw's `println!`.
+    Ok(writeln!(out, "{extra}")?)
+}
+
 /// The profile of the shim: `RBW_PROFILE`, else the agent's default. `DYBW_PROFILE` is not read.
 fn profile(env: &Env) -> Option<String> {
     (env.var)("RBW_PROFILE").and_then(|v| v.into_string().ok()).filter(|v| !v.is_empty())
@@ -310,10 +334,9 @@ fn run_opt(opt: Opt, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Res
                     .into(),
             ));
         }
-        // TODO(Task 4): the completion scripts need `clap_complete` (and its nushell and fig companions), which the
-        // workspace does not have yet.
-        Opt::GenCompletions { .. } => {
-            return Err(Fail::Log("completion scripts are not available in this build".into()));
+        Opt::GenCompletions { shell } => {
+            completions(shell, out)?;
+            return Ok(0);
         }
         // The API key is the only login there is: `register` and `login` are the same step.
         Opt::Register | Opt::Login => Cmd::Login,

@@ -11,7 +11,6 @@ use dybw_proto::{AgentError, Charset, Field, Op, Reply, Select, Target};
 
 use super::*;
 use crate::rbw::Opt;
-use crate::rbw_config::Lines;
 use crate::tests::{Act, base as new_base, env_in, fake, s, secret, status};
 
 /// `env_in`, with these variables on top.
@@ -107,7 +106,7 @@ fn help_names_every_command_alias_and_text() {
     }
     // The long help of `register` and `add` is rbw's.
     let (_, out, _) = alone(&[], &["register", "--help"]);
-    assert!(out.contains("personal API key (instead of your password) first"), "{out}");
+    assert!(out.contains("includes bot detection to prevent brute force attacks"), "{out}");
     let (_, out, _) = alone(&[], &["add", "-h"]);
     assert!(out.starts_with("Add a new password to the database\n"), "{out}");
     let (_, out, _) = alone(&[], &["get", "-h"]);
@@ -427,14 +426,56 @@ fn unlocked_follows_the_agent() {
 }
 
 #[test]
-fn purge_and_completions_say_what_is_missing() {
+fn purge_says_what_is_missing() {
     let (code, out, err) = alone(&[], &["purge"]);
     assert_eq!((code, out.as_str()), (1, ""));
     assert!(err.starts_with("rbw purge: dybw has no purge") && err.contains(".cache/dybw/profiles"), "{err}");
-    // TODO(Task 4): the scripts themselves, once `clap_complete` is allowed in.
-    let (code, _, err) = alone(&[], &["gen-completions", "bash"]);
-    assert_eq!(code, 1);
-    assert!(err.starts_with("rbw gen-completions: "), "{err}");
+}
+
+#[test]
+fn gen_completions_is_clap_output_for_the_model_plus_rbws_scripts() {
+    use clap::CommandFactory as _;
+    use clap_complete::Shell;
+    let render = |f: &dyn Fn(&mut Vec<u8>)| {
+        let mut buf = vec![];
+        f(&mut buf);
+        String::from_utf8(buf).unwrap()
+    };
+    let cmd = Opt::command();
+    let want: Vec<(&str, String)> = vec![
+        (
+            "bash",
+            render(&|b| clap_complete::generate(Shell::Bash, &mut cmd.clone(), "rbw", b))
+                + include_str!("rbw_completion/rbw.bash")
+                + "\n",
+        ),
+        (
+            "zsh",
+            render(&|b| clap_complete::generate(Shell::Zsh, &mut cmd.clone(), "rbw", b))
+                + include_str!("rbw_completion/rbw.zsh")
+                + "\n",
+        ),
+        (
+            "fish",
+            render(&|b| clap_complete::generate(Shell::Fish, &mut cmd.clone(), "rbw", b))
+                + include_str!("rbw_completion/rbw.fish")
+                + "\n",
+        ),
+        ("powershell", render(&|b| clap_complete::generate(Shell::PowerShell, &mut cmd.clone(), "rbw", b))),
+        ("elvish", render(&|b| clap_complete::generate(Shell::Elvish, &mut cmd.clone(), "rbw", b))),
+        ("nushell", render(&|b| clap_complete::generate(clap_complete_nushell::Nushell, &mut cmd.clone(), "rbw", b))),
+        ("fig", render(&|b| clap_complete::generate(clap_complete_fig::Fig, &mut Opt::command(), "rbw", b))),
+    ];
+    for (shell, expected) in want {
+        let (code, out, err) = alone(&[], &["gen-completions", shell]);
+        assert_eq!((code, err.as_str()), (0, ""), "{shell}");
+        assert_eq!(out, expected, "{shell}");
+        assert!(out.contains("stop-agent") && out.contains("gen-completions"), "{shell}");
+    }
+    let (_, fish, _) = alone(&[], &["gen-completions", "fish"]);
+    for sub in ["config", "register", "unlocked", "search", "code", "history", "purge"] {
+        assert!(fish.contains(&format!("-a \"{sub}\"")), "{sub}");
+    }
 }
 
 #[test]
@@ -695,13 +736,7 @@ fn config_set_pinentry_must_be_trusted() {
 }
 
 #[test]
-fn config_set_keeps_a_file_it_cannot_edit_safely_untouched() {
-    // A profile written as an inline table is not found by line; adding a section would define it twice.
-    let inline = "default = \"w\"\nprofiles = { w = { server_url = \"https://w\", email = \"e\" } }\n";
-    let (base, (code, _, err)) = cfg(Some(inline), &[], &["config", "set", "email", "x"]);
-    assert_eq!(code, 1);
-    assert!(err.starts_with("rbw config set: the edit would break "), "{err}");
-    assert_eq!(read_config(base.path()), inline);
+fn config_set_refuses_a_file_it_cannot_parse() {
     let (_, (code, _, err)) = cfg(Some("default = \n"), &[], &["config", "set", "email", "x"]);
     assert_eq!(code, 1);
     assert!(err.starts_with("rbw config set: cannot parse "), "{err}");
@@ -791,46 +826,66 @@ fn config_unset_refuses_what_a_profile_needs_or_rbw_cannot_unset() {
     }
 }
 
-// the line editor
+// the toml_edit based editor
 
-fn put(text: &str, section: &str, key: &str, value: i64) -> (String, Vec<String>) {
-    let mut lines = Lines(text.lines().map(str::to_owned).collect());
-    let mut shown = vec![];
-    lines.put(section, key, &toml::Value::Integer(value), &mut shown);
-    (lines.0.join("\n"), shown)
+fn set_email(
+    text: &str,
+    vars: &'static [(&'static str, &'static str)],
+    key: &str,
+    value: &str,
+) -> (u8, String, String) {
+    let (base, (code, _, err)) = cfg(Some(text), vars, &["config", "set", key, value]);
+    (code, read_config(base.path()), err)
 }
 
 #[test]
-fn the_editor_places_a_new_key_after_the_last_line_of_its_section() {
-    let text = "[profiles.a]\nx = 1\n# note\n\n[profiles.b]\ny = 2";
-    assert_eq!(put(text, "profiles.a", "k", 7).0, "[profiles.a]\nx = 1\n# note\nk = 7\n\n[profiles.b]\ny = 2");
-    assert_eq!(put(text, "profiles.b", "k", 7).0, "[profiles.a]\nx = 1\n# note\n\n[profiles.b]\ny = 2\nk = 7");
-    // An empty section, directly followed by another.
-    assert_eq!(put("[profiles.a]\n[profiles.b]\n", "profiles.a", "k", 7).0, "[profiles.a]\nk = 7\n\n[profiles.b]");
-    // The top level goes before the first header, with a blank line between.
-    assert_eq!(put("[profiles.a]\nx = 1", "", "k", 7).0, "k = 7\n\n[profiles.a]\nx = 1");
-    assert_eq!(put("a = 1\n\n[t]\n", "", "k", 7).0, "a = 1\nk = 7\n\n[t]");
-    assert_eq!(put("", "", "k", 7).0, "k = 7");
+fn the_editor_keeps_comments_trailing_ones_and_order() {
+    let text = "# top\ndefault = \"w\" # which\n\n[profiles.w] # the job\nemail = \"a\" # mine\nserver_url = \"https://w\"\n\n# last\n[bwss]\nprofile = \"w\"\n";
+    let (code, new, err) = set_email(text, &[], "email", "b");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(new, text.replace("\"a\"", "\"b\""));
+    assert!(err.contains("[profiles.w] - email = \"a\"") && err.contains("[profiles.w] + email = \"b\""), "{err}");
+    // A new key goes into its section, before the next one.
+    let (code, new, _) = set_email(text, &[], "lock_timeout", "120");
+    assert_eq!(code, 0);
+    assert!(new.contains("server_url = \"https://w\"\nlock_timeout_minutes = 2\n"), "{new}");
+    assert!(new.starts_with("# top\ndefault = \"w\" # which\n"), "{new}");
 }
 
 #[test]
-fn the_editor_finds_headers_and_keys_as_toml_spells_them() {
-    for header in ["[profiles.a]", "  [ profiles.a ]  # c", "[profiles.\"a\"]"] {
-        let text = format!("{header}\nk   =  1\n");
-        let (new, shown) = put(&text, "profiles.a", "k", 2);
-        assert_eq!(new, format!("{header}\nk = 2"), "{header}");
-        assert_eq!(shown.len(), 1);
+fn the_editor_edits_inline_table_and_dotted_profiles() {
+    let inline = "default = \"w\"\nprofiles = { w = { server_url = \"https://w\", email = \"e\" } }\n";
+    let (code, new, err) = set_email(inline, &[], "email", "x");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(new, inline.replace("\"e\"", "\"x\""));
+    let (_, new, _) = set_email(inline, &[], "lock_timeout", "60");
+    assert!(new.contains("lock_timeout_minutes = 1"), "{new}");
+    let dotted = "default = \"w\"\nprofiles.w.email = \"e\" # c\nprofiles.w.server_url = \"https://w\"\n";
+    let (code, new, err) = set_email(dotted, &[], "email", "x");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(new, dotted.replace("\"e\"", "\"x\""));
+}
+
+#[test]
+fn the_editor_refuses_a_profile_that_is_not_a_table_and_leaves_the_file() {
+    for text in ["default = \"w\"\nprofiles = \"x\"\n", "default = \"w\"\n[profiles]\nw = 3\n"] {
+        let (base, (code, _, err)) = cfg(Some(text), &[], &["config", "set", "email", "x"]);
+        assert_eq!(code, 1);
+        assert!(err.starts_with("rbw config set: cannot edit ") && err.contains("is not a table"), "{err}");
+        assert_eq!(read_config(base.path()), text);
     }
-    // `kk` and a comment are not the key; `[[array]]` is another table.
-    let (new, _) = put("[profiles.a]\nkk = 1\n# k = 1\n[[profiles.a]]\n", "profiles.a", "k", 2);
-    assert_eq!(new, "[profiles.a]\nkk = 1\n# k = 1\nk = 2\n\n[[profiles.a]]");
-    let (new, shown) = put("[profiles.a]\nk = 1", "profiles.a", "k", 1);
-    assert_eq!((new.as_str(), shown.len()), ("[profiles.a]\nk = 1", 0));
 }
 
 #[test]
-fn the_editor_appends_a_missing_section_after_a_blank_line() {
-    assert_eq!(put("a = 1", "profiles.z", "k", 7).0, "a = 1\n\n[profiles.z]\nk = 7");
-    assert_eq!(put("a = 1\n", "profiles.z", "k", 7).0, "a = 1\n\n[profiles.z]\nk = 7");
-    assert_eq!(put("", "profiles.z", "k", 7).0, "[profiles.z]\nk = 7");
+fn the_editor_unsets_in_inline_tables_and_keeps_the_rest() {
+    let text = "default = \"w\"\nprofiles = { w = { email = \"e\", lock_timeout_minutes = 5 } } # all\n";
+    let (base, (code, _, err)) = cfg(Some(text), &[], &["config", "unset", "lock_timeout"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("[profiles.w] - lock_timeout_minutes = 5"), "{err}");
+    let new = read_config(base.path());
+    assert!(new.contains("email = \"e\"") && new.contains("# all") && !new.contains("lock_timeout"), "{new}");
+    // No `profiles` at all: nothing to remove.
+    let (_, (code, _, err)) = cfg(Some("default = \"w\"\n"), &[], &["config", "unset", "lock_timeout"]);
+    assert_eq!(code, 0);
+    assert!(err.contains("nothing to change"), "{err}");
 }

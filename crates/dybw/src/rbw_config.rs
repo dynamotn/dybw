@@ -6,7 +6,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use dybw_proto::Op;
-use toml::{Table, Value};
+use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use crate::{Env, Fail, ask, doctor, no_home, pinentry_text};
 
@@ -23,7 +23,7 @@ pub fn show(env: &Env, profile: Option<&str>, out: &mut dyn Write) -> Result<u8,
     let config = dybw_agent::config::Config::load(&config_file(env)?).map_err(|e| log(format!("{e:#}")))?;
     let p = config.profile(profile).map_err(|e| log(format!("{e:#}")))?;
     // rbw's field order; the settings dybw has no use for are null.
-    let text = |s: &str| Value::String(s.into()).to_string();
+    let text = |s: &str| serde_json::Value::from(s).to_string();
     writeln!(
         out,
         "{{\n  \"email\": {},\n  \"sso_id\": null,\n  \"base_url\": {},\n  \"identity_url\": null,\n  \"ui_url\": null,\n  \
@@ -59,8 +59,8 @@ fn refuse(key: &str) -> Fail {
 
 pub fn set(env: &Env, profile: Option<&str>, key: &str, value: &str, err: &mut dyn Write) -> Result<u8, Fail> {
     let change = match key {
-        "email" => Some(("email", Value::String(value.into()))),
-        "base_url" => Some(("server_url", Value::String(value.into()))),
+        "email" => Some(("email", Value::from(value))),
+        "base_url" => Some(("server_url", Value::from(value))),
         "lock_timeout" => {
             let secs: u64 = value.parse().map_err(|e| log(format!("failed to parse value for lock_timeout: {e}")))?;
             if secs == 0 {
@@ -68,17 +68,17 @@ pub fn set(env: &Env, profile: Option<&str>, key: &str, value: &str, err: &mut d
                 let _ = writeln!(err, "ERROR: lock_timeout must be greater than 0");
                 None
             } else {
-                Some(("lock_timeout_minutes", Value::Integer(i64::try_from(secs.div_ceil(60)).unwrap_or(i64::MAX))))
+                Some(("lock_timeout_minutes", Value::from(i64::try_from(secs.div_ceil(60)).unwrap_or(i64::MAX))))
             }
         }
         // 0 is "no periodic sync", as in rbw.
         "sync_interval" => {
             let secs: u64 = value.parse().map_err(|e| log(format!("failed to parse value for sync_interval: {e}")))?;
-            Some(("sync_interval_seconds", Value::Integer(i64::try_from(secs).map_err(log)?)))
+            Some(("sync_interval_seconds", Value::from(i64::try_from(secs).map_err(log)?)))
         }
         "pinentry" => {
             pinentry_text(value).map_err(|e| log(format!("pinentry {value:?} is not trusted: {e}")))?;
-            Some(("pinentry", Value::String(value.into())))
+            Some(("pinentry", Value::from(value)))
         }
         _ => return Err(refuse(key)),
     };
@@ -116,28 +116,63 @@ fn edit(env: &Env, profile: Option<&str>, key: &str, value: Option<Value>, err: 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(log(format!("cannot read {}: {e}", path.display()))),
     };
-    let doc: Table = toml::from_str(&text).map_err(|e| log(format!("cannot parse {}: {e}", path.display())))?;
-    let named = profile.map(str::to_owned).or_else(|| doc.get("default").and_then(Value::as_str).map(str::to_owned));
+    let mut doc: DocumentMut = text.parse().map_err(|e| log(format!("cannot parse {}: {e}", path.display())))?;
+    let named = profile.map(str::to_owned).or_else(|| doc.get("default").and_then(Item::as_str).map(str::to_owned));
     let name = named.clone().unwrap_or_else(|| "default".into());
-    let mut lines = Lines(text.lines().map(str::to_owned).collect());
     let mut shown = vec![];
     if named.is_none() && value.is_some() {
-        lines.put("", "default", &Value::String(name.clone()), &mut shown);
+        put(doc.as_table_mut(), None, "default", Value::from(name.as_str()), &mut shown);
     }
-    let section = format!("profiles.{name}");
-    match &value {
-        Some(v) => lines.put(&section, key, v, &mut shown),
-        None => lines.remove(&section, key, &mut shown),
+    let broken = |what: &str| log(format!("cannot edit {}: {what} is not a table", path.display()));
+    match value {
+        Some(v) => {
+            let profiles = doc.entry("profiles").or_insert_with(|| {
+                let mut t = Table::new();
+                t.set_implicit(true);
+                Item::Table(t)
+            });
+            let profiles = profiles.as_table_like_mut().ok_or_else(|| broken("`profiles`"))?;
+            let own = profiles.entry(&name).or_insert(Item::Table(Table::new()));
+            let own = own.as_table_like_mut().ok_or_else(|| broken(&format!("`profiles.{name}`")))?;
+            put(own, Some(&name), key, v, &mut shown);
+        }
+        None => {
+            let own = doc.get_mut("profiles").and_then(Item::as_table_like_mut).and_then(|p| p.get_mut(&name));
+            if let Some(own) = own.and_then(Item::as_table_like_mut)
+                && let Some(old) = own.remove(key)
+            {
+                shown.push(format!("[profiles.{name}] - {key} = {}", item_text(&old)));
+            }
+        }
     }
     if shown.is_empty() {
         let _ = writeln!(err, "{}: nothing to change", path.display());
         return Ok(0);
     }
-    let new = lines.0.join("\n") + "\n";
-    toml::from_str::<Table>(&new).map_err(|e| log(format!("the edit would break {}: {e}", path.display())))?;
-    write_file(&path, &new)?;
+    write_file(&path, &doc.to_string())?;
     let _ = writeln!(err, "{}\n{}", path.display(), shown.join("\n"));
     Ok(0)
+}
+
+fn item_text(item: &Item) -> String {
+    item.as_value().map_or_else(String::new, |v| v.to_string().trim().to_owned())
+}
+
+/// Set `key` in `table` (`profile`: the profile it is the table of; `None`: the top level), keeping the comment
+/// after an old value, and note a change.
+fn put(table: &mut dyn TableLike, profile: Option<&str>, key: &str, mut new: Value, shown: &mut Vec<String>) {
+    let place = profile.map_or("top level".to_owned(), |p| format!("[profiles.{p}]"));
+    let new_text = format!("{key} = {}", new.to_string().trim());
+    let old = table.get(key).and_then(Item::as_value);
+    if let Some(old) = old {
+        if old.to_string().trim() == new.to_string().trim() {
+            return;
+        }
+        shown.push(format!("{place} - {key} = {}", old.to_string().trim()));
+        *new.decor_mut() = old.decor().clone();
+    }
+    table.insert(key, Item::Value(new));
+    shown.push(format!("{place} + {new_text}"));
 }
 
 /// Write beside the file and rename over it; an existing file keeps its permissions.
@@ -152,76 +187,4 @@ fn write_file(path: &Path, text: &str) -> Result<(), Fail> {
         std::fs::rename(&tmp, path)
     };
     write().map_err(|e| log(format!("cannot write {}: {e}", path.display())))
-}
-
-/// The lines of the file. shortcut: a header is a line that starts with `[` and keys are bare, one per line, which is
-/// how this tool and the docs write the file; a profile written any other way is not found, and a new section is made.
-pub(crate) struct Lines(pub(crate) Vec<String>);
-
-fn is_header(line: &str) -> bool {
-    line.trim_start().starts_with('[')
-}
-
-fn header_is(line: &str, section: &str) -> bool {
-    let name = line.trim_start().strip_prefix('[').and_then(|r| r.split(']').next()).map(str::trim);
-    let quoted = section.split_once('.').map(|(a, b)| format!("{a}.\"{b}\""));
-    name.is_some_and(|n| n == section || quoted.as_deref() == Some(n))
-}
-
-fn is_key(line: &str, key: &str) -> bool {
-    line.trim_start().strip_prefix(key).is_some_and(|rest| rest.trim_start().starts_with('='))
-}
-
-impl Lines {
-    /// The body of a section as a range of line indexes (`""`: the top level, before the first header).
-    fn body(&self, section: &str) -> Option<std::ops::Range<usize>> {
-        let first =
-            |from: usize| self.0.iter().skip(from).position(|l| is_header(l)).map_or(self.0.len(), |p| p + from);
-        if section.is_empty() {
-            return Some(0..first(0));
-        }
-        let at = self.0.iter().position(|l| header_is(l, section))?;
-        Some(at + 1..first(at + 1))
-    }
-
-    /// The lines of a body with their indexes.
-    fn lines(&self, body: &std::ops::Range<usize>) -> impl Iterator<Item = (usize, &String)> {
-        self.0.iter().enumerate().skip(body.start).take(body.len())
-    }
-
-    pub(crate) fn put(&mut self, section: &str, key: &str, value: &Value, shown: &mut Vec<String>) {
-        let new = format!("{key} = {value}");
-        let place = if section.is_empty() { "top level".to_owned() } else { format!("[{section}]") };
-        let Some(body) = self.body(section) else {
-            if self.0.last().is_some_and(|l| !l.trim().is_empty()) {
-                self.0.push(String::new());
-            }
-            self.0.push(format!("[{section}]"));
-            self.0.push(new.clone());
-            shown.push(format!("{place} + {new}"));
-            return;
-        };
-        if let Some(line) = self.0.iter_mut().skip(body.start).take(body.len()).find(|l| is_key(l, key)) {
-            if line.trim() != new {
-                shown.push(format!("{place} - {}\n{place} + {new}", line.trim()));
-                *line = new;
-            }
-            return;
-        }
-        // After the last line with something on it, so a trailing blank line stays a separator.
-        let at =
-            self.lines(&body).filter(|(_, l)| !l.trim().is_empty()).map(|(i, _)| i + 1).last().unwrap_or(body.start);
-        self.0.insert(at, new.clone());
-        if self.0.get(at + 1).is_some_and(|l| is_header(l)) {
-            self.0.insert(at + 1, String::new());
-        }
-        shown.push(format!("{place} + {new}"));
-    }
-
-    fn remove(&mut self, section: &str, key: &str, shown: &mut Vec<String>) {
-        let found = self.body(section).and_then(|b| self.lines(&b).find(|(_, l)| is_key(l, key)).map(|(i, _)| i));
-        if let Some(at) = found {
-            shown.push(format!("[{section}] - {}", self.0.remove(at).trim()));
-        }
-    }
 }
