@@ -15,7 +15,7 @@ import urllib.request
 import uuid
 
 from cryptography.hazmat.primitives import hashes, padding, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import padding as asym, rsa
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 
@@ -64,6 +64,13 @@ def encrypt(plain: bytes, key: bytes) -> str:
     return f"2.{b64e(iv)}|{b64e(ct)}|{b64e(mac)}"
 
 
+def rsa_encrypt(public_key: str, plain: bytes) -> str:
+    """A type 4 EncString (RSA-OAEP SHA-1) for the base64 DER public key: how an organization key is shared."""
+    pub = serialization.load_der_public_key(b64d(public_key))
+    oaep = asym.OAEP(mgf=asym.MGF1(algorithm=hashes.SHA1()), algorithm=hashes.SHA1(), label=None)
+    return f"4.{b64e(pub.encrypt(plain, oaep))}"
+
+
 def decrypt(enc: str, key: bytes) -> bytes:
     ty, rest = enc.split(".", 1)
     assert ty == "2", ty
@@ -84,10 +91,12 @@ class Account:
         master = hashlib.pbkdf2_hmac("sha256", self.password.encode(), self.email.encode(), self.iterations, 32)
         self.master_hash = b64e(hashlib.pbkdf2_hmac("sha256", master, self.password.encode(), 1, 32))
         self.user_key = os.urandom(64)
+        self.org_keys = {}
         stretched = stretch(master)
         priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         pub = priv.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
         pkcs8 = priv.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+        self.public_key = b64e(pub)
         token = http(
             "POST",
             f"{self.server}/identity/accounts/register/send-verification-email",
@@ -152,7 +161,8 @@ class Account:
         raise KeyError(f"no cipher with id {cipher_id}")
 
     def _dec(self, c):
-        key = decrypt(c["key"], self.user_key) if c.get("key") else self.user_key
+        base = self.org_keys[c["organizationId"]] if c.get("organizationId") else self.user_key
+        key = decrypt(c["key"], base) if c.get("key") else base
         return lambda v: decrypt(v, key).decode() if v else None
 
     def _view(self, c):
@@ -277,3 +287,65 @@ class Account:
             if decrypt(f["name"], self.user_key).decode() == name:
                 return f["id"]
         return None
+
+    def cipher(self, cipher_id):
+        """One cipher as /sync sends it, encrypted."""
+        return self._cipher(cipher_id)
+
+    def create_org(self, name):
+        """A new organization this account owns (with its default collection); returns its id."""
+        org_key = os.urandom(64)
+        priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pub = priv.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        pkcs8 = priv.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+        org = http("POST", f"{self.server}/api/organizations", {
+            "name": name,
+            "billingEmail": self.email,
+            "collectionName": encrypt(b"Default", org_key),
+            "key": rsa_encrypt(self.public_key, org_key),
+            "keys": {"publicKey": b64e(pub), "encryptedPrivateKey": encrypt(pkcs8, org_key)},
+            "planType": 0,
+        }, self._auth())
+        self.org_keys[org["id"]] = org_key
+        return org["id"]
+
+    def add_collection(self, org_id, name):
+        body = {"name": encrypt(name.encode(), self.org_keys[org_id]), "groups": [], "users": [], "externalId": None}
+        return http("POST", f"{self.server}/api/organizations/{org_id}/collections", body, self._auth())["id"]
+
+    def add_member(self, org_id, member, collections):
+        """Invite `member` (an Account) as a plain user with `collections` [(id, read_only)], then confirm it with the
+        organization key sealed to its public key. With mail off, Vaultwarden accepts an existing user's invite."""
+        access = [{"id": c, "readOnly": ro, "hidePasswords": False, "manage": False} for c, ro in collections]
+        http("POST", f"{self.server}/api/organizations/{org_id}/users/invite", {
+            "emails": [member.email], "type": 2, "collections": access, "groups": [], "accessAll": False,
+            "permissions": {},
+        }, self._auth())
+        users = http("GET", f"{self.server}/api/organizations/{org_id}/users", headers=self._auth())["data"]
+        (m,) = [u for u in users if u["email"].lower() == member.email.lower()]
+        key = rsa_encrypt(member.public_key, self.org_keys[org_id])
+        http("POST", f"{self.server}/api/organizations/{org_id}/users/{m['id']}/confirm", {"key": key}, self._auth())
+        member.org_keys[org_id] = self.org_keys[org_id]
+
+    def add_org_login(self, org_id, collection_id, name, password, username=None):
+        k = self.org_keys[org_id]
+        cipher = {
+            "type": 1,
+            "folderId": None,
+            "organizationId": org_id,
+            "name": encrypt(name.encode(), k),
+            "notes": None,
+            "favorite": False,
+            "reprompt": 0,
+            "fields": [],
+            "passwordHistory": [],
+            "encryptedFor": self.user_id,
+            "login": {
+                "username": encrypt(username.encode(), k) if username else None,
+                "password": encrypt(password.encode(), k),
+                "uris": None,
+                "totp": None,
+            },
+        }
+        body = {"cipher": cipher, "collectionIds": [collection_id]}
+        return http("POST", f"{self.server}/api/ciphers/create", body, self._auth())["id"]

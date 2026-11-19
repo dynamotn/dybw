@@ -242,9 +242,12 @@ def test_get_raw(world, account):
     assert "login-pw" in text and "luser" in text
 
 
-def test_get_list_fields(world, account):
+def test_get_list_fields_needs_no_confirmation(world, account):
     ensure_unlocked(world, account)
-    assert get(world, "login-item", "-l").splitlines() == ["api-token", "other"]
+    Path("/tmp/fake-pinentry.log").unlink(missing_ok=True)
+    assert get(world, "login-item", "-l", confirm="deny").splitlines() == ["api-token", "other"]
+    log = Path("/tmp/fake-pinentry.log")
+    assert not log.exists() or "CONFIRM" not in log.read_text(), "names only: nobody is asked"
 
 
 def test_history(world, account):
@@ -258,7 +261,7 @@ def test_history(world, account):
 
 def test_refused_confirmation_is_denied(world, account):
     ensure_unlocked(world, account)
-    for args in (("get", "login-item"), ("get", "login-item", "--full"), ("get", "login-item", "-l"), ("history", "login-item")):
+    for args in (("get", "login-item"), ("get", "login-item", "--full"), ("history", "login-item")):
         r = world(*args, confirm="deny")
         assert r.returncode == 1 and r.stdout == "" and "denied" in r.stderr, (args, r)
     assert "login-pw" not in r.stderr
