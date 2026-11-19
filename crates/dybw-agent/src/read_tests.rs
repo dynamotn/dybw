@@ -54,11 +54,19 @@ pub(crate) fn err(error: AgentError) -> Reply {
 }
 
 pub(crate) fn get_op(needle: &str, select: Select) -> Op {
-    Op::Get { profile: Some("work".into()), needle: needle.into(), user: None, folder: None, ignorecase: false, select }
+    Op::Get {
+        profile: Some("work".into()),
+        needle: needle.into(),
+        user: None,
+        folder: None,
+        ignorecase: false,
+        select,
+        rbw: false,
+    }
 }
 
 pub(crate) fn history_op(needle: &str) -> Op {
-    Op::History { profile: Some("work".into()), needle: needle.into(), user: None, folder: None }
+    Op::History { profile: Some("work".into()), needle: needle.into(), user: None, folder: None, ignorecase: false }
 }
 
 fn list_op(fields: &[Field], folder: Option<&str>) -> Op {

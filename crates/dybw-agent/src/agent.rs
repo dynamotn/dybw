@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use dybw_native::fsutil::User;
-use dybw_proto::{AgentError, Op, PolicyAction, Reply, Select, Target};
+use dybw_proto::{AgentError, Op, Part, PolicyAction, Reply, Sealed, Select, Target};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
@@ -56,10 +56,16 @@ fn kind(op: &Op) -> &'static str {
         Op::Edit { .. } => "edit",
         Op::Generate { .. } => "generate",
         Op::Remove { .. } => "remove",
+        Op::Purge { .. } => "purge",
         Op::Policy { .. } => "policy",
         Op::StopAgent => "stop_agent",
         _ => "other",
     }
+}
+
+/// The values a write request carries, by part.
+fn given(password: Option<Sealed>, notes: Option<Sealed>) -> Vec<(Part, Sealed)> {
+    [(Part::Password, password), (Part::Notes, notes)].into_iter().filter_map(|(p, v)| Some((p, v?))).collect()
 }
 
 /// The audit name of a `dybw policy` request.
@@ -188,6 +194,7 @@ impl Agent {
             | Op::Edit { profile, .. }
             | Op::Generate { profile, .. }
             | Op::Remove { profile, .. }
+            | Op::Purge { profile }
             | Op::Policy { profile, .. } => Some((kind(&op), None, profile.clone())),
             _ => None,
         };
@@ -195,7 +202,8 @@ impl Agent {
             Op::List { profile, .. } | Op::Search { profile, .. } => Some((kind(&op), None, profile.clone())),
             _ => None,
         });
-        let write = matches!(op, Op::Add { .. } | Op::Edit { .. } | Op::Generate { .. } | Op::Remove { .. });
+        let write =
+            matches!(op, Op::Add { .. } | Op::Edit { .. } | Op::Generate { .. } | Op::Remove { .. } | Op::Purge { .. });
         // An AI-class caller reads names and status only: no value, no write, no unlock or login (no prompt is raised
         // on its behalf), no policy, no stop (it could restart the agent under its own environment). An unknown caller
         // writes nothing either. Refused before anything.
@@ -208,7 +216,8 @@ impl Agent {
             | Op::Add { .. }
             | Op::Edit { .. }
             | Op::Generate { .. }
-            | Op::Remove { .. } => sensitive.clone(),
+            | Op::Remove { .. }
+            | Op::Purge { .. } => sensitive.clone(),
             Op::StopAgent => Some((kind(&op), None, None)),
             Op::Unlock { profile } | Op::Login { profile } => Some((kind(&op), None, profile.clone())),
             Op::Policy { profile, action } => Some((policy_op(action), None, profile.clone())),
@@ -238,6 +247,7 @@ impl Agent {
                 | Reply::Code { .. }
                 | Reply::Full { .. }
                 | Reply::Raw { .. }
+                | Reply::RbwItem { .. }
                 | Reply::FieldNames { .. }
                 | Reply::History { .. }
         );
@@ -330,13 +340,14 @@ impl Agent {
             Op::Search { profile, term, folder, fields } => {
                 self.on_unlocked(profile.as_deref(), Cmd::Search { term, folder, fields }, ai).await
             }
-            Op::Get { profile, needle, user, folder, ignorecase, select } => {
+            Op::Get { profile, needle, user, folder, ignorecase, select, rbw } => {
                 let find = Lookup { needle, user, folder, ignorecase };
-                let cmd = Cmd::Get { find, select, caller: caller(), still: still() };
+                let rbw = rbw.then(|| Now(self.clock.clone()));
+                let cmd = Cmd::Get { find, select, rbw, caller: caller(), still: still() };
                 self.on_unlocked(profile.as_deref(), cmd, ai).await
             }
-            Op::History { profile, needle, user, folder } => {
-                let find = Lookup { needle, user, folder, ignorecase: false };
+            Op::History { profile, needle, user, folder, ignorecase } => {
+                let find = Lookup { needle, user, folder, ignorecase };
                 self.on_unlocked(profile.as_deref(), Cmd::History { find, caller: caller(), still: still() }, ai).await
             }
             Op::Code { profile, needle, user, folder, ignorecase, next } => {
@@ -344,21 +355,31 @@ impl Agent {
                 let cmd = Cmd::Code { find, next, now: Now(self.clock.clone()), caller: caller(), still: still() };
                 self.on_unlocked(profile.as_deref(), cmd, ai).await
             }
-            Op::Add { profile, name, user, uris, folder, ask } => {
-                let write = Write::Add { name, user, uris, folder, ask, generate: None };
+            Op::Add { profile, name, user, uris, folder, ask, password, notes } => {
+                let given = given(password, notes);
+                let write = Write::Add { name, user, uris, folder, ask, generate: None, given };
                 self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
             }
             Op::Generate { profile, name, user, uris, folder, length, charset } => {
-                let write = Write::Add { name, user, uris, folder, ask: vec![], generate: Some((charset, length)) };
+                let generate = Some((charset, length));
+                let write = Write::Add { name, user, uris, folder, ask: vec![], generate, given: vec![] };
                 self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
             }
-            Op::Edit { profile, needle, user, folder, ask } => {
-                let write = Write::Edit { find: Lookup { needle, user, folder, ignorecase: false }, ask };
+            Op::Edit { profile, needle, user, folder, ask, ignorecase, password, notes } => {
+                let write = Write::Edit {
+                    find: Lookup { needle, user, folder, ignorecase },
+                    ask,
+                    given: given(password, notes),
+                };
                 self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
             }
-            Op::Remove { profile, needle, user, folder } => {
-                let write = Write::Remove { find: Lookup { needle, user, folder, ignorecase: false } };
+            Op::Remove { profile, needle, user, folder, ignorecase } => {
+                let write = Write::Remove { find: Lookup { needle, user, folder, ignorecase } };
                 self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
+            }
+            // No unlock: the copy is deleted whether or not the profile is unlocked.
+            Op::Purge { profile } => {
+                self.on_profile(profile.as_deref(), Cmd::Purge { caller: caller(), still: still() }).await
             }
             // The policy needs no unlocked vault.
             Op::Policy { profile, action } => {
@@ -718,11 +739,30 @@ mod tests {
                 folder: None,
                 ignorecase: false,
                 select: dybw_proto::Select::Password,
+                rbw: false,
             },
-            Op::History { profile: None, needle: "n".into(), user: None, folder: None },
+            Op::History { profile: None, needle: "n".into(), user: None, folder: None, ignorecase: false },
             Op::Code { profile: None, needle: "n".into(), user: None, folder: None, ignorecase: false, next: false },
-            Op::Add { profile: None, name: "n".into(), user: None, uris: vec![], folder: None, ask: vec![] },
-            Op::Edit { profile: None, needle: "n".into(), user: None, folder: None, ask: vec![] },
+            Op::Add {
+                profile: None,
+                name: "n".into(),
+                user: None,
+                uris: vec![],
+                folder: None,
+                ask: vec![],
+                password: None,
+                notes: None,
+            },
+            Op::Edit {
+                profile: None,
+                needle: "n".into(),
+                user: None,
+                folder: None,
+                ask: vec![],
+                ignorecase: false,
+                password: None,
+                notes: None,
+            },
             Op::Generate {
                 profile: None,
                 name: "n".into(),
@@ -732,7 +772,8 @@ mod tests {
                 length: 8,
                 charset: dybw_proto::Charset::All,
             },
-            Op::Remove { profile: None, needle: "n".into(), user: None, folder: None },
+            Op::Remove { profile: None, needle: "n".into(), user: None, folder: None, ignorecase: false },
+            Op::Purge { profile: None },
             Op::StopAgent,
             Op::Unknown,
         ];
@@ -754,6 +795,7 @@ mod tests {
                 "edit",
                 "generate",
                 "remove",
+                "purge",
                 "stop_agent",
                 "other"
             ]

@@ -45,6 +45,7 @@ pub(crate) fn env_in(base: &Path, profile: Option<&'static str>, exe_dir: Option
         started_log: Default::default(),
         clip: ClipLog::default().clip(None),
         stdin_tty: true,
+        stdin: Box::new(|| Ok(Zeroizing::new(String::new()))),
     }
 }
 
@@ -129,7 +130,14 @@ pub(crate) fn s(v: &str) -> String {
 }
 
 fn item(id: &str, name: &str, user: Option<&str>) -> ItemSummary {
-    ItemSummary { id: s(id), name: Some(s(name)), user: user.map(s), folder: Some(s("work")), kind: Some(s("Login")) }
+    ItemSummary {
+        id: s(id),
+        name: Some(s(name)),
+        user: user.map(s),
+        folder: Some(s("work")),
+        kind: Some(s("Login")),
+        uris: None,
+    }
 }
 
 pub(crate) fn status(unlocked: bool) -> Reply {
@@ -167,8 +175,15 @@ fn usage_errors_exit_1_on_stderr() {
 
 #[test]
 fn every_command_maps_to_its_op() {
-    let get =
-        |select| Op::Get { profile: Some(s("p")), needle: s("n"), user: None, folder: None, ignorecase: false, select };
+    let get = |select| Op::Get {
+        profile: Some(s("p")),
+        needle: s("n"),
+        user: None,
+        folder: None,
+        ignorecase: false,
+        select,
+        rbw: false,
+    };
     let cases: Vec<(Vec<&str>, Reply, Op)> = vec![
         (vec!["login"], Reply::Done, Op::Login { profile: Some(s("p")) }),
         (vec!["unlock"], Reply::Done, Op::Unlock { profile: Some(s("p")) }),
@@ -206,12 +221,19 @@ fn every_command_maps_to_its_op() {
                 folder: Some(s("f")),
                 ignorecase: true,
                 select: Select::Password,
+                rbw: false,
             },
         ),
         (
             vec!["history", "n", "me", "--folder", "f"],
             Reply::History { entries: vec![] },
-            Op::History { profile: Some(s("p")), needle: s("n"), user: Some(s("me")), folder: Some(s("f")) },
+            Op::History {
+                profile: Some(s("p")),
+                needle: s("n"),
+                user: Some(s("me")),
+                folder: Some(s("f")),
+                ignorecase: false,
+            },
         ),
         (
             vec!["code", "n", "me", "--folder", "f", "-i", "--next"],
@@ -235,6 +257,8 @@ fn every_command_maps_to_its_op() {
                 uris: vec![s("https://a"), s("https://b")],
                 folder: Some(s("f")),
                 ask: vec![Part::Password],
+                password: None,
+                notes: None,
             },
         ),
         (
@@ -247,6 +271,8 @@ fn every_command_maps_to_its_op() {
                 uris: vec![],
                 folder: None,
                 ask: vec![Part::Password, Part::Notes],
+                password: None,
+                notes: None,
             },
         ),
         (
@@ -258,17 +284,35 @@ fn every_command_maps_to_its_op() {
                 user: Some(s("me")),
                 folder: Some(s("f")),
                 ask: vec![Part::Password],
+                ignorecase: false,
+                password: None,
+                notes: None,
             },
         ),
         (
             vec!["edit", "n", "--notes", "--no-password"],
             Reply::Done,
-            Op::Edit { profile: Some(s("p")), needle: s("n"), user: None, folder: None, ask: vec![Part::Notes] },
+            Op::Edit {
+                profile: Some(s("p")),
+                needle: s("n"),
+                user: None,
+                folder: None,
+                ask: vec![Part::Notes],
+                ignorecase: false,
+                password: None,
+                notes: None,
+            },
         ),
         (
             vec!["remove", "n", "me", "--folder", "f"],
             Reply::Done,
-            Op::Remove { profile: Some(s("p")), needle: s("n"), user: Some(s("me")), folder: Some(s("f")) },
+            Op::Remove {
+                profile: Some(s("p")),
+                needle: s("n"),
+                user: Some(s("me")),
+                folder: Some(s("f")),
+                ignorecase: false,
+            },
         ),
         (
             vec!["generate", "20", "n", "me", "--uri", "https://a", "--folder", "f"],
@@ -1181,7 +1225,7 @@ fn a_logged_failure_names_the_log_when_there_is_one() {
 
 /// What the fake clipboard and clearer saw, in order, and the fake wall clock (time since the epoch).
 #[derive(Default, Clone)]
-struct ClipLog {
+pub(crate) struct ClipLog {
     events: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
     clock: std::rc::Rc<std::cell::Cell<Duration>>,
     /// Added to the clock by the next nap: the machine was suspended during it.
@@ -1193,12 +1237,12 @@ impl ClipLog {
         self.events.borrow_mut().push(event);
     }
 
-    fn events(&self) -> Vec<String> {
+    pub(crate) fn events(&self) -> Vec<String> {
         self.events.borrow().clone()
     }
 
     /// Copy gives `count:7`; `job` is the clearer's stdin (`None`: unreadable). Failing parts are set after.
-    fn clip(&self, job: Option<&'static str>) -> clip::Clip {
+    pub(crate) fn clip(&self, job: Option<&'static str>) -> clip::Clip {
         let (a, b, c, d, e) = (self.clone(), self.clone(), self.clone(), self.clone(), self.clone());
         clip::Clip {
             copy: Box::new(move |v| {
@@ -1444,4 +1488,9 @@ fn generate_and_save_sends_the_charset_and_never_a_password() {
         let (_, op) = one(&["generate", "6", "n", flag], Reply::Done);
         assert!(matches!(op, Op::Generate { charset: c, length: 6, .. } if c == charset), "{flag}");
     }
+}
+
+#[test]
+fn the_uri_field_is_no_column_of_a_text_list() {
+    assert_eq!(cell(&item("1", "n", None), Field::Uri), None);
 }

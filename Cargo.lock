@@ -527,10 +527,13 @@ dependencies = [
  "dybw-peer",
  "dybw-proto",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "toml_edit",
+ "url",
+ "uuid",
  "zeroize",
 ]
 

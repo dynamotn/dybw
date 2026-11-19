@@ -15,6 +15,8 @@ use serde::ser::{SerializeMap, Serializer};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
+use crate::rbw_view;
+
 /// How a client names the item it wants (rbw's `get` arguments).
 #[derive(Debug, Clone)]
 pub struct Lookup {
@@ -96,24 +98,36 @@ fn kind_name(kind: u64) -> &'static str {
 }
 
 /// `list` (no term) and `search` (a case-insensitive part of the name or the user): only the fields asked for are
-/// filled. Folder names are decrypted only when shown or filtered on.
+/// filled. Folder names are decrypted only when shown or filtered on, a login's URIs only when asked for (rbw's
+/// `--raw`; never matched by a search term).
 pub fn list(vault: &UnlockedVault, fields: &[Field], folder: Option<&str>, term: Option<&str>) -> Reply {
     let want = |f| fields.contains(&f);
     let names = (want(Field::Folder) || folder.is_some()).then(|| folder_names(&vault.sync, vault.keys.user()));
     let folder_name = |s: &Summary| names.as_ref().and_then(|n| folder_of(n, s));
     let term = term.map(str::to_lowercase);
     let has = |text: &str| term.as_deref().is_none_or(|t| text.to_lowercase().contains(t));
-    let items = summaries(vault)
+    let rows: Vec<(Summary, Option<Vec<String>>)> = if want(Field::Uri) {
+        let uris = |l: &item::Lookup| l.uris.iter().filter_map(|u| text(&u.uri).map(str::to_owned)).collect();
+        let read = |c| item::summary_with_uris(c, vault.keys.user(), vault.keys.orgs()).ok();
+        let row = |l: item::Lookup| {
+            let uris = (l.summary.kind == 1).then(|| uris(&l));
+            (l.summary, uris)
+        };
+        ciphers(&vault.sync).filter_map(read).map(row).collect()
+    } else {
+        summaries(vault).into_iter().map(|(_, s)| (s, None)).collect()
+    };
+    let items = rows
         .into_iter()
-        .map(|(_, s)| s)
-        .filter(|s| folder.is_none_or(|f| folder_name(s) == Some(f)))
-        .filter(|s| term.is_none() || has(&s.name) || s.user.as_deref().is_some_and(|u| has(u)))
-        .map(|s| ItemSummary {
+        .filter(|(s, _)| folder.is_none_or(|f| folder_name(s) == Some(f)))
+        .filter(|(s, _)| term.is_none() || has(&s.name) || s.user.as_deref().is_some_and(|u| has(u)))
+        .map(|(s, uris)| ItemSummary {
             name: want(Field::Name).then(|| s.name.to_string()),
             user: s.user.as_deref().filter(|_| want(Field::User)).cloned(),
             folder: folder_name(&s).filter(|_| want(Field::Folder)).map(str::to_owned),
             kind: want(Field::Type).then(|| kind_name(s.kind).to_owned()),
             id: s.id,
+            uris,
         })
         .collect();
     Reply::Items { items }
@@ -371,9 +385,14 @@ pub fn field_names(vault: &UnlockedVault, id: &str) -> Result<Reply, AgentError>
 }
 
 /// Whether the item `id` has a custom field of the hidden type (1) named `name`. Names and types only, so it does not
-/// know whether a property of that name would answer `--field` first: it errs on the side of hiding.
-pub fn hidden_field(vault: &UnlockedVault, id: &str, name: &str) -> Result<bool, AgentError> {
-    Ok(names_of(vault, id)?.iter().any(|f| f.kind == 1 && text(&f.name) == Some(name)))
+/// know whether a property of that name would answer `--field` first: it errs on the side of hiding. With `rbw`, the
+/// field rbw's `--field` would read (the first whose name holds `name`, ignoring case).
+pub fn hidden_field(vault: &UnlockedVault, id: &str, name: &str, rbw: bool) -> Result<bool, AgentError> {
+    let names = names_of(vault, id)?;
+    if rbw {
+        return Ok(rbw_view::custom_kind(&names, name) == Some(1));
+    }
+    Ok(names.iter().any(|f| f.kind == 1 && text(&f.name) == Some(name)))
 }
 
 fn entry(name: &str, value: &str) -> Entry {
@@ -510,6 +529,33 @@ pub fn value(vault: &UnlockedVault, id: &str, select: &Select) -> Result<Reply, 
     }
 }
 
+/// `get` in rbw's view (the `rbw` shim), after the value gate (none for `--list-fields`): its main value, a field as
+/// rbw resolves it (`Done` when rbw prints nothing; a login's `totp` is the code at `now`, Unix seconds), the item in
+/// rbw's shape for `--full` and `--raw` (`folder` is its folder's name), or rbw's list of field names.
+pub fn rbw_value(
+    vault: &UnlockedVault,
+    id: &str,
+    folder: Option<&str>,
+    select: &Select,
+    now: u64,
+) -> Result<Reply, AgentError> {
+    let value = |mut v: Zeroizing<String>| Reply::Value { value: Secret::new(std::mem::take(&mut *v)) };
+    match select {
+        Select::Password => rbw_view::short(&item_of(vault, id)?).map(value),
+        Select::Field(name) => Ok(rbw_view::field(&item_of(vault, id)?, name, now)?.map_or(Reply::Done, value)),
+        Select::Full | Select::Raw => {
+            Ok(Reply::RbwItem { item: Box::new(rbw_view::item(&item_of(vault, id)?, folder.map(str::to_owned))) })
+        }
+        // Names only: the item is not opened.
+        Select::ListFields => {
+            let names = names_of(vault, id)?;
+            let cipher = cipher(vault, id).ok_or(AgentError::NotFound)?;
+            let kind = cipher.get("type").and_then(Value::as_u64).unwrap_or_default();
+            Ok(Reply::FieldNames { names: rbw_view::field_list(cipher, kind, &names) })
+        }
+    }
+}
+
 /// The cipher `id` as `/sync` sent it, in the trash or not: what a write is planned on.
 pub fn cipher<'a>(vault: &'a UnlockedVault, id: &str) -> Option<&'a Value> {
     let all = vault.sync.get("ciphers").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
@@ -526,10 +572,8 @@ pub fn revision(vault: &UnlockedVault, id: &str) -> String {
 /// code says why, never what it holds.
 pub fn totp(vault: &UnlockedVault, id: &str) -> Result<TotpKey, AgentError> {
     let item = item_of(vault, id)?;
-    let key = match &item.data {
-        Data::Login(l) => text(&l.totp),
-        _ => None,
-    };
+    let Data::Login(l) = &item.data else { return Err(AgentError::NotALogin) };
+    let key = text(&l.totp);
     let key = key.ok_or_else(|| AgentError::NoSuchField("totp".to_owned()))?;
     TotpKey::parse(key).map_err(|e| AgentError::Totp(e.to_string()))
 }

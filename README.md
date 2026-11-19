@@ -112,9 +112,9 @@ only says "see the agent log" is explained there.
 - Organization items are readable; one whose organization hides the password (`viewPassword: false`) gives no
   password, TOTP key or code, history, `--full`, `--raw`, nor any custom field of the hidden type.
 - Writes (`add`, `edit`, `remove`, `generate <len> <name>`) are confirmed in the pinentry every time: no grant
-  counts and "always" is never offered. AI-class and unknown callers are refused. New values never travel over the
-  socket: the agent asks for them in its own pinentry, one line each, so notes are a single line (multi-line notes
-  through `$EDITOR` come with the rbw shim, P4.4). An empty answer cancels. `edit` changes the password and the notes
+  counts and "always" is never offered. AI-class and unknown callers are refused. `dybw`'s new values never travel
+  over the socket: the agent asks for them in its own pinentry, one line each, so notes are a single line. An empty
+  answer cancels. (The rbw shim's `add` and `edit` send theirs, see below.) `edit` changes the password and the notes
   only (no rename, user, URIs, folder or TOTP key). An item changed on the server since the last sync is refused
   ("sync and try again") and nothing is written. New logins are personal (no creating into an organization). A
   folder that `add` or `generate` created stays when the login create then fails, as with rbw.
@@ -127,6 +127,22 @@ only says "see the agent log" is explained there.
   stdin is not a terminal, so a script or an AI harness cannot redirect the server or the prompt through the shim.
   This is a guard against accidents, not a barrier: any process of the same user can still edit `config.toml`; what
   protects the API key is that it stays bound to the identity origin it was stored for.
+- The shim prints what rbw 1.15 prints, byte for byte, and its errors with exit code 1 (`couldn't find entry for
+  'x': no entry found`, `multiple entries found: user@name, ...`, `entry does not contain a totp secret`, ...); an
+  entry without the value `get` shows says so on stderr and exits 0, as rbw. Names and values are printed as they are
+  (tabs and control characters included), as rbw does. `rbw search` matches names and users only (rbw also matches
+  notes, URIs and field values, which would decrypt values without a confirmation).
+- `rbw add` and `rbw edit` open `$VISUAL`, else `$EDITOR`, else `/usr/bin/vim`, as rbw: the first line is the
+  password, the rest the notes (`edit` of a note: the notes). The file is in a new 0700 directory under
+  `$XDG_RUNTIME_DIR`, else `$TMPDIR`, else `/tmp`; whatever happens it is overwritten with zeros, then it and the
+  directory are removed. With stdin not a terminal the text is read from stdin. The text goes to the agent with the
+  write, which is still confirmed every time and refused to AI-class and unknown callers. An editor that fails, or a
+  text with neither a password nor notes, writes nothing. `edit` first reads the item (one confirmation, as
+  `get --raw`) to fill the editor. `rbw generate <len> <name>` prints the password, as rbw, then saves that one as a
+  new login (made by the shim and sent with the confirmed write).
+- `rbw purge` locks the profile and deletes its copy of the vault (`~/.cache/dybw/profiles/<profile>`) once you
+  confirm it in the pinentry; the API key, the device id, the policy and the KDF/security pins stay. `rbw unlock` logs
+  in first when the profile has no API key.
 - Migration from rbw: `rbw config set identity_url` is refused (dybw derives the identity URL from `base_url`; use
   `base_url`), as are `sso_id`, `ui_url`, `notifications_url` and `client_cert_path`. `lock_timeout` (seconds) is
   rounded up to whole minutes; `sync_interval` 0 means no periodic sync.

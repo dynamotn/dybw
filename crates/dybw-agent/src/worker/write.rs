@@ -1,6 +1,8 @@
 //! The writes, `add`, `edit` and `remove`, as a vault client (ADR 0025, data model §1.1). Each is confirmed by the
 //! user every time (no grant counts and "always" is never offered) and refused to an AI-class or an unknown caller.
-//! The new values are asked for here, in the trusted pinentry, so they never travel over the socket. An edit or a
+//! The new values are asked for here, in the trusted pinentry, so they never travel over the socket; or, for the rbw
+//! shim (whose `$EDITOR` runs in the CLI, as rbw's does), they come with the request, and the write is confirmed all
+//! the same. An edit or a
 //! remove of an item that asks for a reprompt needs the master password first. `generate` is an `add` whose password the
 //! agent makes itself. A new login's folder that does not exist yet is created with it, as rbw does.
 //!
@@ -15,14 +17,14 @@ use dybw_core::vault::client::{self, ClientEdit, NewEntry, NewKind, NewLogin, Ne
 use dybw_core::vault::write::WriteError;
 use dybw_native::ports::clock::SystemClock;
 use dybw_native::ports::random::OsRandom;
-use dybw_proto::{Charset, Part};
+use dybw_proto::{Charset, Part, Sealed};
 use serde_json::{Map, Value};
 use zeroize::Zeroizing;
 
 use super::*;
 use crate::pwgen;
 
-/// A change of the vault, with only the non-secret parts the client sent.
+/// A change of the vault: what the client sent, its values (`given`) redacted in `Debug`.
 #[derive(Debug)]
 pub enum Write {
     /// A new personal login; the agent asks for each of `ask`, and with `generate` makes the password itself.
@@ -33,9 +35,10 @@ pub enum Write {
         folder: Option<String>,
         ask: Vec<Part>,
         generate: Option<(Charset, u32)>,
+        given: Vec<(Part, Sealed)>,
     },
-    /// New values for `ask` (the password, the notes) of one item.
-    Edit { find: Lookup, ask: Vec<Part> },
+    /// New values for `ask` (asked for) and `given` (sent) of one item: the password, the notes.
+    Edit { find: Lookup, ask: Vec<Part>, given: Vec<(Part, Sealed)> },
     /// Move one item to the trash.
     Remove { find: Lookup },
 }
@@ -53,6 +56,13 @@ impl Write {
     fn asked(&self) -> &[Part] {
         match self {
             Write::Add { ask, .. } | Write::Edit { ask, .. } => ask,
+            Write::Remove { .. } => &[],
+        }
+    }
+
+    fn given(&self) -> &[(Part, Sealed)] {
+        match self {
+            Write::Add { given, .. } | Write::Edit { given, .. } => given,
             Write::Remove { .. } => &[],
         }
     }
@@ -108,7 +118,7 @@ fn plan(v: &UnlockedVault, write: &Write) -> Result<Planned, AgentError> {
         }),
         // The core edits the name, notes, user, password, URIs and folder: no TOTP key.
         Write::Edit { ask, .. } if ask.contains(&Part::Totp) => Err(refused_as("totp-edit")),
-        Write::Edit { ask, .. } if ask.is_empty() => Err(refused_as("nothing-to-change")),
+        Write::Edit { ask, given, .. } if ask.is_empty() && given.is_empty() => Err(refused_as("nothing-to-change")),
         Write::Edit { find, .. } => Ok(planned(read::find(v, find)?, Vec::new())),
         Write::Remove { find } => {
             let found = read::find(v, find)?;
@@ -139,8 +149,8 @@ fn question(ctx: &Ctx, caller: &Caller, write: &Write, planned: &Planned) -> Str
             let made = generate.map(|(_, n)| format!(" and a generated password ({n} {})", unit(generate)));
             format!("add the login \"{name}\"{user}{folder}{}{}", uri_list(uris), made.unwrap_or_default())
         }
-        Write::Edit { ask, .. } => {
-            let parts: Vec<_> = ask.iter().map(|p| label(*p).1).collect();
+        Write::Edit { ask, given, .. } => {
+            let parts: Vec<_> = given.iter().map(|(p, _)| p).chain(ask).map(|p| label(*p).1).collect();
             format!("change {} of the item {item}", parts.join(" and "))
         }
         Write::Remove { .. } if !planned.markers.is_empty() => format!(
@@ -176,7 +186,7 @@ fn uri_list(uris: &[String]) -> String {
     format!(" with the URIs {}{more}", shown.join(", "))
 }
 
-/// The new values: a generated password, then each asked part from the pinentry. A TOTP key that gives no code is
+/// The new values: those the client sent, a generated password, then each asked part from the pinentry. A TOTP key that gives no code is
 /// refused here, before anything is sent.
 async fn values<H: Host>(
     host: &H,
@@ -185,7 +195,8 @@ async fn values<H: Host>(
     write: &Write,
 ) -> Result<Vec<(Part, Zeroizing<String>)>, AgentError> {
     let ask = write.asked();
-    let mut out = Vec::with_capacity(ask.len() + 1);
+    let mut out = Vec::with_capacity(ask.len() + 3);
+    out.extend(write.given().iter().map(|(p, v)| (*p, Zeroizing::new(v.expose().to_owned()))));
     if let Write::Add { generate: Some((charset, length)), .. } = write {
         // The length was checked in the plan, and the OS random source does not fail.
         out.push((Part::Password, pwgen::generate(&OsRandom, *charset, *length).ok().ok_or(AgentError::Internal)?));

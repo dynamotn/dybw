@@ -818,8 +818,41 @@ async fn a_peer_that_goes_while_a_write_waits_its_turn_writes_nothing() {
     rig.host.vault(&vault.to_string());
     unlock(&rig.agent, &rig.host, "work").await;
     rig.host.allow();
-    let remove = Op::Remove { profile: Some("work".into()), needle: NOTE.into(), user: None, folder: None };
+    let remove =
+        Op::Remove { profile: Some("work".into()), needle: NOTE.into(), user: None, folder: None, ignorecase: false };
     assert_eq!(rig.agent.dispatch(remove).await, err(AgentError::Denied));
     assert_eq!(rig.host.world().count("/delete"), 0, "nothing was sent");
     assert_eq!(verdicts(&rig), [Verdict::Denied]);
+}
+
+#[tokio::test]
+async fn a_peer_that_goes_while_the_user_is_asked_purges_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two checks of a purge: before the request, and after the user's yes (worker).
+    let rig = rig_with(dir.path(), |tree| Arc::new(Flips(tree, Default::default(), 1)));
+    let mut vault: Value = serde_json::from_str(VAULT).unwrap();
+    vault["ciphers"].as_array_mut().unwrap().iter_mut().for_each(|c| c["reprompt"] = json!(0));
+    rig.host.vault(&vault.to_string());
+    unlock(&rig.agent, &rig.host, "work").await;
+    rig.host.allow();
+    assert_eq!(rig.agent.dispatch(Op::Purge { profile: Some("work".into()) }).await, err(AgentError::Denied));
+    assert!(dir.path().join(".cache/dybw/profiles/work/sync.json").exists(), "nothing was deleted");
+    assert_eq!(rig.host.world().confirmed.len(), 1);
+    assert_eq!(verdicts(&rig), [Verdict::Denied]);
+}
+
+#[tokio::test]
+async fn an_rbw_item_is_not_handed_to_a_peer_that_went_after_it_was_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    // Three checks of a value read: before the request, after the yes (worker), and before the reply is handed back.
+    let rig = rig_with(dir.path(), |tree| Arc::new(Flips(tree, Default::default(), 2)));
+    let mut vault: Value = serde_json::from_str(VAULT).unwrap();
+    vault["ciphers"].as_array_mut().unwrap().iter_mut().for_each(|c| c["reprompt"] = json!(0));
+    rig.host.vault(&vault.to_string());
+    unlock(&rig.agent, &rig.host, "work").await;
+    rig.host.allow();
+    let Op::Get { profile, needle, user, folder, ignorecase, .. } = get_op(NOTE, Select::Raw) else { panic!() };
+    let raw = Op::Get { profile, needle, user, folder, ignorecase, select: Select::Raw, rbw: true };
+    assert_eq!(rig.agent.dispatch(raw).await, err(AgentError::Denied));
+    assert_eq!(rig.agent.opens("work").await, 1, "opened, then held back");
 }

@@ -8,6 +8,7 @@ mod clip;
 mod doctor;
 mod rbw;
 mod rbw_config;
+mod rbw_edit;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -393,7 +394,7 @@ fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, er
                 (_, _, _, true) => Select::ListFields,
                 _ => Select::Password,
             };
-            let op = Op::Get { profile, needle: item, user, folder, ignorecase, select };
+            let op = Op::Get { profile, needle: item, user, folder, ignorecase, select, rbw: false };
             let reply = ask_started(env, op)?;
             // shortcut: a value longer than this leaves a copy in the freed buffer when it grows; rare for a password.
             let mut copied = Zeroizing::new(Vec::with_capacity(4096));
@@ -418,7 +419,7 @@ fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, er
             Ok(0)
         }
         Cmd::History { item, user, folder } => {
-            match ask_started(env, Op::History { profile, needle: item, user, folder })? {
+            match ask_started(env, Op::History { profile, needle: item, user, folder, ignorecase: false })? {
                 Reply::History { entries } => {
                     entries
                         .iter()
@@ -439,31 +440,34 @@ fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, er
             Ok(0)
         }
         Cmd::Add { name, user, uri, folder, ask } => {
-            done(ask_started(env, Op::Add { profile, name, user, uris: uri, folder, ask: ask.parts() })?)
+            let op = Op::Add { profile, name, user, uris: uri, folder, ask: ask.parts(), password: None, notes: None };
+            done(ask_started(env, op)?)
         }
         Cmd::Edit { item, user, folder, ask } => {
-            done(ask_started(env, Op::Edit { profile, needle: item, user, folder, ask: ask.parts() })?)
+            let op = Op::Edit {
+                profile,
+                needle: item,
+                user,
+                folder,
+                ask: ask.parts(),
+                ignorecase: false,
+                password: None,
+                notes: None,
+            };
+            done(ask_started(env, op)?)
         }
         Cmd::Remove { item, user, folder } => {
-            done(ask_started(env, Op::Remove { profile, needle: item, user, folder })?)
+            done(ask_started(env, Op::Remove { profile, needle: item, user, folder, ignorecase: false })?)
         }
         Cmd::Generate { length, name, user, uri, folder, no_symbols, only_numbers, nonconfusables, diceware } => {
-            let charset = match (no_symbols, only_numbers, nonconfusables, diceware) {
-                (true, ..) => Charset::NoSymbols,
-                (_, true, ..) => Charset::Numbers,
-                (_, _, true, _) => Charset::Nonconfusables,
-                (.., true) => Charset::Diceware,
-                _ => Charset::All,
-            };
+            let charset = charset(no_symbols, only_numbers, nonconfusables, diceware);
             match name {
                 // Made and kept by the agent: the password never crosses the socket, so there is none to print.
                 Some(name) => {
                     done(ask_started(env, Op::Generate { profile, name, user, uris: uri, folder, length, charset })?)
                 }
                 None => {
-                    let password = dybw_agent::pwgen::generate(&dybw_agent::pwgen::OsRandom, charset, length)
-                        .map_err(|e| Fail::Log(e.to_string()))?;
-                    writeln!(out, "{}", password.as_str())?;
+                    writeln!(out, "{}", generated(charset, length)?.as_str())?;
                     Ok(0)
                 }
             }
@@ -508,6 +512,22 @@ fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, er
         Cmd::Agent { command: AgentCmd::Stop } => done(ask(env, Op::StopAgent, false)?.unwrap_or(Reply::Done)),
         Cmd::ClearClipboard => clear_later(env),
     }
+}
+
+/// rbw's `generate` options, the first one set winning (clap allows only one).
+fn charset(no_symbols: bool, only_numbers: bool, nonconfusables: bool, diceware: bool) -> Charset {
+    match (no_symbols, only_numbers, nonconfusables, diceware) {
+        (true, ..) => Charset::NoSymbols,
+        (_, true, ..) => Charset::Numbers,
+        (_, _, true, _) => Charset::Nonconfusables,
+        (.., true) => Charset::Diceware,
+        _ => Charset::All,
+    }
+}
+
+/// A password made in this process (the OS random source).
+fn generated(charset: Charset, length: u32) -> Result<Zeroizing<String>, Fail> {
+    dybw_agent::pwgen::generate(&dybw_agent::pwgen::OsRandom, charset, length).map_err(|e| Fail::Log(e.to_string()))
 }
 
 /// Copy the output (its last newline dropped) and start the clearer. The delay is read first: a bad config leaves
@@ -608,6 +628,8 @@ fn cell(item: &ItemSummary, field: Field) -> Option<&str> {
         Field::User => item.user.as_deref(),
         Field::Folder => item.folder.as_deref(),
         Field::Type => item.kind.as_deref(),
+        // Not a column of `dybw list`.
+        Field::Uri => None,
     }
 }
 
@@ -690,6 +712,10 @@ pub fn main() -> ExitCode {
     ExitCode::from(dispatch(args, &Env::real(), &mut std::io::stdout().lock(), &mut std::io::stderr().lock()))
 }
 
+#[cfg(test)]
+mod rbw_edit_tests;
+#[cfg(test)]
+mod rbw_out_tests;
 #[cfg(test)]
 mod rbw_tests;
 #[cfg(test)]

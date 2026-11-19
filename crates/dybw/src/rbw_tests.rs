@@ -7,11 +7,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use clap::Parser as _;
-use dybw_proto::{AgentError, Charset, Field, Op, Reply, Select, Target};
+use dybw_proto::{AgentError, Field, Op, Reply, Select, Target};
 
 use super::*;
 use crate::rbw::Opt;
-use crate::tests::{Act, base as new_base, env_in, fake, s, secret, status};
+use crate::tests::{Act, base as new_base, env_in, fake, s, secret};
 
 /// `env_in`, with these variables on top.
 fn renv(base: &Path, vars: &'static [(&'static str, &'static str)]) -> Env {
@@ -223,26 +223,25 @@ fn usage_errors_have_rbws_text_and_exit_code_2() {
 
 #[test]
 fn every_command_maps_to_its_op() {
-    let get =
-        |select| Op::Get { profile: Some(s("p")), needle: s("n"), user: None, folder: None, ignorecase: false, select };
-    let generate = |charset| Op::Generate {
+    let get = |select| Op::Get {
         profile: Some(s("p")),
-        name: s("n"),
+        needle: s("n"),
         user: None,
-        uris: vec![],
         folder: None,
-        length: 9,
-        charset,
+        ignorecase: false,
+        select,
+        rbw: true,
     };
     let find = |ignorecase| (s("n"), Some(s("me")), Some(s("f")), ignorecase);
     let (n, u, f, i) = find(true);
+    let item = || Reply::RbwItem { item: Box::new(crate::rbw_out_tests::note_item(None)) };
     let cases: Vec<(Vec<&str>, Reply, Op)> = vec![
         (vec!["register"], Reply::Done, Op::Login { profile: Some(s("p")) }),
         (vec!["login"], Reply::Done, Op::Login { profile: Some(s("p")) }),
-        (vec!["unlock"], Reply::Done, Op::Unlock { profile: Some(s("p")) }),
         (vec!["lock"], Reply::Done, Op::Lock { target: Target::Profile(s("p")) }),
         (vec!["sync"], Reply::Done, Op::Sync { target: Target::Profile(s("p")) }),
         (vec!["stop-agent"], Reply::Done, Op::StopAgent),
+        (vec!["purge"], Reply::Done, Op::Purge { profile: Some(s("p")) }),
         (
             vec!["list"],
             Reply::Items { items: vec![] },
@@ -262,7 +261,7 @@ fn every_command_maps_to_its_op() {
             Reply::Items { items: vec![] },
             Op::List {
                 profile: Some(s("p")),
-                fields: vec![Field::Id, Field::Name, Field::User, Field::Folder, Field::Type],
+                fields: vec![Field::Id, Field::Name, Field::User, Field::Folder, Field::Uri, Field::Type],
                 folder: None,
             },
         ),
@@ -276,10 +275,20 @@ fn every_command_maps_to_its_op() {
                 fields: vec![Field::Id, Field::User],
             },
         ),
+        (
+            vec!["search", "t", "--raw"],
+            Reply::Items { items: vec![] },
+            Op::Search {
+                profile: Some(s("p")),
+                term: s("t"),
+                folder: None,
+                fields: vec![Field::Id, Field::Name, Field::User, Field::Folder, Field::Uri, Field::Type],
+            },
+        ),
         (vec!["get", "n"], Reply::Value { value: secret("v") }, get(Select::Password)),
         (vec!["get", "n", "-f", "totp"], Reply::Value { value: secret("v") }, get(Select::Field(s("totp")))),
-        (vec!["get", "n", "--full", "-f", "totp"], Reply::Full { entries: vec![] }, get(Select::Full)),
-        (vec!["get", "n", "--raw", "--full", "-f", "x"], Reply::Raw { json: secret("{}") }, get(Select::Raw)),
+        (vec!["get", "n", "--full", "-f", "totp"], item(), get(Select::Full)),
+        (vec!["get", "n", "--raw", "--full", "-f", "x"], item(), get(Select::Raw)),
         (
             vec!["get", "n", "-l", "--raw", "--full", "-f", "x"],
             Reply::FieldNames { names: vec![] },
@@ -295,6 +304,7 @@ fn every_command_maps_to_its_op() {
                 folder: Some(s("f")),
                 ignorecase: true,
                 select: Select::Password,
+                rbw: true,
             },
         ),
         (
@@ -322,60 +332,32 @@ fn every_command_maps_to_its_op() {
             },
         ),
         (
-            vec!["add", "n", "me", "--uri", "https://a", "--uri", "https://b", "--folder", "f"],
+            vec!["rm", "n", "me", "--folder", "f", "-i"],
             Reply::Done,
-            Op::Add {
-                profile: Some(s("p")),
-                name: s("n"),
-                user: Some(s("me")),
-                uris: vec![s("https://a"), s("https://b")],
-                folder: Some(s("f")),
-                ask: vec![dybw_proto::Part::Password],
-            },
-        ),
-        (
-            vec!["edit", "n", "me", "--folder", "f", "-i"],
-            Reply::Done,
-            Op::Edit {
+            Op::Remove {
                 profile: Some(s("p")),
                 needle: n.clone(),
                 user: u.clone(),
                 folder: f.clone(),
-                ask: vec![dybw_proto::Part::Password],
+                ignorecase: true,
             },
-        ),
-        (
-            vec!["rm", "n", "me", "--folder", "f", "-i"],
-            Reply::Done,
-            Op::Remove { profile: Some(s("p")), needle: n.clone(), user: u.clone(), folder: f.clone() },
         ),
         (
             vec!["remove", "n", "me", "--folder", "f"],
             Reply::Done,
-            Op::Remove { profile: Some(s("p")), needle: n.clone(), user: u.clone(), folder: f.clone() },
+            Op::Remove {
+                profile: Some(s("p")),
+                needle: n.clone(),
+                user: u.clone(),
+                folder: f.clone(),
+                ignorecase: false,
+            },
         ),
         (
             vec!["history", "n", "me", "--folder", "f", "-i"],
             Reply::History { entries: vec![] },
-            Op::History { profile: Some(s("p")), needle: n, user: u, folder: f },
+            Op::History { profile: Some(s("p")), needle: n, user: u, folder: f, ignorecase: true },
         ),
-        (
-            vec!["generate", "20", "n", "me", "--uri", "https://a", "--folder", "f"],
-            Reply::Done,
-            Op::Generate {
-                profile: Some(s("p")),
-                name: s("n"),
-                user: Some(s("me")),
-                uris: vec![s("https://a")],
-                folder: Some(s("f")),
-                length: 20,
-                charset: Charset::All,
-            },
-        ),
-        (vec!["gen", "9", "n", "--no-symbols"], Reply::Done, generate(Charset::NoSymbols)),
-        (vec!["gen", "9", "n", "--only-numbers"], Reply::Done, generate(Charset::Numbers)),
-        (vec!["gen", "9", "n", "--nonconfusables"], Reply::Done, generate(Charset::Nonconfusables)),
-        (vec!["gen", "9", "n", "--diceware"], Reply::Done, generate(Charset::Diceware)),
     ];
     for (args, reply, want) in cases {
         let (result, op) = rone(&args, reply);
@@ -397,6 +379,9 @@ fn generate_without_a_name_prints_locally() {
     let (code, out, err) = alone(&[], &["generate", "12", "--only-numbers"]);
     assert_eq!((code, err.as_str()), (0, ""));
     assert!(out.trim_end().len() == 12 && out.trim_end().bytes().all(|b| b.is_ascii_digit()), "{out}");
+    let (code, _, err) = alone(&[], &["generate", "0"]);
+    assert_eq!(code, 1);
+    assert!(err.starts_with("rbw generate: "), "{err}");
 }
 
 #[test]
@@ -416,20 +401,6 @@ fn a_length_too_large_for_the_agent_is_refused() {
     let (code, _, err) = alone(&[], &["generate", "99999999999", "n"]);
     assert_eq!(code, 1);
     assert_eq!(err, "rbw generate: the length is too large\n");
-}
-
-#[test]
-fn unlocked_follows_the_agent() {
-    assert_eq!(rone(&["unlocked"], status(true)).0.0, 0);
-    assert_eq!(rone(&["unlocked"], status(false)).0.0, 1);
-    assert_eq!(alone(&[], &["unlocked"]).0, 1);
-}
-
-#[test]
-fn purge_says_what_is_missing() {
-    let (code, out, err) = alone(&[], &["purge"]);
-    assert_eq!((code, out.as_str()), (1, ""));
-    assert!(err.starts_with("rbw purge: dybw has no purge") && err.contains(".cache/dybw/profiles"), "{err}");
 }
 
 #[test]
@@ -480,9 +451,9 @@ fn gen_completions_is_clap_output_for_the_model_plus_rbws_scripts() {
 
 #[test]
 fn errors_are_prefixed_with_the_rbw_command() {
-    let ((code, out, err), _) = rone(&["get", "n"], Reply::Error { error: AgentError::Locked });
+    let ((code, out, err), _) = rone(&["get", "n"], Reply::Error { error: AgentError::Denied });
     assert_eq!((code, out.as_str()), (1, ""));
-    assert!(err.starts_with("rbw get: "), "{err}");
+    assert!(err.starts_with("rbw get: denied"), "{err}");
 }
 
 // RBW_PROFILE
@@ -491,12 +462,12 @@ fn errors_are_prefixed_with_the_rbw_command() {
 fn rbw_profile_names_the_profile_and_dybw_profile_is_not_read() {
     let f = fake(vec![Act::Reply(Reply::Done), Act::Reply(Reply::Done), Act::Reply(Reply::Done)]);
     let base = f.base.path();
-    assert_eq!(rbw_in(&renv(base, &[("RBW_PROFILE", "work"), ("DYBW_PROFILE", "other")]), &["unlock"]).0, 0);
-    assert_eq!(rbw_in(&renv(base, &[("DYBW_PROFILE", "other")]), &["unlock"]).0, 0);
-    assert_eq!(rbw_in(&renv(base, &[("RBW_PROFILE", "")]), &["unlock"]).0, 0);
+    assert_eq!(rbw_in(&renv(base, &[("RBW_PROFILE", "work"), ("DYBW_PROFILE", "other")]), &["sync"]).0, 0);
+    assert_eq!(rbw_in(&renv(base, &[("DYBW_PROFILE", "other")]), &["purge"]).0, 0);
+    assert_eq!(rbw_in(&renv(base, &[("RBW_PROFILE", "")]), &["purge"]).0, 0);
     assert_eq!(
         f.ops(),
-        [Op::Unlock { profile: Some(s("work")) }, Op::Unlock { profile: None }, Op::Unlock { profile: None }]
+        [Op::Sync { target: Target::Profile(s("work")) }, Op::Purge { profile: None }, Op::Purge { profile: None }]
     );
 }
 

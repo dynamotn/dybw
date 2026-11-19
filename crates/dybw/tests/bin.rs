@@ -38,3 +38,18 @@ fn the_clipboard_clearer_reads_its_job_from_stdin_and_refuses_an_empty_one() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&out.stderr), "dybw: not a clipboard job\n");
 }
+
+#[test]
+fn as_rbw_add_reads_piped_text_from_stdin_and_refuses_an_empty_one_before_any_agent() {
+    let dir = tempfile::Builder::new().prefix("d").tempdir_in("/tmp").expect("tempdir");
+    let rbw = dir.path().join("rbw");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_dybw"), &rbw).expect("symlink");
+    let out = Command::new(&rbw)
+        .args(["add", "n"])
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run rbw");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "rbw add: the editor left nothing to save; nothing was changed\n");
+}

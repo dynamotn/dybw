@@ -22,17 +22,17 @@ const USER_KEY: [u8; 64] = [
     143, 111, 21, 229, 119, 245, 58, 126, 62, 189, 157, 50, 105, 135, 55, 158, 238, 160, 126, 221, 169, 125, 245, 45,
     80, 172, 232, 27, 90, 67, 184, 0, 61, 199, 122, 33, 200, 62, 197,
 ];
-const REV: &str = "2026-01-01T00:00:00.000Z";
-const TOTP: &str = "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP";
+pub(crate) const REV: &str = "2026-01-01T00:00:00.000Z";
+pub(crate) const TOTP: &str = "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP";
 /// 30 s periods start here (1 700 000 010 is a multiple of 30).
-const PERIOD_START: u64 = 1_700_000_010;
+pub(crate) const PERIOD_START: u64 = 1_700_000_010;
 
-fn enc(text: &str) -> String {
+pub(crate) fn enc(text: &str) -> String {
     SymmetricKey::from_bytes(&USER_KEY).unwrap().encrypt_str(text, &OsRandom).unwrap()
 }
 
 /// A personal login under the user key, with the password `old-pass`.
-fn login(id: &str, name: &str, totp: Option<&str>) -> Value {
+pub(crate) fn login(id: &str, name: &str, totp: Option<&str>) -> Value {
     json!({
         "id": id, "type": 1, "name": enc(name), "notes": null, "folderId": null, "organizationId": null,
         "reprompt": 0, "revisionDate": REV, "fields": [], "passwordHistory": [],
@@ -42,7 +42,7 @@ fn login(id: &str, name: &str, totp: Option<&str>) -> Value {
 
 /// The fixture vault, the marked item `m1` and the logins `x1` (no TOTP key) and `x2` (digits 12), unlocked on
 /// `work`, after `edit`. No item asks for a reprompt unless `edit` says so.
-async fn setup(edit: impl FnOnce(&mut Value)) -> (tempfile::TempDir, Rig) {
+pub(crate) async fn setup(edit: impl FnOnce(&mut Value)) -> (tempfile::TempDir, Rig) {
     let dir = tempfile::tempdir().unwrap();
     let rig = rig(dir.path());
     let mut vault: Value = serde_json::from_str(VAULT).unwrap();
@@ -66,7 +66,7 @@ fn reprompting(id: &'static str) -> impl FnOnce(&mut Value) {
     }
 }
 
-fn w() -> Option<String> {
+pub(crate) fn w() -> Option<String> {
     Some("work".into())
 }
 
@@ -74,7 +74,7 @@ fn code_op(needle: &str, next: bool) -> Op {
     Op::Code { profile: w(), needle: needle.into(), user: None, folder: None, ignorecase: false, next }
 }
 
-fn add_op(name: &str, folder: Option<&str>, ask: &[Part]) -> Op {
+pub(crate) fn add_op(name: &str, folder: Option<&str>, ask: &[Part]) -> Op {
     Op::Add {
         profile: w(),
         name: name.into(),
@@ -82,22 +82,33 @@ fn add_op(name: &str, folder: Option<&str>, ask: &[Part]) -> Op {
         uris: vec!["https://new.example.invalid".into()],
         folder: folder.map(Into::into),
         ask: ask.to_vec(),
+        password: None,
+        notes: None,
     }
 }
 
-fn edit_op(needle: &str, ask: &[Part]) -> Op {
-    Op::Edit { profile: w(), needle: needle.into(), user: None, folder: None, ask: ask.to_vec() }
+pub(crate) fn edit_op(needle: &str, ask: &[Part]) -> Op {
+    Op::Edit {
+        profile: w(),
+        needle: needle.into(),
+        user: None,
+        folder: None,
+        ask: ask.to_vec(),
+        ignorecase: false,
+        password: None,
+        notes: None,
+    }
 }
 
-fn remove_op(needle: &str) -> Op {
-    Op::Remove { profile: w(), needle: needle.into(), user: None, folder: None }
+pub(crate) fn remove_op(needle: &str) -> Op {
+    Op::Remove { profile: w(), needle: needle.into(), user: None, folder: None, ignorecase: false }
 }
 
-fn ai() -> Caller {
+pub(crate) fn ai() -> Caller {
     Caller::Ai { harness: "claude".into(), via: Via::Ancestry }
 }
 
-fn unknown() -> Caller {
+pub(crate) fn unknown() -> Caller {
     Caller::Unknown { why: "orphan".into(), peer: None }
 }
 
@@ -112,25 +123,25 @@ fn program() -> Caller {
     }
 }
 
-fn at(secs: u64) -> SystemTime {
+pub(crate) fn at(secs: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
 }
 
-fn code_at(secs: u64) -> String {
+pub(crate) fn code_at(secs: u64) -> String {
     TotpKey::parse(TOTP).unwrap().generate(secs).code().to_owned()
 }
 
 /// Every audited (op, item, verdict).
-fn audited(rig: &Rig) -> Vec<(&'static str, Option<String>, Verdict)> {
+pub(crate) fn audited(rig: &Rig) -> Vec<(&'static str, Option<String>, Verdict)> {
     rig.audit.events().into_iter().map(|e| (e.op, e.item, e.verdict)).collect()
 }
 
 /// How many cipher writes reached the server.
-fn writes(rig: &Rig) -> usize {
+pub(crate) fn writes(rig: &Rig) -> usize {
     rig.host.world().bodies.len()
 }
 
-fn cipher(rig: &Rig, id: &str) -> Value {
+pub(crate) fn cipher(rig: &Rig, id: &str) -> Value {
     let list: Vec<Value> = serde_json::from_str(&rig.host.world().ciphers).unwrap();
     list.into_iter().find(|c| c["id"] == id).unwrap()
 }
@@ -222,7 +233,7 @@ async fn a_code_of_an_item_without_a_totp_key_or_with_one_out_of_range_says_so()
     rig.host.allow();
     assert_eq!(rig.agent.dispatch(code_op("x1", false)).await, err(AgentError::NoSuchField("totp".into())));
     rig.host.allow();
-    assert_eq!(rig.agent.dispatch(code_op("n1", false)).await, err(AgentError::NoSuchField("totp".into())), "a note");
+    assert_eq!(rig.agent.dispatch(code_op("n1", false)).await, err(AgentError::NotALogin), "a note, as rbw says");
     rig.host.allow();
     let reply = rig.agent.dispatch(code_op("x2", false)).await;
     assert_eq!(reply, err(AgentError::Totp("the TOTP digits 12 is outside 1..=10".into())));
@@ -547,6 +558,9 @@ async fn an_organization_item_is_written_with_its_key_and_a_read_only_one_is_ref
         user: None,
         folder: None,
         ask: ask.to_vec(),
+        ignorecase: false,
+        password: None,
+        notes: None,
     };
     rig.host.allow();
     rig.host.answer(Answer::Text("org notes"));
@@ -557,7 +571,13 @@ async fn an_organization_item_is_written_with_its_key_and_a_read_only_one_is_ref
     rig.host.allow();
     let reply = rig
         .agent
-        .dispatch(Op::Remove { profile: Some("org".into()), needle: "o2".into(), user: None, folder: None })
+        .dispatch(Op::Remove {
+            profile: Some("org".into()),
+            needle: "o2".into(),
+            user: None,
+            folder: None,
+            ignorecase: false,
+        })
         .await;
     assert_eq!(reply, err(AgentError::WriteRefused("read-only".into())));
     assert_eq!(writes(&rig), 1, "only o3");
@@ -569,6 +589,7 @@ async fn an_organization_item_is_written_with_its_key_and_a_read_only_one_is_ref
         folder: None,
         ignorecase: false,
         select: Select::Field("notes".into()),
+        rbw: false,
     };
     assert_eq!(text(rig.agent.dispatch(get).await), "org notes");
 }

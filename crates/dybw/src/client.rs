@@ -38,6 +38,8 @@ pub struct Env {
     pub clip: crate::clip::Clip,
     /// Whether stdin is a terminal: a person is typing, not a script or an AI harness.
     pub stdin_tty: bool,
+    /// All of stdin (rbw's `add` and `edit` read the new text there when it is not a terminal).
+    pub stdin: Box<dyn Fn() -> std::io::Result<Zeroizing<String>>>,
 }
 
 impl Env {
@@ -52,6 +54,9 @@ impl Env {
             started_log: RefCell::new(None),
             clip: crate::clip::Clip::real(),
             stdin_tty: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            // shortcut: the buffer grows while it reads, leaving freed copies of a long text; fine for a password and a
+            // few notes, read once.
+            stdin: Box::new(|| std::io::read_to_string(std::io::stdin()).map(Zeroizing::new)),
         }
     }
 

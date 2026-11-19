@@ -11,6 +11,7 @@ pub mod host;
 pub mod paths;
 pub mod policy;
 pub mod pwgen;
+pub mod rbw_view;
 pub mod read;
 pub mod server;
 pub mod session;
@@ -22,6 +23,8 @@ pub mod worker;
 mod flow_tests;
 #[cfg(test)]
 mod policy_tests;
+#[cfg(test)]
+mod rbw_tests;
 #[cfg(test)]
 mod read_tests;
 #[cfg(test)]

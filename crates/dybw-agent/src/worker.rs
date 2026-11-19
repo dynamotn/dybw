@@ -82,10 +82,12 @@ pub enum Cmd {
         folder: Option<String>,
         fields: Vec<Field>,
     },
-    /// A value of one item, once the caller policy allows it (a grant, or the user's yes).
+    /// A value of one item, once the caller policy allows it (a grant, or the user's yes). `rbw`: in rbw's view, with
+    /// the clock a TOTP field's code is made at.
     Get {
         find: Lookup,
         select: Select,
+        rbw: Option<Now>,
         caller: Caller,
         still: Recheck,
     },
@@ -115,6 +117,11 @@ pub enum Cmd {
         caller: Caller,
         still: Recheck,
     },
+    /// rbw's `purge`: once the user confirms, lock and delete the local copy of the vault.
+    Purge {
+        caller: Caller,
+        still: Recheck,
+    },
     /// Lock and end the thread.
     Exit,
     /// Test only: how many items this worker has opened.
@@ -137,6 +144,7 @@ enum Long {
     Read(Lookup, Read, Caller, Recheck),
     Write(Write, Caller, Recheck),
     Policy(PolicyAction, Caller, Recheck),
+    Purge(Caller, Recheck),
     #[cfg(test)]
     Panic,
 }
@@ -289,11 +297,18 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
             let search = |v: &UnlockedVault| Ok(read::list(v, &fields, folder.as_deref(), Some(&term)));
             return quick(reply, with_vault(shared, search).unwrap_or_else(error));
         }
-        Cmd::Get { find, select, caller, still } => Long::Read(find, Read::Get(select), caller, still),
+        Cmd::Get { find, select, rbw, caller, still } => {
+            let read = match rbw {
+                Some(now) => Read::Rbw { select, now },
+                None => Read::Get(select),
+            };
+            Long::Read(find, read, caller, still)
+        }
         Cmd::History { find, caller, still } => Long::Read(find, Read::History, caller, still),
         Cmd::Code { find, next, now, caller, still } => Long::Read(find, Read::Code { next, now }, caller, still),
         Cmd::Write { write, caller, still } => Long::Write(write, caller, still),
         Cmd::Policy { action, caller, still } => Long::Policy(action, caller, still),
+        Cmd::Purge { caller, still } => Long::Purge(caller, still),
         #[cfg(test)]
         Cmd::Opens => {
             return quick(reply, Reply::Value { value: dybw_proto::Secret::new(read::OPENS.get().to_string()) });
@@ -394,6 +409,7 @@ async fn run_long<H: Host>(shared: Rc<Shared>, host: Rc<H>, ctx: Rc<Ctx>, long: 
         Long::Read(find, read, caller, still) => get(&shared, &*host, &ctx, &caller, &still, find, read).await,
         Long::Write(change, caller, still) => write::write(&shared, &*host, &ctx, &caller, &still, change).await,
         Long::Policy(action, caller, still) => change_policy(&shared, &*host, &ctx, &caller, &still, action).await,
+        Long::Purge(caller, still) => purge(&shared, &*host, &ctx, &caller, &still).await,
         #[cfg(test)]
         Long::Panic => panic!("task panic for a test"),
     }
@@ -408,13 +424,13 @@ fn with_vault<T>(shared: &Shared, f: impl FnOnce(&UnlockedVault) -> Result<T, Ag
 /// What the confirmation says: the profile, who asks and by which command, what is read of which item, each on one
 /// line; and when "always" is for this process only, that.
 fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Scope) -> String {
-    let (command, what) = match read {
-        Read::Get(Select::Field(name)) => ("get", format!("its field \"{}\"", tidy(name))),
-        Read::Get(Select::Full) => ("get", "the full item (every value)".to_owned()),
-        Read::Get(Select::Raw) => ("get", "the raw item as JSON".to_owned()),
-        Read::Get(_) => ("get", "its main value (password, notes, number or public key)".to_owned()),
-        Read::History => ("history", "its password history".to_owned()),
-        Read::Code { .. } => ("code", "a TOTP code".to_owned()),
+    let (command, what) = match (read, read.select()) {
+        (_, Some(Select::Field(name))) => ("get", format!("its field \"{}\"", tidy(name))),
+        (_, Some(Select::Full)) => ("get", "the full item (every value)".to_owned()),
+        (_, Some(Select::Raw)) => ("get", "the raw item as JSON".to_owned()),
+        (_, Some(_)) => ("get", "its main value (password, notes, number or public key)".to_owned()),
+        (Read::History, None) => ("history", "its password history".to_owned()),
+        (_, None) => ("code", "a TOTP code".to_owned()),
     };
     let scope = if remember == Scope::Process { " [always (this process only)]" } else { "" };
     format!(
@@ -453,6 +469,11 @@ fn tidy(s: &str) -> String {
 #[derive(Debug, Clone)]
 pub enum Read {
     Get(Select),
+    /// `Get` in rbw's view (the `rbw` shim); `now` is the clock a TOTP field's code is made at.
+    Rbw {
+        select: Select,
+        now: Now,
+    },
     History,
     /// The TOTP code at the time it is made; with `next`, the next one when fewer than [`NEXT_UNDER`] seconds are
     /// left.
@@ -460,6 +481,16 @@ pub enum Read {
         next: bool,
         now: Now,
     },
+}
+
+impl Read {
+    /// What a `get` selects, in either view.
+    pub(crate) fn select(&self) -> Option<&Select> {
+        match self {
+            Read::Get(select) | Read::Rbw { select, .. } => Some(select),
+            Read::History | Read::Code { .. } => None,
+        }
+    }
 }
 
 /// The agent's clock, read when a code is made rather than when its request came in: the user may have taken a
@@ -478,22 +509,22 @@ pub const NEXT_UNDER: u64 = 5;
 
 /// What a request reads: the whole item, its raw JSON and the history are never covered by a grant.
 fn access_of(read: &Read) -> Access {
-    match read {
-        Read::History | Read::Get(Select::Full | Select::Raw) => Access::Whole,
+    match (read, read.select()) {
+        (Read::History, _) | (_, Some(Select::Full | Select::Raw)) => Access::Whole,
         _ => Access::Value,
     }
 }
 
 /// The op, and for `get` what was selected: the kind only, never a field name.
 pub(crate) fn op_of(read: &Read) -> (&'static str, Option<&'static str>) {
-    match read {
-        Read::History => ("history", None),
-        Read::Code { .. } => ("code", None),
-        Read::Get(Select::Field(_)) => ("get", Some("field")),
-        Read::Get(Select::Full) => ("get", Some("full")),
-        Read::Get(Select::Raw) => ("get", Some("raw")),
-        Read::Get(Select::ListFields) => ("get", Some("list-fields")),
-        Read::Get(_) => ("get", Some("password")),
+    match (read, read.select()) {
+        (Read::History, _) => ("history", None),
+        (_, Some(Select::Field(_))) => ("get", Some("field")),
+        (_, Some(Select::Full)) => ("get", Some("full")),
+        (_, Some(Select::Raw)) => ("get", Some("raw")),
+        (_, Some(Select::ListFields)) => ("get", Some("list-fields")),
+        (_, Some(Select::Password)) => ("get", Some("password")),
+        (_, None) => ("code", None),
     }
 }
 
@@ -644,7 +675,7 @@ async fn get<H: Host>(
     }
     // Field names are names (ADR 0012): no question for any caller, but a reprompt item still asks for the master
     // password, which is never asked on behalf of an AI agent or an unidentified caller.
-    let names = matches!(read, Read::Get(Select::ListFields));
+    let names = matches!(read.select(), Some(Select::ListFields));
     if names && found.reprompt && matches!(caller, Caller::Ai { .. } | Caller::Unknown { .. }) {
         audit(ctx, caller, op_of(&read), Some(&found.id), Verdict::Denied);
         return error(AgentError::Denied);
@@ -666,9 +697,10 @@ async fn get<H: Host>(
     }
     // A hidden-type custom field is hidden with the password. It is checked only now, after the user's yes, as
     // ruled in P4.3: an unconfirmed caller learns nothing from the refusal (no oracle on field types).
+    let rbw = matches!(read, Read::Rbw { .. });
     if found.hidden
-        && let Read::Get(Select::Field(name)) = &read
-        && with_vault(shared, |v| same_item(ctx, v, &found).and_then(|()| read::hidden_field(v, &found.id, name)))
+        && let Some(Select::Field(name)) = read.select()
+        && with_vault(shared, |v| same_item(ctx, v, &found).and_then(|()| read::hidden_field(v, &found.id, name, rbw)))
             .unwrap_or(true)
     {
         tracing::warn!(profile = %ctx.profile.name, id = %found.id, "denied: the organization hides this field");
@@ -686,6 +718,10 @@ async fn get<H: Host>(
         same_item(ctx, v, &found)?;
         match &read {
             Read::Get(select) => read::value(v, &found.id, select),
+            Read::Rbw { select, now } => {
+                let at = now.0.wall().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                read::rbw_value(v, &found.id, found.folder.as_deref(), select, at)
+            }
             _ => read::history(v, &found.id),
         }
     };
@@ -698,10 +734,11 @@ async fn get<H: Host>(
 
 /// Whether `read` gives a login's password, TOTP key or history, or the whole item (which holds them).
 fn shows_password(read: &Read) -> bool {
-    match read {
-        Read::Code { .. } | Read::History | Read::Get(Select::Password | Select::Full | Select::Raw) => true,
-        Read::Get(Select::Field(name)) => name == "password" || name == "totp",
-        Read::Get(_) => false,
+    match (read, read.select()) {
+        (Read::Get(Select::Field(name)), _) => name == "password" || name == "totp",
+        (Read::Rbw { select: Select::Field(name), .. }, _) => crate::rbw_view::login_secret(name),
+        (_, Some(Select::ListFields)) => false,
+        _ => true,
     }
 }
 
@@ -854,6 +891,53 @@ async fn change_policy<H: Host>(
         },
         |()| Reply::Done,
     )
+}
+
+/// rbw's `purge`: refused to a caller the policy refuses, then confirmed by the user every time (no grant counts).
+/// After the yes it waits for any login, unlock, sync or write in flight, drops the keys (whatever still waits on
+/// the user finds the profile locked) and deletes the profile's copy of the vault. The API key, the device id, the
+/// policy and the core's pins stay: a pin deleted here would let the server lower the KDF unnoticed at the next unlock.
+async fn purge<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, still: &Recheck) -> Reply {
+    let op = ("purge", None);
+    let store = Store::new(&ctx.paths.policy, ctx.user.uid);
+    if policy::decide(caller, &store.load(), &[], Access::Write) == Decision::Deny {
+        audit(ctx, caller, op, None, Verdict::Denied);
+        return error(AgentError::Denied);
+    }
+    {
+        let _screen = shared.asking.lock().await;
+        let text = format!(
+            "dybw profile {}: allow {} (rbw purge) to lock the profile and delete its local copy of the vault? (asked \
+             every time)",
+            ctx.profile.name,
+            policy::who(caller)
+        );
+        if let Err(e) = session::confirm(host, &text, false).await {
+            audit(ctx, caller, op, None, Verdict::Declined);
+            return error(e);
+        }
+    }
+    if !still.holds() {
+        audit(ctx, caller, op, None, Verdict::Denied);
+        return error(AgentError::Denied);
+    }
+    let _op = shared.op.lock().await;
+    {
+        let mut st = shared.state.borrow_mut();
+        st.slot = None;
+        st.held.clear();
+    }
+    let removed = match std::fs::remove_dir_all(&ctx.paths.cache) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    };
+    if let Err(e) = removed {
+        tracing::warn!(profile = %ctx.profile.name, "the local copy was not deleted: {}", e.kind());
+        audit(ctx, caller, op, None, Verdict::Failed);
+        return internal();
+    }
+    audit(ctx, caller, op, None, Verdict::Confirmed);
+    Reply::Done
 }
 
 async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx) -> Reply {

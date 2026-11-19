@@ -29,6 +29,69 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// A new value a request carries to the agent (rbw's `$EDITOR` text for `add` and `edit`): zeroed on drop, redacted in
+/// `Debug`, and hex on the wire. The op is internally tagged, so serde buffers a request before it reads it; a hex
+/// string has no escape, so the buffer only borrows it from the (wiped) frame and the one decoded copy is this one.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Sealed(Zeroizing<String>);
+
+impl Sealed {
+    pub fn new(value: String) -> Self {
+        Self(Zeroizing::new(value))
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Sealed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Sealed(..)")
+    }
+}
+
+impl Serialize for Sealed {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut hex = Zeroizing::new(String::with_capacity(self.0.len() * 2));
+        for b in self.0.bytes() {
+            for nibble in [b >> 4, b & 15] {
+                hex.push(char::from(HEX.get(usize::from(nibble)).copied().unwrap_or(b'0')));
+            }
+        }
+        s.serialize_str(&hex)
+    }
+}
+
+impl<'de> Deserialize<'de> for Sealed {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Hex;
+        impl serde::de::Visitor<'_> for Hex {
+            type Value = Sealed;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("hex text")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Sealed, E> {
+                let digit = |c: &u8| char::from(*c).to_digit(16).ok_or_else(|| E::custom("not hex"));
+                let mut bytes = Zeroizing::new(Vec::with_capacity(v.len() / 2));
+                for pair in v.as_bytes().chunks(2) {
+                    let [hi, lo] = pair else { return Err(E::custom("odd hex")) };
+                    // Two hex digits make at most 255.
+                    bytes.push(u8::try_from(digit(hi)? * 16 + digit(lo)?).unwrap_or_default());
+                }
+                let text = String::from_utf8(std::mem::take(&mut *bytes)).map_err(|e| {
+                    // The rejected bytes are wiped with the error.
+                    drop(Zeroizing::new(e.into_bytes()));
+                    E::custom("not UTF-8")
+                })?;
+                Ok(Sealed::new(text))
+            }
+        }
+        d.deserialize_str(Hex)
+    }
+}
+
 impl PartialEq for Secret {
     fn eq(&self, other: &Self) -> bool {
         self.expose() == other.expose()
@@ -45,6 +108,8 @@ pub enum Field {
     User,
     Folder,
     Type,
+    /// A login's URIs (rbw's `list --raw` and `search --raw`); names, never a value.
+    Uri,
 }
 
 /// Which profile(s) `Lock` and `Sync` act on.
@@ -174,12 +239,18 @@ pub enum Op {
         folder: Option<String>,
         ignorecase: bool,
         select: Select,
+        /// rbw 1.15's view (the `rbw` shim): `Password`, `Field` and `ListFields` as rbw resolves and prints them,
+        /// `Full` and `Raw` as an [`RbwItem`]. The gate is the select's, as without it.
+        #[serde(default)]
+        rbw: bool,
     },
     History {
         profile: Option<String>,
         needle: String,
         user: Option<String>,
         folder: Option<String>,
+        #[serde(default)]
+        ignorecase: bool,
     },
     /// The current TOTP code of a login; the key never leaves the agent. `next`: when fewer than 5 s of the code are
     /// left, the agent waits for the next one.
@@ -191,7 +262,9 @@ pub enum Op {
         ignorecase: bool,
         next: bool,
     },
-    /// Create a personal login; the agent asks for the value of each of `ask` in the pinentry.
+    /// Create a personal login; the agent asks for the value of each of `ask` in the pinentry. `password` and
+    /// `notes` are values the client already has (rbw's `$EDITOR`, the password `rbw generate` printed); the write
+    /// is confirmed all the same.
     Add {
         profile: Option<String>,
         name: String,
@@ -199,14 +272,25 @@ pub enum Op {
         uris: Vec<String>,
         folder: Option<String>,
         ask: Vec<Part>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<Sealed>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notes: Option<Sealed>,
     },
-    /// Change parts of one item; the agent asks for the new value of each of `ask` in the pinentry.
+    /// Change parts of one item; the agent asks for the new value of each of `ask` in the pinentry, and takes
+    /// `password` and `notes` as given (rbw's `$EDITOR`).
     Edit {
         profile: Option<String>,
         needle: String,
         user: Option<String>,
         folder: Option<String>,
         ask: Vec<Part>,
+        #[serde(default)]
+        ignorecase: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<Sealed>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notes: Option<Sealed>,
     },
     /// Create a personal login whose password the agent generates: the password never travels over the socket.
     Generate {
@@ -224,6 +308,13 @@ pub enum Op {
         needle: String,
         user: Option<String>,
         folder: Option<String>,
+        #[serde(default)]
+        ignorecase: bool,
+    },
+    /// rbw's `purge`: lock the profile and delete its local copy of the vault, confirmed every time. The API key,
+    /// the device id, the policy and the core's pins stay.
+    Purge {
+        profile: Option<String>,
     },
     /// Show or change the caller policy of the profile.
     Policy {
@@ -254,6 +345,9 @@ pub struct ItemSummary {
     pub user: Option<String>,
     pub folder: Option<String>,
     pub kind: Option<String>,
+    /// A login's URIs when [`Field::Uri`] was asked for; `None` for every other type.
+    #[serde(default)]
+    pub uris: Option<Vec<String>>,
 }
 
 /// A named value of an item (`get --full`).
@@ -267,6 +361,98 @@ pub struct Entry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub last_used: String,
+    pub password: Secret,
+}
+
+/// The decrypted item as rbw 1.15 holds it (`DecryptedCipher`, rbw `src/bin/rbw/commands.rs:338-348`), its fields
+/// named as rbw's JSON keys. On the wire `data` is tagged by its type; rbw's `--raw` writes it untagged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RbwItem {
+    pub id: String,
+    pub folder: Option<String>,
+    pub name: String,
+    pub data: RbwData,
+    pub fields: Vec<RbwField>,
+    pub notes: Option<Secret>,
+    pub history: Vec<RbwPast>,
+}
+
+/// rbw's `DecryptedData` (`commands.rs:1021-1064`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RbwData {
+    Login(RbwLogin),
+    Card(RbwCard),
+    Identity(Box<RbwIdentity>),
+    SecureNote,
+    SshKey(RbwSshKey),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RbwLogin {
+    pub username: Option<Secret>,
+    pub password: Option<Secret>,
+    pub totp: Option<Secret>,
+    pub uris: Option<Vec<RbwUri>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RbwUri {
+    pub uri: Secret,
+    /// Bitwarden's match type as a number, as rbw writes it.
+    pub match_type: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RbwCard {
+    pub cardholder_name: Option<Secret>,
+    pub number: Option<Secret>,
+    pub brand: Option<Secret>,
+    pub exp_month: Option<Secret>,
+    pub exp_year: Option<Secret>,
+    pub code: Option<Secret>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RbwIdentity {
+    pub title: Option<Secret>,
+    pub first_name: Option<Secret>,
+    pub middle_name: Option<Secret>,
+    pub last_name: Option<Secret>,
+    pub address1: Option<Secret>,
+    pub address2: Option<Secret>,
+    pub address3: Option<Secret>,
+    pub city: Option<Secret>,
+    pub state: Option<Secret>,
+    pub postal_code: Option<Secret>,
+    pub country: Option<Secret>,
+    pub phone: Option<Secret>,
+    pub email: Option<Secret>,
+    pub ssn: Option<Secret>,
+    pub license_number: Option<Secret>,
+    pub passport_number: Option<Secret>,
+    pub username: Option<Secret>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RbwSshKey {
+    pub public_key: Option<Secret>,
+    pub fingerprint: Option<Secret>,
+    pub private_key: Option<Secret>,
+}
+
+/// A custom field; `type` is rbw's name of its type (text, hidden, boolean, linked).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RbwField {
+    pub name: Option<String>,
+    pub value: Option<Secret>,
+    #[serde(rename = "type")]
+    pub ty: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RbwPast {
+    pub last_used_date: String,
     pub password: Secret,
 }
 
@@ -291,6 +477,13 @@ pub enum AgentError {
     /// The item matched but has no field of this name (a field name is not secret).
     #[error("the item has no field named {0:?}")]
     NoSuchField(String),
+    /// The item has none of what rbw's `get` prints for its type ("password", "card number", "name", "notes",
+    /// "public key"); rbw says so and succeeds.
+    #[error("the item has no {0}")]
+    NoValue(String),
+    /// `code` of an item that is not a login.
+    #[error("not a login entry")]
+    NotALogin,
     #[error("no folder is named {0:?}")]
     NoSuchFolder(String),
     /// The item's TOTP key gives no code; the text names the problem, never the key.
@@ -349,6 +542,10 @@ pub enum Reply {
     /// `Get` with `Raw`: the decrypted item as JSON.
     Raw {
         json: Secret,
+    },
+    /// `Get` with `rbw` and `Full` or `Raw`: the decrypted item in rbw's shape.
+    RbwItem {
+        item: Box<RbwItem>,
     },
     /// `Get` with `ListFields`: custom field names only.
     FieldNames {
@@ -587,6 +784,7 @@ mod tests {
                 folder: None,
                 ignorecase: true,
                 select: Select::Password,
+                rbw: false,
             },
             Op::Get {
                 profile: p(),
@@ -595,9 +793,26 @@ mod tests {
                 folder: None,
                 ignorecase: false,
                 select: Select::Field(s("totp")),
+                rbw: true,
             },
-            Op::Get { profile: p(), needle: s("n"), user: None, folder: None, ignorecase: false, select: Select::Full },
-            Op::Get { profile: p(), needle: s("n"), user: None, folder: None, ignorecase: false, select: Select::Raw },
+            Op::Get {
+                profile: p(),
+                needle: s("n"),
+                user: None,
+                folder: None,
+                ignorecase: false,
+                select: Select::Full,
+                rbw: false,
+            },
+            Op::Get {
+                profile: p(),
+                needle: s("n"),
+                user: None,
+                folder: None,
+                ignorecase: false,
+                select: Select::Raw,
+                rbw: true,
+            },
             Op::Get {
                 profile: p(),
                 needle: s("n"),
@@ -605,8 +820,9 @@ mod tests {
                 folder: None,
                 ignorecase: false,
                 select: Select::ListFields,
+                rbw: false,
             },
-            Op::History { profile: p(), needle: s("n"), user: None, folder: Some(s("f")) },
+            Op::History { profile: p(), needle: s("n"), user: None, folder: Some(s("f")), ignorecase: true },
             Op::Code { profile: p(), needle: s("n"), user: Some(s("u")), folder: None, ignorecase: true, next: true },
             Op::Add {
                 profile: None,
@@ -615,8 +831,19 @@ mod tests {
                 uris: vec![s("https://a.invalid")],
                 folder: Some(s("f")),
                 ask: vec![Part::Password, Part::Notes, Part::Totp],
+                password: Some(Sealed::new(s("pw\n\"ü"))),
+                notes: None,
             },
-            Op::Edit { profile: p(), needle: s("n"), user: None, folder: None, ask: vec![Part::Password] },
+            Op::Edit {
+                profile: p(),
+                needle: s("n"),
+                user: None,
+                folder: None,
+                ask: vec![Part::Password],
+                ignorecase: true,
+                password: None,
+                notes: Some(Sealed::new(s("a\nb"))),
+            },
             Op::Generate {
                 profile: p(),
                 name: s("n"),
@@ -635,7 +862,8 @@ mod tests {
                 length: 4,
                 charset: Charset::Diceware,
             },
-            Op::Remove { profile: p(), needle: s("n"), user: Some(s("u")), folder: Some(s("f")) },
+            Op::Remove { profile: p(), needle: s("n"), user: Some(s("u")), folder: Some(s("f")), ignorecase: true },
+            Op::Purge { profile: p() },
             Op::Policy { profile: p(), action: PolicyAction::Show },
             Op::Policy {
                 profile: None,
@@ -687,12 +915,14 @@ mod tests {
                     user: None,
                     folder: Some(s("f")),
                     kind: Some(s("login")),
+                    uris: Some(vec![s("https://a.invalid")]),
                 }],
             },
             Reply::Value { value: Secret::new(s("hunter2")) },
             Reply::Full { entries: vec![Entry { name: s("password"), value: Secret::new(s("v")) }] },
             Reply::Raw { json: Secret::new(s("{}")) },
             Reply::FieldNames { names: vec![s("totp")] },
+            Reply::RbwItem { item: Box::new(rbw_item()) },
             Reply::Code { code: Secret::new(s("123456")), seconds_left: 17 },
             Reply::History { entries: vec![HistoryEntry { last_used: s("d"), password: Secret::new(s("old")) }] },
             Reply::Policy {
@@ -724,6 +954,8 @@ mod tests {
             (NotFound, "no item matches"),
             (NoSuchField(s("totp")), "the item has no field named \"totp\""),
             (NoSuchFolder(s("Work")), "no folder is named \"Work\""),
+            (NoValue(s("card number")), "the item has no card number"),
+            (NotALogin, "not a login entry"),
             (
                 Totp(s("the TOTP digits 12 is outside 1..=10")),
                 "the TOTP key is not usable: the TOTP digits 12 is outside 1..=10",
@@ -748,6 +980,129 @@ mod tests {
             let res = Response::new(Reply::Error { error: e });
             assert_eq!(decode_response(&encode(&res).unwrap()).unwrap().unwrap().0, res);
         }
+    }
+
+    fn rbw_item() -> RbwItem {
+        let some = |v: &str| Some(Secret::new(s(v)));
+        RbwItem {
+            id: s("i"),
+            folder: Some(s("f")),
+            name: s("n"),
+            data: RbwData::Login(RbwLogin {
+                username: some("u"),
+                password: some("hunter2"),
+                totp: None,
+                uris: Some(vec![RbwUri { uri: Secret::new(s("https://a.invalid")), match_type: Some(4) }]),
+            }),
+            fields: vec![RbwField { name: Some(s("f")), value: some("v"), ty: Some(s("hidden")) }],
+            notes: some("n"),
+            history: vec![RbwPast { last_used_date: s("d"), password: Secret::new(s("old")) }],
+        }
+    }
+
+    #[test]
+    fn every_rbw_data_round_trips_and_hides_its_values_in_debug() {
+        let none = || None;
+        let datas = [
+            RbwData::SecureNote,
+            RbwData::Card(RbwCard {
+                cardholder_name: none(),
+                number: Some(Secret::new(s("hunter2"))),
+                brand: none(),
+                exp_month: none(),
+                exp_year: none(),
+                code: none(),
+            }),
+            RbwData::Identity(Box::new(RbwIdentity {
+                title: Some(Secret::new(s("hunter2"))),
+                first_name: none(),
+                middle_name: none(),
+                last_name: none(),
+                address1: none(),
+                address2: none(),
+                address3: none(),
+                city: none(),
+                state: none(),
+                postal_code: none(),
+                country: none(),
+                phone: none(),
+                email: none(),
+                ssn: none(),
+                license_number: none(),
+                passport_number: none(),
+                username: none(),
+            })),
+            RbwData::SshKey(RbwSshKey {
+                public_key: none(),
+                fingerprint: none(),
+                private_key: Some(Secret::new(s("hunter2"))),
+            }),
+        ];
+        for data in datas {
+            let item = RbwItem { data, ..rbw_item() };
+            let res = Response::new(Reply::RbwItem { item: Box::new(item) });
+            assert_eq!(decode_response(&encode(&res).unwrap()).unwrap().unwrap().0, res);
+            assert!(!format!("{res:?}").contains("hunter2"));
+        }
+        assert!(!format!("{:?}", rbw_item()).contains("hunter2"));
+    }
+
+    #[test]
+    fn a_sealed_value_is_hex_on_the_wire_and_never_in_debug() {
+        let value = "pw \"q\"\nline ü 😀";
+        let op = Op::Add {
+            profile: None,
+            name: s("n"),
+            user: None,
+            uris: vec![],
+            folder: None,
+            ask: vec![],
+            password: Some(Sealed::new(s(value))),
+            notes: Some(Sealed::new(String::new())),
+        };
+        let frame = encode(&Request::new(op.clone())).unwrap();
+        let body = std::str::from_utf8(&frame[4..]).unwrap();
+        let hex: String = value.bytes().map(|b| format!("{b:02x}")).collect();
+        assert!(body.contains(&format!("\"password\":\"{hex}\"")), "{body}");
+        assert!(body.contains("\"notes\":\"\""), "{body}");
+        assert!(!body.contains("line"), "{body}");
+        assert_eq!(decode_request(&frame).unwrap().unwrap().0.op, op);
+        assert_eq!(format!("{:?}", Sealed::new(s("hunter2"))), "Sealed(..)");
+        assert_eq!(Sealed::new(s("a")).expose(), "a");
+        // Absent values are left out, and read as none.
+        let edit = Op::Edit {
+            profile: None,
+            needle: s("n"),
+            user: None,
+            folder: None,
+            ask: vec![],
+            ignorecase: false,
+            password: None,
+            notes: None,
+        };
+        let frame = encode(&Request::new(edit.clone())).unwrap();
+        assert!(!std::str::from_utf8(&frame[4..]).unwrap().contains("password"));
+        assert_eq!(decode_request(&frame).unwrap().unwrap().0.op, edit);
+        // Anything but even, lowercase or uppercase hex of UTF-8 is refused.
+        for bad in ["\"abc\"", "\"zz\"", "\"ff\"", "1"] {
+            assert!(serde_json::from_str::<Sealed>(bad).is_err(), "{bad}");
+        }
+        assert_eq!(serde_json::from_str::<Sealed>("\"4A\"").unwrap().expose(), "J");
+        let err = serde_json::from_str::<Sealed>("1").unwrap_err().to_string();
+        assert!(err.contains("hex text"), "{err}");
+    }
+
+    #[test]
+    fn requests_from_before_the_rbw_fields_read_with_their_defaults() {
+        let body = br#"{"version":1,"op":"get","profile":null,"needle":"n","user":null,"folder":null,"ignorecase":false,"select":"password"}"#;
+        let Op::Get { rbw, .. } = decode_request(&frame(body)).unwrap().unwrap().0.op else { panic!() };
+        assert!(!rbw);
+        let body = br#"{"version":1,"op":"remove","profile":null,"needle":"n","user":null,"folder":null}"#;
+        let Op::Remove { ignorecase, .. } = decode_request(&frame(body)).unwrap().unwrap().0.op else { panic!() };
+        assert!(!ignorecase);
+        let row: ItemSummary =
+            serde_json::from_str(r#"{"id":"i","name":null,"user":null,"folder":null,"kind":null}"#).unwrap();
+        assert_eq!(row.uris, None);
     }
 
     #[test]
