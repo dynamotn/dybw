@@ -264,14 +264,16 @@ def test_refused_confirmation_is_denied(world, account):
     assert "login-pw" not in r.stderr
 
 
-def test_reprompt_item_is_denied_without_a_prompt(world, account):
+def test_reprompt_item_needs_the_master_password_after_the_confirmation(world, account):
     ensure_unlocked(world, account)
-    Path("/tmp/fake-pinentry.log").unlink(missing_ok=True)
-    r = world("get", "guarded", confirm="always")
-    assert r.returncode == 1 and r.stdout == "" and "denied" in r.stderr
     assert "guarded" in world("list").stdout.splitlines()
-    log = Path("/tmp/fake-pinentry.log")  # absent: no pinentry was started at all
-    assert not log.exists() or "CONFIRM" not in log.read_text()
+    r = world("get", "guarded", pins=["not-the-master-password"], confirm="once")
+    assert r.returncode == 1 and r.stdout == "" and "denied" in r.stderr
+    Path("/tmp/fake-pinentry.log").unlink(missing_ok=True)
+    r = world("get", "guarded", pins=[account.password], confirm="once")
+    assert (r.returncode, r.stdout) == (0, "guard-pw\n"), r.stderr
+    log = Path("/tmp/fake-pinentry.log").read_text()
+    assert log.index("CONFIRM") < log.index("GETPIN") and log.count("GETPIN") == 1
 
 
 def test_lock(world, account):

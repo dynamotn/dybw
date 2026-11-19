@@ -231,14 +231,15 @@ class Account:
             body.update(extra)
         return http("POST", f"{self.server}/api/ciphers", body, self._auth())
 
-    def add_login(self, folder, name, password, fields=None, username=None, uri=None, notes=None, reprompt=0, history=None):
+    def add_login(self, folder, name, password, fields=None, username=None, uri=None, notes=None, reprompt=0, history=None,
+                  totp=None):
         """Add a login; `folder` may be None for no folder."""
         k = self.user_key
         login = {
             "username": encrypt(username.encode(), k) if username else None,
             "password": encrypt(password.encode(), k),
             "uris": [{"uri": encrypt(uri.encode(), k), "match": None}] if uri else None,
-            "totp": None,
+            "totp": encrypt(totp.encode(), k) if totp else None,
         }
         return self._new(folder, 1, name, notes, login, fields, reprompt=reprompt, history=history)
 
@@ -269,3 +270,10 @@ class Account:
         body = {k: v for k, v in c.items() if k not in ("id", "revisionDate", "creationDate", "deletedDate", "object", "edit", "viewPassword", "permissions", "collectionIds", "attachments", "organizationUseTotp", "data", "passwordHistory")}
         body["encryptedFor"] = self.user_id
         return http("POST", f"{self.server}/api/ciphers", body, self._auth())["id"]
+
+    def folder_named(self, name):
+        """The id of the folder `name`, or None; unlike folder_id, it never makes one."""
+        for f in self.sync()["folders"]:
+            if decrypt(f["name"], self.user_key).decode() == name:
+                return f["id"]
+        return None
