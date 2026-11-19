@@ -6,7 +6,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{NSPasteboard, NSPasteboardItem};
 use objc2_foundation::{NSArray, NSData, NSString};
 
-use super::{Error, Token};
+use super::{Copied, Error, Token};
 
 const TEXT: &str = "public.utf8-plain-text";
 /// Clipboard managers do not show or store it.
@@ -14,7 +14,7 @@ const CONCEALED: &str = "org.nspasteboard.ConcealedType";
 /// Clipboard managers do not keep it in their history.
 const TRANSIENT: &str = "org.nspasteboard.TransientType";
 
-pub(super) fn copy(value: &[u8]) -> Result<Token, Error> {
+pub(super) fn copy(value: &[u8]) -> Result<Copied, Error> {
     copy_on(&NSPasteboard::generalPasteboard(), value)
 }
 
@@ -22,18 +22,21 @@ pub(super) fn clear_if_unchanged(token: &Token) -> Result<bool, Error> {
     clear_on(&NSPasteboard::generalPasteboard(), token)
 }
 
-fn copy_on(pasteboard: &NSPasteboard, value: &[u8]) -> Result<Token, Error> {
+fn copy_on(pasteboard: &NSPasteboard, value: &[u8]) -> Result<Copied, Error> {
     let text = std::str::from_utf8(value).map_err(|_| Error::NotText)?;
     autoreleasepool(|_| {
         let item = NSPasteboardItem::new();
         let empty = NSData::new();
         let marked = item.setString_forType(&NSString::from_str(text), &NSString::from_str(TEXT))
             && [CONCEALED, TRANSIENT].into_iter().all(|t| item.setData_forType(&empty, &NSString::from_str(t)));
-        pasteboard.clearContents();
         let items = NSArray::from_retained_slice(&[ProtocolObject::from_retained(item)]);
-        // The count after the write: a later copy by anyone bumps it.
-        let written = marked && pasteboard.writeObjects(&items);
-        written.then(|| Token::Count(pasteboard.changeCount())).ok_or(Error::Refused)
+        // Only a complete item clears the user's clipboard. The count `clearContents` returns is ours: a later
+        // copy by anyone bumps it, and no read in between can pick up someone else's.
+        let count = marked.then(|| pasteboard.clearContents());
+        count
+            .filter(|_| pasteboard.writeObjects(&items))
+            .map(|n| Copied { token: Token::Count(n), marked: true })
+            .ok_or(Error::Refused)
     })
 }
 
@@ -71,7 +74,7 @@ mod tests {
     /// Skipped where no pasteboard server answers (a sandbox, a session without a window server).
     fn copied(pasteboard: &NSPasteboard, value: &[u8]) -> Option<Token> {
         // Text values only: the one error left is `Refused`.
-        copy_on(pasteboard, value).ok()
+        copy_on(pasteboard, value).ok().map(|c| c.token)
     }
 
     #[test]

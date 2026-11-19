@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use super::{Error, Token, Tool};
+use super::{Copied, Error, Token, Tool};
 
 /// Where the tools are looked for, and the `PATH` they run with: never the caller's.
 pub(crate) const PATH: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -68,7 +68,7 @@ impl Tool {
 
     fn paste(self) -> (&'static str, &'static [&'static str]) {
         match self {
-            Tool::WlCopy => ("wl-paste", &["--no-newline"]),
+            Tool::WlCopy => ("wl-paste", &["--type", "text/plain", "--no-newline"]),
             Tool::Xclip => ("xclip", &["-selection", "clipboard", "-out"]),
             Tool::Xsel => ("xsel", &["--clipboard", "--output"]),
         }
@@ -105,11 +105,12 @@ fn pick(runner: &dyn Runner, var: &dyn Fn(&str) -> Option<OsString>) -> Result<(
     tools.iter().find_map(|&t| find(runner, t.name()).map(|p| (t, p))).ok_or(Error::Unavailable)
 }
 
-pub(crate) fn copy(runner: &dyn Runner, var: &dyn Fn(&str) -> Option<OsString>, value: &[u8]) -> Result<Token, Error> {
+pub(crate) fn copy(runner: &dyn Runner, var: &dyn Fn(&str) -> Option<OsString>, value: &[u8]) -> Result<Copied, Error> {
     let (tool, path) = pick(runner, var)?;
-    for args in tool.copy_args() {
+    for (i, args) in tool.copy_args().iter().enumerate() {
         if runner.run(&path, args, value)? {
-            return Ok(Token::Hash(tool, digest(value)));
+            // Only the first `wl-copy` form carries the hint.
+            return Ok(Copied { token: Token::Hash(tool, digest(value)), marked: tool == Tool::WlCopy && i == 0 });
         }
     }
     Err(Error::Refused)
@@ -194,8 +195,9 @@ mod tests {
     #[test]
     fn wayland_copy_sends_the_value_on_stdin_with_the_hint() {
         let fake = Fake::with(&["/usr/bin/wl-copy", "/usr/bin/xclip"], vec![true]);
-        let token = copy(&fake, &vars(WAYLAND), VALUE).unwrap();
-        assert_eq!(token, Token::Hash(Tool::WlCopy, digest(VALUE)));
+        let copied = copy(&fake, &vars(WAYLAND), VALUE).unwrap();
+        assert_eq!(copied, Copied { token: Token::Hash(Tool::WlCopy, digest(VALUE)), marked: true });
+        let token = copied.token;
         let calls = fake.calls();
         assert_eq!(calls.len(), 1);
         let (program, args, input) = &calls[0];
@@ -210,7 +212,8 @@ mod tests {
     fn an_old_wl_copy_without_sensitive_still_copies() {
         let fake = Fake::with(&["/usr/local/bin/wl-copy"], vec![false, true]);
         let vars = vars(&[("WAYLAND_DISPLAY", "w")]);
-        assert_eq!(copy(&fake, &vars, VALUE).unwrap(), Token::Hash(Tool::WlCopy, digest(VALUE)));
+        let unmarked = Copied { token: Token::Hash(Tool::WlCopy, digest(VALUE)), marked: false };
+        assert_eq!(copy(&fake, &vars, VALUE).unwrap(), unmarked);
         let calls = fake.calls();
         assert_eq!(calls[1].1, ["--type", "text/plain"]);
         assert_eq!(calls[1].2, VALUE);
@@ -222,10 +225,12 @@ mod tests {
     #[test]
     fn x11_takes_xclip_then_xsel_and_wayland_without_wl_copy_falls_back() {
         let fake = Fake::with(&["/bin/xclip", "/bin/xsel"], vec![true]);
-        assert_eq!(copy(&fake, &vars(WAYLAND), VALUE).unwrap(), Token::Hash(Tool::Xclip, digest(VALUE)));
+        let copied = copy(&fake, &vars(WAYLAND), VALUE).unwrap();
+        assert_eq!(copied, Copied { token: Token::Hash(Tool::Xclip, digest(VALUE)), marked: false });
         assert_eq!(fake.calls()[0].1, ["-selection", "clipboard", "-in"]);
         let fake = Fake::with(&["/usr/bin/xsel"], vec![true]);
-        assert_eq!(copy(&fake, &vars(X11), VALUE).unwrap(), Token::Hash(Tool::Xsel, digest(VALUE)));
+        let copied = copy(&fake, &vars(X11), VALUE).unwrap();
+        assert_eq!(copied, Copied { token: Token::Hash(Tool::Xsel, digest(VALUE)), marked: false });
         assert_eq!(fake.calls()[0], (s("/usr/bin/xsel"), vec![s("--clipboard"), s("--input")], VALUE.to_vec()));
     }
 
@@ -261,7 +266,11 @@ mod tests {
     fn clear_runs_only_while_the_clipboard_still_holds_the_copy() {
         let installed = ["/usr/bin/wl-copy", "/usr/bin/wl-paste", "/usr/bin/xclip", "/usr/bin/xsel"];
         for (tool, paste, clear) in [
-            (Tool::WlCopy, ("/usr/bin/wl-paste", vec!["--no-newline"]), ("/usr/bin/wl-copy", vec!["--clear"])),
+            (
+                Tool::WlCopy,
+                ("/usr/bin/wl-paste", vec!["--type", "text/plain", "--no-newline"]),
+                ("/usr/bin/wl-copy", vec!["--clear"]),
+            ),
             (
                 Tool::Xclip,
                 ("/usr/bin/xclip", vec!["-selection", "clipboard", "-out"]),

@@ -7,15 +7,15 @@ use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-pub use dybw_peer::clipboard::{Error, Token};
+pub use dybw_peer::clipboard::{Copied, Error, Token};
 use zeroize::Zeroizing;
 
 /// The hidden subcommand the clearer runs.
 pub const CLEAR_COMMAND: &str = "__clear-clipboard";
 
-type CopyFn = Box<dyn Fn(&[u8]) -> Result<Token, Error>>;
+type CopyFn = Box<dyn Fn(&[u8]) -> Result<Copied, Error>>;
 type ClearFn = Box<dyn Fn(&Token) -> Result<bool, Error>>;
 type SpawnFn = Box<dyn Fn(&str) -> io::Result<()>>;
 
@@ -26,6 +26,8 @@ pub struct Clip {
     /// Start the clearer with this job on its stdin.
     pub spawn: SpawnFn,
     pub sleep: Box<dyn Fn(Duration)>,
+    /// The wall clock: the delay counts time the machine was asleep, which `sleep` does not.
+    pub now: Box<dyn Fn() -> SystemTime>,
     /// The clearer reads its job (from stdin).
     pub job: Box<dyn Fn() -> io::Result<Zeroizing<String>>>,
 }
@@ -37,6 +39,7 @@ impl Clip {
             clear: Box::new(dybw_peer::clipboard::clear_if_unchanged),
             spawn: Box::new(|job| spawn_clearer(&std::env::current_exe()?, job)),
             sleep: Box::new(std::thread::sleep),
+            now: Box::new(SystemTime::now),
             job: Box::new(|| io::read_to_string(io::stdin()).map(Zeroizing::new)),
         }
     }
@@ -51,6 +54,8 @@ pub fn spawn_clearer(program: &Path, job: &str) -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0)
+        // Not the caller's directory: it may be unmounted or deleted meanwhile.
+        .current_dir("/")
         .spawn()?;
     child.stdin.take().map_or(Ok(()), |mut stdin| stdin.write_all(job.as_bytes()))
 }

@@ -9,12 +9,15 @@ mod doctor;
 
 use std::io::Write;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand};
 use dybw_proto::{AgentError, Field, ItemSummary, Op, PolicyAction, PolicyRule, Reply, Select, Target};
 use serde_json::{Map, Value};
 use zeroize::Zeroizing;
+
+use clip::Copied;
 
 pub use client::{Env, Error as ClientError, START_WAIT};
 
@@ -251,7 +254,7 @@ fn default_profile(env: &Env, profile: Option<String>, autostart: bool) -> Resul
     }
 }
 
-fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
+fn execute(cli: Cli, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, Fail> {
     let profile =
         cli.profile.or_else(|| (env.var)("DYBW_PROFILE").and_then(|v| v.into_string().ok()).filter(|v| !v.is_empty()));
     match cli.command {
@@ -321,7 +324,7 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
                 _ => return Err(Fail::Unexpected),
             }
             if clipboard {
-                copy_out(env, &copied)?;
+                copy_out(env, &copied, err)?;
             }
             Ok(0)
         }
@@ -380,12 +383,16 @@ fn execute(cli: Cli, env: &Env, out: &mut dyn Write) -> Result<u8, Fail> {
 
 /// Copy the output (its last newline dropped) and start the clearer. The delay is read first: a bad config leaves
 /// nothing on the clipboard.
-fn copy_out(env: &Env, text: &[u8]) -> Result<(), Fail> {
+fn copy_out(env: &Env, text: &[u8], err: &mut dyn Write) -> Result<(), Fail> {
     let config = dybw_agent::paths::config_path(&doctor::home_of(env).ok_or_else(no_home)?);
     let seconds = dybw_agent::config::Config::load(&config)
         .and_then(|c| c.clipboard_clear_seconds())
         .map_err(|e| Fail::Log(format!("{e:#}")))?;
-    let token = (env.clip.copy)(text.strip_suffix(b"\n").unwrap_or(text))?;
+    let Copied { token, marked } = (env.clip.copy)(text.strip_suffix(b"\n").unwrap_or(text))?;
+    if !marked {
+        let _ =
+            writeln!(err, "dybw: note: this clipboard cannot mark the copy as secret; a clipboard manager may keep it");
+    }
     // No clearer, no copy left behind.
     (env.clip.spawn)(&clip::job(seconds, &token)).map_err(|e| {
         let _ = (env.clip.clear)(&token);
@@ -397,7 +404,11 @@ fn copy_out(env: &Env, text: &[u8]) -> Result<(), Fail> {
 fn clear_later(env: &Env) -> Result<u8, Fail> {
     let job = (env.clip.job)()?;
     let (delay, token) = clip::parse_job(&job).ok_or_else(|| Fail::Log("not a clipboard job".into()))?;
-    (env.clip.sleep)(delay);
+    // Short naps against a wall-clock deadline: a nap of the whole delay would not count a suspend.
+    let deadline = (env.clip.now)() + delay;
+    while let Some(left) = deadline.duration_since((env.clip.now)()).ok().filter(|d| !d.is_zero()) {
+        (env.clip.sleep)(left.min(Duration::from_secs(1)));
+    }
     (env.clip.clear)(&token)?;
     Ok(0)
 }
@@ -528,7 +539,7 @@ where
             };
         }
     };
-    match execute(cli, env, out) {
+    match execute(cli, env, out, err) {
         Ok(code) => code,
         Err(fail) => {
             report(err, &fail);

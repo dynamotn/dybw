@@ -1108,26 +1108,31 @@ fn a_logged_failure_names_the_log_when_there_is_one() {
 
 // clipboard
 
-/// What the fake clipboard and clearer saw, in order.
+/// What the fake clipboard and clearer saw, in order, and the fake wall clock (time since the epoch).
 #[derive(Default, Clone)]
-struct ClipLog(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+struct ClipLog {
+    events: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    clock: std::rc::Rc<std::cell::Cell<Duration>>,
+    /// Added to the clock by the next nap: the machine was suspended during it.
+    suspend: std::rc::Rc<std::cell::Cell<Duration>>,
+}
 
 impl ClipLog {
     fn push(&self, event: String) {
-        self.0.borrow_mut().push(event);
+        self.events.borrow_mut().push(event);
     }
 
     fn events(&self) -> Vec<String> {
-        self.0.borrow().clone()
+        self.events.borrow().clone()
     }
 
     /// Copy gives `count:7`; `job` is the clearer's stdin (`None`: unreadable). Failing parts are set after.
     fn clip(&self, job: Option<&'static str>) -> clip::Clip {
-        let (a, b, c, d) = (self.clone(), self.clone(), self.clone(), self.clone());
+        let (a, b, c, d, e) = (self.clone(), self.clone(), self.clone(), self.clone(), self.clone());
         clip::Clip {
             copy: Box::new(move |v| {
                 a.push(format!("copy:{}", String::from_utf8_lossy(v)));
-                Ok(clip::Token::Count(7))
+                Ok(clip::Copied { token: clip::Token::Count(7), marked: true })
             }),
             clear: Box::new(move |t| {
                 b.push(format!("clear:{}", t.encode()));
@@ -1137,7 +1142,11 @@ impl ClipLog {
                 c.push(format!("spawn:{job}"));
                 Ok(())
             }),
-            sleep: Box::new(move |d_| d.push(format!("sleep:{}", d_.as_secs()))),
+            sleep: Box::new(move |nap| {
+                d.push(format!("sleep:{}", nap.as_secs()));
+                d.clock.set(d.clock.get() + nap + d.suspend.take());
+            }),
+            now: Box::new(move || std::time::UNIX_EPOCH + e.clock.get()),
             job: Box::new(move || {
                 job.map(|j| Zeroizing::new(j.to_owned())).ok_or(std::io::ErrorKind::BrokenPipe.into())
             }),
@@ -1207,6 +1216,22 @@ fn clipboard_failures_are_reported() {
     f.ops();
 }
 
+/// X11 or an old wl-copy: the copy still happens, with a note that it is not marked.
+#[test]
+fn an_unmarked_copy_says_so() {
+    let f = fake(vec![Act::Reply(Reply::Value { value: secret("v") })]);
+    let log = ClipLog::default();
+    let mut env = env_in(f.base.path(), None, None);
+    env.clip = log.clip(None);
+    env.clip.copy = Box::new(|_| Ok(clip::Copied { token: clip::Token::Count(1), marked: false }));
+    let (code, out, err) = run_in(&env, &["get", "n", "-c"]);
+    assert_eq!((code, out.as_str()), (0, ""));
+    assert_eq!(err, "dybw: note: this clipboard cannot mark the copy as secret; a clipboard manager may keep it\n");
+    assert_eq!(log.events(), ["spawn:30 count:1\n"]);
+    drop(env);
+    f.ops();
+}
+
 #[test]
 fn copy_without_a_home_is_refused_before_copying() {
     let f = fake(vec![Act::Reply(Reply::Value { value: secret("v") })]);
@@ -1230,9 +1255,18 @@ fn the_clearer_sleeps_then_clears_if_unchanged() {
         env.clip = log.clip(job);
         (env, log)
     };
-    let (env, log) = env_with(Some("7 count:3\n"));
+    let (env, log) = env_with(Some("3 count:3\n"));
     assert_eq!(run_in(&env, &[clip::CLEAR_COMMAND]), (0, s(""), s("")));
-    assert_eq!(log.events(), ["sleep:7", "clear:count:3"]);
+    assert_eq!(log.events(), ["sleep:1", "sleep:1", "sleep:1", "clear:count:3"]);
+    // Suspended for an hour during the first nap: the wall clock is past the deadline, so it clears at once.
+    let (env, log) = env_with(Some("30 count:3\n"));
+    log.suspend.set(Duration::from_secs(3600));
+    assert_eq!(run_in(&env, &[clip::CLEAR_COMMAND]).0, 0);
+    assert_eq!(log.events(), ["sleep:1", "clear:count:3"]);
+    // A zero delay naps not at all.
+    let (env, log) = env_with(Some("0 count:3\n"));
+    assert_eq!(run_in(&env, &[clip::CLEAR_COMMAND]).0, 0);
+    assert_eq!(log.events(), ["clear:count:3"]);
     // Changed meanwhile: nothing to do, and no error.
     let (mut env, _) = env_with(Some("1 count:3"));
     env.clip.clear = Box::new(|_| Ok(false));
@@ -1255,7 +1289,7 @@ fn the_clearer_gets_its_job_on_stdin_not_in_argv_or_env() {
     let seen = dir.path().join("seen");
     let program = dir.path().join("clearer");
     let script = format!(
-        "#!/bin/sh\n{{ printf 'argv:%s\\n' \"$*\"; env; printf 'stdin:'; cat; }} > '{}.tmp'; mv '{0}.tmp' '{0}'\n",
+        "#!/bin/sh\n{{ printf 'argv:%s\\n' \"$*\"; printf 'cwd:%s\\n' \"$(pwd)\"; env; printf 'stdin:'; cat; }} > '{}.tmp'; mv '{0}.tmp' '{0}'\n",
         seen.display()
     );
     std::fs::write(&program, script).unwrap();
@@ -1270,7 +1304,7 @@ fn the_clearer_gets_its_job_on_stdin_not_in_argv_or_env() {
     let seen = std::fs::read_to_string(&seen).unwrap();
     let (before, stdin) = seen.split_once("stdin:").unwrap();
     assert_eq!(stdin, job);
-    assert!(before.starts_with(&format!("argv:{}\n", clip::CLEAR_COMMAND)), "{before}");
+    assert!(before.starts_with(&format!("argv:{}\ncwd:/\n", clip::CLEAR_COMMAND)), "{before}");
     assert!(!before.contains(&token.encode()), "{before}");
     assert_eq!(clip::parse_job(stdin), Some((Duration::from_secs(30), token)));
     // The real clearer starts this test binary, which takes the subcommand for a test filter and exits.

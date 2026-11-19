@@ -49,6 +49,14 @@ impl Tool {
     }
 }
 
+/// A copy on the clipboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Copied {
+    pub token: Token,
+    /// Marked as secret for clipboard managers; `false` on X11 and with a `wl-copy` older than 2.2.
+    pub marked: bool,
+}
+
 /// What a later [`clear_if_unchanged`] compares with: never the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
@@ -87,7 +95,7 @@ impl Token {
 
 /// Put `value` on the clipboard, marked as secret.
 #[cfg(target_os = "macos")]
-pub fn copy(value: &[u8]) -> Result<Token, Error> {
+pub fn copy(value: &[u8]) -> Result<Copied, Error> {
     mac::copy(value)
 }
 
@@ -99,7 +107,7 @@ pub fn clear_if_unchanged(token: &Token) -> Result<bool, Error> {
 
 /// Put `value` on the clipboard, marked as secret.
 #[cfg(target_os = "linux")]
-pub fn copy(value: &[u8]) -> Result<Token, Error> {
+pub fn copy(value: &[u8]) -> Result<Copied, Error> {
     tools::copy(&tools::System, &|name| std::env::var_os(name), value)
 }
 
