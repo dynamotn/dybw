@@ -359,7 +359,7 @@ fn add_with(name: &str, password: Option<Sealed>, notes: Option<Sealed>) -> Op {
 
 fn edit_with(needle: &str, ignorecase: bool, password: Option<Sealed>, notes: Option<Sealed>) -> Op {
     let Op::Edit { profile, needle, user, folder, ask, .. } = edit_op(needle, &[]) else { panic!() };
-    Op::Edit { profile, needle, user, folder, ask, ignorecase, password, notes }
+    Op::Edit { profile, needle, user, folder, ask, ignorecase, password, notes, text: None }
 }
 
 #[tokio::test]
@@ -506,4 +506,53 @@ async fn a_purge_that_cannot_delete_the_copy_fails_and_a_deny_entry_refuses_it_u
     let asked = rig.host.world().confirmed.len();
     assert_eq!(rig.agent.dispatch(purge()).await, err(AgentError::Denied));
     assert_eq!(rig.host.world().confirmed.len(), asked, "not asked");
+}
+
+#[tokio::test]
+async fn rbw_edit_reads_only_the_password_and_notes_and_says_why() {
+    let (_dir, rig) = setup(|_| {}).await;
+    let s = |v: &str| Some(Secret::new(v.into()));
+    let Reply::RbwItem { item } = rbw(&rig, "c1", Select::EditText).await else { panic!() };
+    let login = RbwLogin { username: None, password: s("pw-ünï-😀"), totp: None, uris: None };
+    assert_eq!(
+        (item.data, item.notes, item.fields, item.history),
+        (RbwData::Login(login), s("line 1\nline 2"), vec![], vec![])
+    );
+    let asked = rig.host.world().confirmed[0].clone();
+    assert!(
+        asked.ends_with(&format!("(dybw edit) to read its current password and notes, to edit them of the item {C1}?")),
+        "{asked}"
+    );
+    assert_eq!(rig.host.world().offered, [false], "never \"always\"");
+    // The same without the rbw flag; a note; another type is refused.
+    rig.host.allow();
+    let Reply::RbwItem { item } = rig.agent.dispatch(get_op("n1", Select::EditText)).await else { panic!() };
+    assert_eq!((item.data, item.notes), (RbwData::SecureNote, s("the note's text")));
+    assert_eq!(rbw(&rig, "k1", Select::EditText).await, err(AgentError::WriteRefused("rbw-type".into())));
+}
+
+fn edit_text(needle: &str, text: &str) -> Op {
+    let Op::Edit { profile, needle, user, folder, ask, .. } = edit_op(needle, &[]) else { panic!() };
+    Op::Edit { profile, needle, user, folder, ask, ignorecase: false, password: None, notes: None, text: sealed(text) }
+}
+
+#[tokio::test]
+async fn rbw_edit_text_from_stdin_is_split_by_the_items_type_in_the_agent() {
+    let (_dir, rig) = setup(|_| {}).await;
+    rig.host.allow();
+    assert_eq!(rig.agent.dispatch(edit_text("x1", "pw3\n\nn3\n# c\n")).await, Reply::Done);
+    let confirm = rig.host.world().confirmed[0].clone();
+    assert!(confirm.contains("to change the password and the notes of the item \"Plain\""), "{confirm}");
+    assert_eq!(text(rbw(&rig, "x1", Select::Password).await), "pw3");
+    assert_eq!(text(rbw(&rig, "x1", field("notes")).await), "n3");
+    rig.host.allow();
+    assert_eq!(rig.agent.dispatch(edit_text("n1", "a\n\nb\n")).await, Reply::Done);
+    assert_eq!(text(rbw(&rig, "n1", Select::Password).await), "a\n\nb", "a note's whole text");
+    let asked = rig.host.world().confirmed.len();
+    assert_eq!(rig.agent.dispatch(edit_text("k1", "x")).await, err(AgentError::WriteRefused("rbw-type".into())));
+    assert_eq!(
+        rig.agent.dispatch(edit_text("x1", "\n# nothing\n")).await,
+        err(AgentError::WriteRefused("empty".into()))
+    );
+    assert_eq!(rig.host.world().confirmed.len(), asked, "refused before any question");
 }

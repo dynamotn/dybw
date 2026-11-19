@@ -9,7 +9,7 @@
 use dybw_core::totp::TotpKey;
 use dybw_core::vault::item::{Data, FieldName, Item, Text};
 use dybw_proto::{
-    AgentError, RbwCard, RbwData, RbwField, RbwIdentity, RbwItem, RbwLogin, RbwPast, RbwSshKey, RbwUri, Secret,
+    AgentError, RbwCard, RbwData, RbwField, RbwIdentity, RbwItem, RbwLogin, RbwPast, RbwSshKey, RbwUri, Sealed, Secret,
 };
 use serde_json::Value;
 use zeroize::Zeroizing;
@@ -258,4 +258,62 @@ pub fn item(item: &Item, folder: Option<String>) -> RbwItem {
             })
             .collect(),
     }
+}
+
+/// rbw's `edit` text to start from: a login's password, a note's notes, and the notes; any other type is refused.
+pub fn edit_text(item: &Item) -> Result<RbwItem, AgentError> {
+    let s = |t: &Text| text(t).map(|v| Secret::new(v.to_owned()));
+    let data = match &item.data {
+        Data::Login(l) => RbwData::Login(RbwLogin { username: None, password: s(&l.password), totp: None, uris: None }),
+        Data::SecureNote => RbwData::SecureNote,
+        _ => return Err(AgentError::WriteRefused("rbw-type".to_owned())),
+    };
+    let item = RbwItem {
+        id: item.id.clone(),
+        folder: None,
+        name: item.name.to_string(),
+        data,
+        fields: vec![],
+        notes: s(&item.notes),
+        history: vec![],
+    };
+    Ok(item)
+}
+
+/// rbw's `parse_editor` (`commands.rs:2629-2648`): the first line is the password; the rest, after the blank lines that
+/// follow it and without the lines starting with `#`, is the notes (`None` when empty).
+pub fn parse_editor(contents: &str) -> (Option<Zeroizing<String>>, Option<Zeroizing<String>>) {
+    let mut lines = contents.lines();
+    let password = lines.next().map(|l| Zeroizing::new(l.to_owned()));
+    // Sized once: the notes are never longer than the text, so they are never moved while they grow.
+    let mut notes = Zeroizing::new(String::with_capacity(contents.len() + 1));
+    for line in lines.skip_while(|l| l.is_empty()).filter(|l| !l.starts_with('#')) {
+        notes.push_str(line);
+        notes.push('\n');
+    }
+    while notes.ends_with('\n') {
+        notes.pop();
+    }
+    (password, (!notes.is_empty()).then_some(notes))
+}
+
+/// rbw's edit text as the values a write sends: a login's password (empty when none) and notes (empty clears them), a
+/// note's notes (read after a blank first line, as rbw, `commands.rs:1840-1841`). `None` when it holds neither a password
+/// nor notes: nothing is written then (the owner's rule; rbw would save an empty password).
+pub fn edit_values(text: &str, login: bool) -> Option<(Option<Sealed>, Sealed)> {
+    let (password, notes) = if login {
+        parse_editor(text)
+    } else {
+        let mut padded = Zeroizing::new(String::with_capacity(text.len() + 2));
+        padded.push('\n');
+        padded.push_str(text);
+        padded.push('\n');
+        (None, parse_editor(&padded).1)
+    };
+    let password = password.filter(|p| !p.is_empty());
+    if password.is_none() && notes.is_none() {
+        return None;
+    }
+    let sealed = |v: Option<Zeroizing<String>>| Sealed::new(v.map(|mut v| std::mem::take(&mut *v)).unwrap_or_default());
+    Some((login.then(|| sealed(password)), sealed(notes)))
 }

@@ -6,7 +6,7 @@
 use std::ffi::OsString;
 use std::fs::{DirBuilder, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -38,6 +38,7 @@ impl Scratch {
             .map(PathBuf::from)
             .find(|p| p.is_absolute())
             .unwrap_or_else(|| PathBuf::from("/tmp"));
+        sweep(&base, env.uid);
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
         let mut last = None;
         for n in 0..16 {
@@ -49,6 +50,22 @@ impl Scratch {
         }
         let why = last.map(|e| e.to_string()).unwrap_or_default();
         Err(Fail::Log(format!("cannot make a private directory under {}: {why}", base.display())))
+    }
+}
+
+/// Wipe and remove the scratch directories under `base` that this user's earlier runs left (a `SIGKILL`, a crash):
+/// a directory of this uid named `rbw-edit.<pid>.…` whose process is gone.
+fn sweep(base: &Path, uid: u32) {
+    for entry in std::fs::read_dir(base).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let pid = name.to_str().and_then(|n| n.strip_prefix("rbw-edit.")).and_then(|n| n.split('.').next());
+        let Some(pid) = pid.and_then(|p| p.parse().ok()).and_then(rustix::process::Pid::from_raw) else { continue };
+        let path = entry.path();
+        let ours = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && m.uid() == uid);
+        if ours && rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH) {
+            wipe(&path);
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
 }
 
@@ -115,6 +132,19 @@ pub(crate) fn edit(env: &Env, contents: &str, help: &str) -> Result<Zeroizing<St
         return (env.stdin)().map_err(|e| Fail::Log(format!("failed to read from stdin: {e}")));
     }
     let (var, editor) = editor_of(env);
+    // A signal that would end this process while the file exists is held off until it is wiped and removed (when
+    // `edited` returns, dropping the scratch directory), then ends the command (exit 128 + the signal).
+    let held =
+        dybw_peer::signals::Deferred::new().map_err(failed("cannot hold off signals for", Path::new("the editor")))?;
+    let text = edited(env, var, &editor, contents, help);
+    match held.caught() {
+        Some(sig) => Err(Fail::Signal(sig)),
+        None => text,
+    }
+}
+
+/// The editor run on `contents` and `help` in a scratch directory, wiped and removed when this returns.
+fn edited(env: &Env, var: &str, editor: &OsString, contents: &str, help: &str) -> Result<Zeroizing<String>, Fail> {
     let scratch = Scratch::new(env)?;
     let file = scratch.0.join("rbw");
     let written = OpenOptions::new()
@@ -124,13 +154,13 @@ pub(crate) fn edit(env: &Env, contents: &str, help: &str) -> Result<Zeroizing<St
         .open(&file)
         .and_then(|mut f| f.write_all(contents.as_bytes()).and_then(|()| f.write_all(help.as_bytes())));
     written.map_err(failed("cannot write", &file))?;
-    let (cmd, args) = if needs_shell(&editor) {
+    let (cmd, args) = if needs_shell(editor) {
         let mut line = editor.clone();
         line.push(" ");
         line.push(&file);
         (PathBuf::from("/bin/sh"), vec![OsString::from("-c"), line])
     } else {
-        let path = PathBuf::from(&editor);
+        let path = PathBuf::from(editor);
         let name = path
             .file_name()
             .ok_or_else(|| Fail::Log(format!("invalid value for ${var}: {}", editor.to_string_lossy())))?;
@@ -163,19 +193,6 @@ pub(crate) fn edit(env: &Env, contents: &str, help: &str) -> Result<Zeroizing<St
     Ok(Zeroizing::new(text))
 }
 
-/// rbw's `parse_editor`: the first line is the password; the rest, after the blank lines that follow it and without
-/// the lines starting with `#`, is the notes (`None` when empty).
-pub(crate) fn parse(contents: &str) -> (Option<Zeroizing<String>>, Option<Zeroizing<String>>) {
-    let mut lines = contents.lines();
-    let password = lines.next().map(|l| Zeroizing::new(l.to_owned()));
-    // Sized once: the notes are never longer than the text, so they are never moved while they grow.
-    let mut notes = Zeroizing::new(String::with_capacity(contents.len() + 1));
-    for line in lines.skip_while(|l| l.is_empty()).filter(|l| !l.starts_with('#')) {
-        notes.push_str(line);
-        notes.push('\n');
-    }
-    while notes.ends_with('\n') {
-        notes.pop();
-    }
-    (password, (!notes.is_empty()).then_some(notes))
-}
+/// rbw's `parse_editor`, shared with the agent (which splits an edit text read from stdin).
+#[cfg(test)]
+pub(crate) use dybw_agent::rbw_view::parse_editor as parse;

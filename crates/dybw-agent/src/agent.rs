@@ -368,12 +368,9 @@ impl Agent {
                 let write = Write::Add { name, user, uris, folder, ask: vec![], generate, given: vec![] };
                 self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
             }
-            Op::Edit { profile, needle, user, folder, ask, ignorecase, password, notes } => {
-                let write = Write::Edit {
-                    find: Lookup { needle, user, folder, ignorecase },
-                    ask,
-                    given: given(password, notes),
-                };
+            Op::Edit { profile, needle, user, folder, ask, ignorecase, password, notes, text } => {
+                let find = Lookup { needle, user, folder, ignorecase };
+                let write = Write::Edit { find, ask, given: given(password, notes), text };
                 self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
             }
             Op::Remove { profile, needle, user, folder, ignorecase } => {
@@ -765,6 +762,7 @@ mod tests {
                 ignorecase: false,
                 password: None,
                 notes: None,
+                text: None,
             },
             Op::Generate {
                 profile: None,

@@ -97,6 +97,7 @@ pub(crate) fn edit_op(needle: &str, ask: &[Part]) -> Op {
         ignorecase: false,
         password: None,
         notes: None,
+        text: None,
     }
 }
 
@@ -561,6 +562,7 @@ async fn an_organization_item_is_written_with_its_key_and_a_read_only_one_is_ref
         ignorecase: false,
         password: None,
         notes: None,
+        text: None,
     };
     rig.host.allow();
     rig.host.answer(Answer::Text("org notes"));

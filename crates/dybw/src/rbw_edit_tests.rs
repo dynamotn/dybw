@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 use super::*;
 use crate::rbw_edit::{HELP_NOTES, HELP_PW, parse};
-use crate::rbw_out_tests::{card_for_edit, edit_reply, login_for_edit, note_item, raw_get, rbw_run};
+use crate::rbw_out_tests::{card_for_edit, edit_read, edit_reply, login_for_edit, note_item, rbw_run};
 use crate::tests::{Act, s};
 
 /// A scratch place for the editors' notes, on the file system of the scratch directory (hard links work).
@@ -99,30 +99,32 @@ fn edit_starts_from_the_current_password_and_notes_and_sends_the_new_ones() {
         with_editor(vec![edit_reply(login_for_edit()), Act::Reply(Reply::Done)], &ed, &["edit", "n", "-i"]);
     assert_eq!(result, (0, s(""), s("")));
     assert_eq!(read(w.path(), "seen"), format!("pw\n\nline 1\nline 2\n{HELP_PW}"));
-    let edit = |password, notes| Op::Edit {
+    // Written to the item the user was asked about, by its id: the needle is not looked up again.
+    let edit = |id: &str, password, notes| Op::Edit {
         profile: None,
-        needle: s("n"),
+        needle: s(id),
         user: None,
         folder: None,
         ask: vec![],
-        ignorecase: true,
+        ignorecase: false,
         password,
         notes,
+        text: None,
     };
-    assert_eq!(ops, [raw_get("n", true), edit(sealed("pw2"), sealed("new notes"))]);
+    assert_eq!(ops, [edit_read("n", true), edit("c1", sealed("pw2"), sealed("new notes"))]);
     assert!(std::fs::read(w.path().join("link")).unwrap().iter().all(|b| *b == 0));
     assert!(!left_where_the_editor_was(w.path()));
     // Notes removed: sent empty, which clears them, as rbw's `None` does.
     let ed = editor(w.path(), "ed", "printf 'pw\\n' > \"$f\"");
     let (_, ops) = with_editor(vec![edit_reply(login_for_edit()), Act::Reply(Reply::Done)], &ed, &["edit", "n", "-i"]);
-    assert_eq!(ops[1], edit(sealed("pw"), sealed("")));
+    assert_eq!(ops[1], edit("c1", sealed("pw"), sealed("")));
     // A note: only its notes, read after a blank first line as rbw does; its old text and rbw's help to start from.
     let ed = editor(w.path(), "ed", &format!("{RECORD}\nprintf 'new 1\\n\\nnew 2\\n# c\\n' > \"$f\""));
     let (result, ops) =
         with_editor(vec![edit_reply(note_item(Some("old"))), Act::Reply(Reply::Done)], &ed, &["edit", "n", "-i"]);
     assert_eq!(result.0, 0);
     assert_eq!(read(w.path(), "seen"), format!("old\n{HELP_NOTES}"));
-    assert_eq!(ops[1], edit(None, sealed("new 1\n\nnew 2")));
+    assert_eq!(ops[1], edit("n1", None, sealed("new 1\n\nnew 2")));
     let (_, ops) = with_editor(vec![edit_reply(note_item(None)), Act::Reply(Reply::Done)], &ed, &["edit", "n", "-i"]);
     assert_eq!(read(w.path(), "seen"), format!("\n{HELP_NOTES}"), "no notes: an empty line");
     assert_eq!(ops.len(), 2);
@@ -134,7 +136,7 @@ fn edit_of_another_type_refuses_before_any_editor_runs() {
     let ed = editor(w.path(), "ed", "touch \"$W/ran\"");
     let (result, ops) = with_editor(vec![edit_reply(card_for_edit())], &ed, &["edit", "n"]);
     assert_eq!(result, (1, s(""), s("rbw edit: modifications are only supported for login and note entries\n")));
-    assert_eq!(ops, [raw_get("n", false)]);
+    assert_eq!(ops, [edit_read("n", false)]);
     assert!(!w.path().join("ran").exists());
 }
 
@@ -293,4 +295,93 @@ fn the_text_is_parsed_as_rbw_parses_it() {
     assert_eq!(parsed("pw\n\n\na\n\nb\n# c\n\n"), (some("pw"), some("a\n\nb")));
     assert_eq!(parsed("pw\nnotes right after\r\n"), (some("pw"), some("notes right after")));
     assert_eq!(parsed(&format!("pw\n{HELP_PW}")), (some("pw"), None), "rbw's help is not kept");
+}
+
+#[test]
+fn edit_with_piped_text_sends_it_to_the_agent_and_reads_no_value() {
+    let w = work();
+    let ed = editor(w.path(), "ed", "touch \"$W/ran\"");
+    let piped = |env: &mut Env| {
+        env.stdin_tty = false;
+        env.stdin = Box::new(|| Ok(Zeroizing::new(s("pw\n\nnotes\n"))));
+    };
+    let visual = [("VISUAL", ed.display().to_string())];
+    let (result, ops) = rbw_run(vec![Act::Reply(Reply::Done)], &visual, &["edit", "n", "-i"], piped);
+    assert_eq!(result, (0, s(""), s("")));
+    let text = Some(Sealed::new(s("pw\n\nnotes\n")));
+    let want = Op::Edit {
+        profile: None,
+        needle: s("n"),
+        user: None,
+        folder: None,
+        ask: vec![],
+        ignorecase: true,
+        password: None,
+        notes: None,
+        text,
+    };
+    assert_eq!(ops, [want]);
+    assert!(!w.path().join("ran").exists(), "no editor");
+    // The agent's refusals in rbw's words; a lookup that fails as for any command.
+    let refused = |code: &str| Act::Reply(Reply::Error { error: dybw_proto::AgentError::WriteRefused(s(code)) });
+    for (act, err) in [
+        (refused("rbw-type"), "rbw edit: modifications are only supported for login and note entries\n"),
+        (refused("empty"), "rbw edit: the editor left nothing to save; nothing was changed\n"),
+        (refused("read-only"), "rbw edit: the write was refused (read-only); nothing was written\n"),
+        (
+            Act::Reply(Reply::Error { error: dybw_proto::AgentError::NotFound }),
+            "rbw edit: couldn't find entry for 'n': no entry found\n",
+        ),
+    ] {
+        assert_eq!(rbw_run(vec![act], &visual, &["edit", "n"], piped).0, (1, s(""), s(err)));
+    }
+    let broken = |env: &mut Env| {
+        env.stdin_tty = false;
+        env.stdin = Box::new(|| Err(std::io::ErrorKind::BrokenPipe.into()));
+    };
+    assert_eq!(rbw_run(vec![], &[], &["edit", "n"], broken).0.2, "rbw edit: failed to read from stdin: broken pipe\n");
+    // A refusal of the read for the editor, in rbw's words.
+    assert_eq!(
+        rbw_run(vec![refused("rbw-type")], &visual, &["edit", "n"], |_| {}).0.2,
+        "rbw edit: modifications are only supported for login and note entries\n"
+    );
+}
+
+#[test]
+fn a_termination_signal_while_the_editor_runs_wipes_the_file_first_then_ends_with_its_code() {
+    let w = work();
+    // The editor's parent is this process: the signal reaches it while the file exists.
+    let ed = editor(w.path(), "ed", &format!("{RECORD}\nprintf 'pw\\n' > \"$f\"\nkill -INT $PPID\nsleep 0.2"));
+    let (result, ops) = with_editor(vec![], &ed, &["add", "n"]);
+    assert_eq!(result, (130, s(""), s("")));
+    assert!(ops.is_empty(), "nothing written");
+    assert!(!left_where_the_editor_was(w.path()));
+    assert!(std::fs::read(w.path().join("link")).unwrap().iter().all(|b| *b == 0), "wiped");
+}
+
+#[test]
+fn scratch_directories_a_killed_run_left_are_wiped_and_removed_by_the_next() {
+    let w = work();
+    let base = w.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    let stale = base.join(format!("rbw-edit.{dead}.1.0"));
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("rbw"), "secret").unwrap();
+    std::fs::hard_link(stale.join("rbw"), w.path().join("kept")).unwrap();
+    let alive = base.join(format!("rbw-edit.{}.1.0", std::process::id()));
+    let odd = base.join("rbw-edit.x");
+    let file = base.join(format!("rbw-edit.{dead}.2.0"));
+    for d in [&alive, &odd] {
+        std::fs::create_dir(d).unwrap();
+    }
+    std::fs::write(&file, "not a directory").unwrap();
+    let ed = editor(w.path(), "ed", "exit 1");
+    let vars = [("VISUAL", ed.display().to_string()), ("XDG_RUNTIME_DIR", base.display().to_string())];
+    assert_eq!(rbw_run(vec![], &vars, &["add", "n"], |_| {}).0.0, 1);
+    assert!(!stale.exists(), "a dead run's directory is gone");
+    assert_eq!(std::fs::read(w.path().join("kept")).unwrap(), [0; 6], "wiped first");
+    assert!(alive.exists() && odd.exists() && file.exists(), "a live run's, an odd name and a file are kept");
 }

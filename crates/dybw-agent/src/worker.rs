@@ -428,6 +428,7 @@ fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Sc
         (_, Some(Select::Field(name))) => ("get", format!("its field \"{}\"", tidy(name))),
         (_, Some(Select::Full)) => ("get", "the full item (every value)".to_owned()),
         (_, Some(Select::Raw)) => ("get", "the raw item as JSON".to_owned()),
+        (_, Some(Select::EditText)) => ("edit", "its current password and notes, to edit them".to_owned()),
         (_, Some(_)) => ("get", "its main value (password, notes, number or public key)".to_owned()),
         (Read::History, None) => ("history", "its password history".to_owned()),
         (_, None) => ("code", "a TOTP code".to_owned()),
@@ -510,7 +511,7 @@ pub const NEXT_UNDER: u64 = 5;
 /// What a request reads: the whole item, its raw JSON and the history are never covered by a grant.
 fn access_of(read: &Read) -> Access {
     match (read, read.select()) {
-        (Read::History, _) | (_, Some(Select::Full | Select::Raw)) => Access::Whole,
+        (Read::History, _) | (_, Some(Select::Full | Select::Raw | Select::EditText)) => Access::Whole,
         _ => Access::Value,
     }
 }
@@ -523,6 +524,7 @@ pub(crate) fn op_of(read: &Read) -> (&'static str, Option<&'static str>) {
         (_, Some(Select::Full)) => ("get", Some("full")),
         (_, Some(Select::Raw)) => ("get", Some("raw")),
         (_, Some(Select::ListFields)) => ("get", Some("list-fields")),
+        (_, Some(Select::EditText)) => ("edit", Some("current")),
         (_, Some(Select::Password)) => ("get", Some("password")),
         (_, None) => ("code", None),
     }

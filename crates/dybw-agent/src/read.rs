@@ -526,6 +526,8 @@ pub fn value(vault: &UnlockedVault, id: &str, select: &Select) -> Result<Reply, 
         Select::Raw => Ok(Reply::Raw { json: raw(&item()?) }),
         // Names only: the item is not opened.
         Select::ListFields => field_names(vault, id),
+        // rbw's alone, whichever view asked.
+        Select::EditText => rbw_value(vault, id, None, select, 0),
     }
 }
 
@@ -543,6 +545,7 @@ pub fn rbw_value(
     match select {
         Select::Password => rbw_view::short(&item_of(vault, id)?).map(value),
         Select::Field(name) => Ok(rbw_view::field(&item_of(vault, id)?, name, now)?.map_or(Reply::Done, value)),
+        Select::EditText => Ok(Reply::RbwItem { item: Box::new(rbw_view::edit_text(&item_of(vault, id)?)?) }),
         Select::Full | Select::Raw => {
             Ok(Reply::RbwItem { item: Box::new(rbw_view::item(&item_of(vault, id)?, folder.map(str::to_owned))) })
         }

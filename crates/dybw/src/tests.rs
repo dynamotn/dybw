@@ -287,6 +287,7 @@ fn every_command_maps_to_its_op() {
                 ignorecase: false,
                 password: None,
                 notes: None,
+                text: None,
             },
         ),
         (
@@ -301,6 +302,7 @@ fn every_command_maps_to_its_op() {
                 ignorecase: false,
                 password: None,
                 notes: None,
+                text: None,
             },
         ),
         (

@@ -585,24 +585,21 @@ fn unlock(env: &Env) -> Result<u8, Fail> {
     done(ask_started(env, Op::Unlock { profile: profile(env) })?)
 }
 
+const NOTHING: &str = "the editor left nothing to save; nothing was changed";
+const OTHER_TYPE: &str = "modifications are only supported for login and note entries";
+
 /// The edited text as the values a write sends; refused when it holds nothing (nothing is written).
 fn edited(text: &str, login: bool) -> Result<(Option<Sealed>, Sealed), Fail> {
-    let (password, notes) = if login {
-        rbw_edit::parse(text)
-    } else {
-        // rbw puts a blank line first, read as the password (`commands.rs:1840-1841`).
-        let mut padded = Zeroizing::new(String::with_capacity(text.len() + 2));
-        padded.push('\n');
-        padded.push_str(text);
-        padded.push('\n');
-        (None, rbw_edit::parse(&padded).1)
-    };
-    let password = password.filter(|p| !p.is_empty());
-    if password.is_none() && notes.is_none() {
-        return Err(Fail::Log("the editor left nothing to save; nothing was changed".into()));
+    dybw_agent::rbw_view::edit_values(text, login).ok_or_else(|| Fail::Log(NOTHING.into()))
+}
+
+/// The agent's refusals of an rbw edit, in rbw's words.
+fn edit_words(fail: Fail) -> Fail {
+    match fail {
+        Fail::Agent(AgentError::WriteRefused(code)) if code == "rbw-type" => Fail::Log(OTHER_TYPE.into()),
+        Fail::Agent(AgentError::WriteRefused(code)) if code == "empty" => Fail::Log(NOTHING.into()),
+        other => other,
     }
-    let sealed = |v: Option<Zeroizing<String>>| Sealed::new(v.map(|mut v| std::mem::take(&mut *v)).unwrap_or_default());
-    Ok((login.then(|| sealed(password)), sealed(notes)))
 }
 
 /// rbw's `add` (`commands.rs:1558-1655`): the password and notes from the editor, sent with the write.
@@ -614,21 +611,22 @@ fn add(env: &Env, name: String, user: Option<String>, uris: Vec<String>, folder:
     done(ask_started(env, op)?)
 }
 
-/// rbw's `edit` (`commands.rs:1753-1876`): the current password and notes (one value read, through the gate) are
-/// the editor's text; a login's new password and notes, or a note's notes, are sent with the write.
+/// rbw's `edit` (`commands.rs:1753-1876`). With stdin not a terminal, its text goes to the agent, which splits it by
+/// the item's type: no value is read. Otherwise the current password and notes (one read through the gate, which
+/// says why) are the editor's text, and the new ones are written to that item, by its id.
 fn edit(env: &Env, find: FindArgs) -> Result<u8, Fail> {
     let FindArgs { needle, user, folder, ignorecase } = find;
     let desc = desc(&needle, user.as_deref());
-    let read = Op::Get {
-        profile: profile(env),
-        needle: needle.clone(),
-        user: user.clone(),
-        folder: folder.clone(),
-        ignorecase,
-        select: Select::Raw,
-        rbw: true,
-    };
-    let Reply::RbwItem { item } = ask_started(env, read).map_err(|e| found(&desc, e))? else {
+    let profile = profile(env);
+    if !env.stdin_tty {
+        let mut text = (env.stdin)().map_err(|e| Fail::Log(format!("failed to read from stdin: {e}")))?;
+        let text = Some(Sealed::new(std::mem::take(&mut *text)));
+        let op = Op::Edit { profile, needle, user, folder, ask: vec![], ignorecase, password: None, notes: None, text };
+        return done(ask_started(env, op).map_err(|e| edit_words(found(&desc, e)))?);
+    }
+    let read =
+        Op::Get { profile: profile.clone(), needle, user, folder, ignorecase, select: Select::EditText, rbw: true };
+    let Reply::RbwItem { item } = ask_started(env, read).map_err(|e| edit_words(found(&desc, e)))? else {
         return Err(Fail::Unexpected);
     };
     let mut text = Zeroizing::new(String::new());
@@ -648,14 +646,25 @@ fn edit(env: &Env, find: FindArgs) -> Result<u8, Fail> {
             text.push('\n');
             (HELP_NOTES, false)
         }
-        _ => return Err(Fail::Log("modifications are only supported for login and note entries".into())),
+        _ => return Err(Fail::Log(OTHER_TYPE.into())),
     };
+    let id = item.id.clone();
     drop(item);
     let new = rbw_edit::edit(env, &text, help)?;
     drop(text);
     let (password, notes) = edited(&new, login)?;
-    let op =
-        Op::Edit { profile: profile(env), needle, user, folder, ask: vec![], ignorecase, password, notes: Some(notes) };
+    // The item the user was asked about, by its id: the needle is not looked up again.
+    let op = Op::Edit {
+        profile,
+        needle: id,
+        user: None,
+        folder: None,
+        ask: vec![],
+        ignorecase: false,
+        password,
+        notes: Some(notes),
+        text: None,
+    };
     done(ask_started(env, op)?)
 }
 
@@ -791,6 +800,8 @@ where
     let name = opt.name();
     match run_opt(opt, env, out, err) {
         Ok(code) => code,
+        // Ended by a signal held off while a secret file existed: the shell's code for it.
+        Err(Fail::Signal(sig)) => u8::try_from(128 + sig).unwrap_or(1),
         Err(fail) => {
             let fail = match fail {
                 // rbw's word for a code of a login without a key (`commands.rs:1543-1553`).

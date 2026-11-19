@@ -129,6 +129,9 @@ pub enum Select {
     Full,
     Raw,
     ListFields,
+    /// rbw's `edit`: a login's password and notes, or a note's notes, to fill its editor (an [`RbwItem`] holding only
+    /// those); another type is refused (`WriteRefused("rbw-type")`).
+    EditText,
 }
 
 /// A part of a login whose new value the agent asks for in its own pinentry: a new value never travels over the
@@ -291,6 +294,10 @@ pub enum Op {
         password: Option<Sealed>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notes: Option<Sealed>,
+        /// rbw's edit text read from stdin: the agent splits it by the item's type as rbw does (a login's first line is
+        /// the password, the rest the notes; a note's whole text its notes); nothing to save is `WriteRefused("empty")`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<Sealed>,
     },
     /// Create a personal login whose password the agent generates: the password never travels over the socket.
     Generate {
@@ -848,6 +855,15 @@ mod tests {
                 select: Select::ListFields,
                 rbw: false,
             },
+            Op::Get {
+                profile: p(),
+                needle: s("n"),
+                user: None,
+                folder: None,
+                ignorecase: false,
+                select: Select::EditText,
+                rbw: true,
+            },
             Op::History { profile: p(), needle: s("n"), user: None, folder: Some(s("f")), ignorecase: true },
             Op::Code { profile: p(), needle: s("n"), user: Some(s("u")), folder: None, ignorecase: true, next: true },
             Op::Add {
@@ -869,6 +885,7 @@ mod tests {
                 ignorecase: true,
                 password: None,
                 notes: Some(Sealed::new(s("a\nb"))),
+                text: Some(Sealed::new(s("pw\n\nn"))),
             },
             Op::Generate {
                 profile: p(),
@@ -1105,6 +1122,7 @@ mod tests {
             ignorecase: false,
             password: None,
             notes: None,
+            text: None,
         };
         let frame = encode(&Request::new(edit.clone())).unwrap();
         assert!(!std::str::from_utf8(&frame[4..]).unwrap().contains("password"));

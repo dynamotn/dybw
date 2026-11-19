@@ -296,6 +296,9 @@ enum Fail {
     Output(#[from] std::io::Error),
     #[error("clipboard: {0}")]
     Clip(#[from] clip::Error),
+    /// A termination signal arrived while a secret file existed: it was wiped first, then the command ends.
+    #[error("interrupted by signal {0}")]
+    Signal(i32),
 }
 
 fn agent_text(e: &AgentError) -> String {
@@ -453,6 +456,7 @@ fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, er
                 ignorecase: false,
                 password: None,
                 notes: None,
+                text: None,
             };
             done(ask_started(env, op)?)
         }

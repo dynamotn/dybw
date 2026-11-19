@@ -37,8 +37,9 @@ pub enum Write {
         generate: Option<(Charset, u32)>,
         given: Vec<(Part, Sealed)>,
     },
-    /// New values for `ask` (asked for) and `given` (sent) of one item: the password, the notes.
-    Edit { find: Lookup, ask: Vec<Part>, given: Vec<(Part, Sealed)> },
+    /// New values for `ask` (asked for) and `given` (sent) of one item: the password, the notes; or rbw's edit `text`,
+    /// split by the item's type once it is found.
+    Edit { find: Lookup, ask: Vec<Part>, given: Vec<(Part, Sealed)>, text: Option<Sealed> },
     /// Move one item to the trash.
     Remove { find: Lookup },
 }
@@ -81,6 +82,8 @@ struct Planned {
     folder: Option<Result<String, String>>,
     /// The namespaces that mark the item a remove is about.
     markers: Vec<String>,
+    /// The values the client sent (an edit `text` split by the item's type).
+    given: Vec<(Part, Sealed)>,
 }
 
 /// A write refused before anything is sent, by its fixed code.
@@ -105,6 +108,7 @@ fn plan(v: &UnlockedVault, write: &Write) -> Result<Planned, AgentError> {
         found: Some(found),
         folder: None,
         markers,
+        given: write.given().to_vec(),
     };
     match write {
         Write::Add { generate: Some((_, n)), .. } if !(1..=pwgen::MAX_LENGTH).contains(n) => Err(refused_as("length")),
@@ -115,10 +119,26 @@ fn plan(v: &UnlockedVault, write: &Write) -> Result<Planned, AgentError> {
             name: name.clone(),
             folder: folder.as_deref().map(|f| read::folder_id(v, f).map_err(|_| f.to_owned())),
             markers: Vec::new(),
+            given: write.given().to_vec(),
         }),
         // The core edits the name, notes, user, password, URIs and folder: no TOTP key.
         Write::Edit { ask, .. } if ask.contains(&Part::Totp) => Err(refused_as("totp-edit")),
-        Write::Edit { ask, given, .. } if ask.is_empty() && given.is_empty() => Err(refused_as("nothing-to-change")),
+        Write::Edit { ask, given, text: None, .. } if ask.is_empty() && given.is_empty() => {
+            Err(refused_as("nothing-to-change"))
+        }
+        Write::Edit { find, text: Some(text), .. } => {
+            let found = read::find(v, find)?;
+            let kind = read::cipher(v, &found.id).and_then(|c| c.get("type")).and_then(Value::as_u64);
+            if !matches!(kind, Some(1 | 2)) {
+                return Err(refused_as("rbw-type"));
+            }
+            let (password, notes) =
+                crate::rbw_view::edit_values(text.expose(), kind == Some(1)).ok_or_else(|| refused_as("empty"))?;
+            let mut planned = planned(found, Vec::new());
+            planned.given.extend(password.map(|p| (Part::Password, p)));
+            planned.given.push((Part::Notes, notes));
+            Ok(planned)
+        }
         Write::Edit { find, .. } => Ok(planned(read::find(v, find)?, Vec::new())),
         Write::Remove { find } => {
             let found = read::find(v, find)?;
@@ -149,8 +169,8 @@ fn question(ctx: &Ctx, caller: &Caller, write: &Write, planned: &Planned) -> Str
             let made = generate.map(|(_, n)| format!(" and a generated password ({n} {})", unit(generate)));
             format!("add the login \"{name}\"{user}{folder}{}{}", uri_list(uris), made.unwrap_or_default())
         }
-        Write::Edit { ask, given, .. } => {
-            let parts: Vec<_> = given.iter().map(|(p, _)| p).chain(ask).map(|p| label(*p).1).collect();
+        Write::Edit { ask, .. } => {
+            let parts: Vec<_> = planned.given.iter().map(|(p, _)| p).chain(ask).map(|p| label(*p).1).collect();
             format!("change {} of the item {item}", parts.join(" and "))
         }
         Write::Remove { .. } if !planned.markers.is_empty() => format!(
@@ -191,12 +211,12 @@ fn uri_list(uris: &[String]) -> String {
 async fn values<H: Host>(
     host: &H,
     ctx: &Ctx,
-    name: &str,
+    planned: &Planned,
     write: &Write,
 ) -> Result<Vec<(Part, Zeroizing<String>)>, AgentError> {
-    let ask = write.asked();
+    let (ask, name) = (write.asked(), &planned.name);
     let mut out = Vec::with_capacity(ask.len() + 3);
-    out.extend(write.given().iter().map(|(p, v)| (*p, Zeroizing::new(v.expose().to_owned()))));
+    out.extend(planned.given.iter().map(|(p, v)| (*p, Zeroizing::new(v.expose().to_owned()))));
     if let Write::Add { generate: Some((charset, length)), .. } = write {
         // The length was checked in the plan, and the OS random source does not fail.
         out.push((Part::Password, pwgen::generate(&OsRandom, *charset, *length).ok().ok_or(AgentError::Internal)?));
@@ -367,7 +387,7 @@ pub(super) async fn write<H: Host>(
         {
             return error(e);
         }
-        match values(host, ctx, &planned.name, &write).await {
+        match values(host, ctx, &planned, &write).await {
             Ok(values) => values,
             Err(e @ (AgentError::Totp(_) | AgentError::Internal)) => return end(Verdict::Failed, e),
             Err(e) => return end(Verdict::Declined, e),

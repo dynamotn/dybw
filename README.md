@@ -135,10 +135,13 @@ only says "see the agent log" is explained there.
 - `rbw add` and `rbw edit` open `$VISUAL`, else `$EDITOR`, else `/usr/bin/vim`, as rbw: the first line is the
   password, the rest the notes (`edit` of a note: the notes). The file is in a new 0700 directory under
   `$XDG_RUNTIME_DIR`, else `$TMPDIR`, else `/tmp`; whatever happens it is overwritten with zeros, then it and the
-  directory are removed. With stdin not a terminal the text is read from stdin. The text goes to the agent with the
-  write, which is still confirmed every time and refused to AI-class and unknown callers. An editor that fails, or a
-  text with neither a password nor notes, writes nothing. `edit` first reads the item (one confirmation, as
-  `get --raw`) to fill the editor. `rbw generate <len> <name>` prints the password, as rbw, then saves that one as a
+  directory are removed (Ctrl-C, SIGHUP, SIGTERM or SIGQUIT while the editor runs are held until then, and end the
+  command with 128 + the signal; a directory left by a killed run is wiped and removed by the next one). With stdin
+  not a terminal the text is read from stdin (for `edit`, the agent splits it by the item's type: no value is read).
+  The text goes to the agent with the write, which is still confirmed every time and refused to AI-class and unknown
+  callers. An editor that fails, or a text with neither a password nor notes, writes nothing. `edit` in a terminal
+  first reads the item's password and notes (one confirmation that says so) to fill the editor, then writes to that
+  item by its id. `rbw generate <len> <name>` prints the password, as rbw, then saves that one as a
   new login (made by the shim and sent with the confirmed write).
 - `rbw purge` locks the profile and deletes its copy of the vault (`~/.cache/dybw/profiles/<profile>`) once you
   confirm it in the pinentry; the API key, the device id, the policy and the KDF/security pins stay. `rbw unlock` logs

@@ -637,6 +637,14 @@ pub(crate) fn card_for_edit() -> RbwItem {
     RbwItem { data: RbwData::Card(card), ..login_item() }
 }
 
-pub(crate) fn raw_get(needle: &str, ignorecase: bool) -> Op {
-    Op::Get { profile: None, needle: s(needle), user: None, folder: None, ignorecase, select: Select::Raw, rbw: true }
+pub(crate) fn edit_read(needle: &str, ignorecase: bool) -> Op {
+    Op::Get {
+        profile: None,
+        needle: s(needle),
+        user: None,
+        folder: None,
+        ignorecase,
+        select: Select::EditText,
+        rbw: true,
+    }
 }
