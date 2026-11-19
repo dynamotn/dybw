@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use dybw_native::fsutil::User;
-use dybw_proto::{AgentError, Op, Part, PolicyAction, Reply, Sealed, Select, Target};
+use dybw_proto::{AgentError, Field, Op, Part, PolicyAction, Reply, Sealed, Select, Target};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
@@ -334,10 +334,13 @@ impl Agent {
                 self.each(|| Cmd::Lock).await;
                 Reply::Done
             }
-            Op::List { profile, fields, folder } => {
+            // An AI-class caller sees names and ids only (ADR 0012): never a login's URIs.
+            Op::List { profile, mut fields, folder } => {
+                fields.retain(|f| !ai || *f != Field::Uri);
                 self.on_unlocked(profile.as_deref(), Cmd::List { fields, folder }, ai).await
             }
-            Op::Search { profile, term, folder, fields } => {
+            Op::Search { profile, term, folder, mut fields } => {
+                fields.retain(|f| !ai || *f != Field::Uri);
                 self.on_unlocked(profile.as_deref(), Cmd::Search { term, folder, fields }, ai).await
             }
             Op::Get { profile, needle, user, folder, ignorecase, select, rbw } => {

@@ -342,6 +342,11 @@ async fn list_and_search_give_a_logins_uris_only_when_asked() {
     assert_eq!(found[0].uris.as_ref().map(Vec::len), Some(3));
     assert!(rig.host.world().confirmed.is_empty());
     assert_eq!(rig.agent.opens("work").await, 0);
+    // An AI-class caller gets names and ids, never a URI.
+    for op in [list(&[Field::Name, Field::Uri]), search("ünï")] {
+        let rows = items(rig.agent.dispatch_as(op, ai()).await);
+        assert!(!rows.is_empty() && rows.iter().all(|r| r.uris.is_none()), "{rows:?}");
+    }
 }
 
 fn sealed(v: &str) -> Option<Sealed> {
