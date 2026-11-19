@@ -37,6 +37,7 @@ use mac as sys;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("dybw-peer supports Linux and macOS only");
 mod raw;
+pub mod signals;
 
 #[cfg(feature = "fake")]
 pub use fake::Fake;
