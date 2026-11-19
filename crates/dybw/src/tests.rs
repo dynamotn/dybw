@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 use super::*;
 
 /// What the fake agent does with one connection.
-enum Act {
+pub(crate) enum Act {
     Reply(Reply),
     /// Read the request, close without answering.
     Close,
@@ -28,7 +28,7 @@ enum Act {
 }
 
 /// `base` is the runtime directory, `HOME` and the home of the password database.
-fn env_in(base: &Path, profile: Option<&'static str>, exe_dir: Option<PathBuf>) -> Env {
+pub(crate) fn env_in(base: &Path, profile: Option<&'static str>, exe_dir: Option<PathBuf>) -> Env {
     let base = base.to_owned();
     let base_home = base.clone();
     Env {
@@ -52,7 +52,7 @@ fn euid() -> u32 {
 }
 
 /// A short base path: a socket path is limited to about 100 bytes.
-fn base() -> tempfile::TempDir {
+pub(crate) fn base() -> tempfile::TempDir {
     let base = tempfile::Builder::new().prefix("d").tempdir_in("/tmp").unwrap();
     std::fs::create_dir(base.path().join("dybw")).unwrap();
     std::fs::set_permissions(base.path().join("dybw"), PermissionsExt::from_mode(0o700)).unwrap();
@@ -85,12 +85,12 @@ fn serve(listener: UnixListener, acts: Vec<Act>) -> JoinHandle<Vec<Op>> {
     })
 }
 
-struct Fake {
-    base: tempfile::TempDir,
+pub(crate) struct Fake {
+    pub(crate) base: tempfile::TempDir,
     agent: JoinHandle<Vec<Op>>,
 }
 
-fn fake(acts: Vec<Act>) -> Fake {
+pub(crate) fn fake(acts: Vec<Act>) -> Fake {
     let base = base();
     let listener = UnixListener::bind(base.path().join("dybw/agent.sock")).unwrap();
     Fake { agent: serve(listener, acts), base }
@@ -101,7 +101,7 @@ impl Fake {
         run_in(&env_in(self.base.path(), None, None), args)
     }
 
-    fn ops(self) -> Vec<Op> {
+    pub(crate) fn ops(self) -> Vec<Op> {
         self.agent.join().unwrap()
     }
 }
@@ -119,11 +119,11 @@ fn one(args: &[&str], reply: Reply) -> ((u8, String, String), Op) {
     (result, f.ops().remove(0))
 }
 
-fn secret(v: &str) -> Secret {
+pub(crate) fn secret(v: &str) -> Secret {
     Secret::new(v.into())
 }
 
-fn s(v: &str) -> String {
+pub(crate) fn s(v: &str) -> String {
     v.into()
 }
 
@@ -131,7 +131,7 @@ fn item(id: &str, name: &str, user: Option<&str>) -> ItemSummary {
     ItemSummary { id: s(id), name: Some(s(name)), user: user.map(s), folder: Some(s("work")), kind: Some(s("Login")) }
 }
 
-fn status(unlocked: bool) -> Reply {
+pub(crate) fn status(unlocked: bool) -> Reply {
     Reply::Status {
         agent_version: s("0.1.0"),
         profiles: vec![ProfileStatus { profile: s("work"), logged_in: true, unlocked, last_sync: Some(1_700_000_000) }],

@@ -6,6 +6,8 @@
 mod client;
 mod clip;
 mod doctor;
+mod rbw;
+mod rbw_config;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -22,7 +24,7 @@ use clip::Copied;
 pub use client::{Env, Error as ClientError, START_WAIT};
 
 /// Command line client for the dybw agent.
-// TODO(P4.4): dispatch on argv[0] here (the git-credential and ssh-askpass personalities) before parsing.
+// `main` dispatches on argv[0]: invoked as `rbw`, it is the rbw shim (`rbw.rs`).
 #[derive(Parser, Debug)]
 #[command(version)]
 struct Cli {
@@ -343,10 +345,8 @@ fn default_profile(env: &Env, profile: Option<String>, autostart: bool) -> Resul
     }
 }
 
-fn execute(cli: Cli, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, Fail> {
-    let profile =
-        cli.profile.or_else(|| (env.var)("DYBW_PROFILE").and_then(|v| v.into_string().ok()).filter(|v| !v.is_empty()));
-    match cli.command {
+fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, Fail> {
+    match cmd {
         Cmd::Login => done(ask_started(env, Op::Login { profile })?),
         Cmd::Unlock => done(ask_started(env, Op::Unlock { profile })?),
         Cmd::Unlocked => match ask(env, Op::Status { profile }, false)? {
@@ -637,9 +637,9 @@ fn json_row(item: &ItemSummary, fields: &[Field]) -> Value {
     Value::Object(row)
 }
 
-/// Print the failure; an ambiguous lookup also lists its candidates as `id<TAB>name<TAB>user`.
-fn report(err: &mut dyn Write, fail: &Fail) {
-    let _ = writeln!(err, "dybw: {fail}");
+/// Print the failure as `<who>: <message>`; an ambiguous lookup also lists its candidates as `id<TAB>name<TAB>user`.
+fn report(err: &mut dyn Write, who: &str, fail: &Fail) {
+    let _ = writeln!(err, "{who}: {fail}");
     if let Fail::Agent(AgentError::Ambiguous { candidates }) = fail {
         for c in candidates {
             let user = c.user.as_deref().unwrap_or("");
@@ -668,18 +668,29 @@ where
             };
         }
     };
-    match execute(cli, env, out, err) {
+    let profile =
+        cli.profile.or_else(|| (env.var)("DYBW_PROFILE").and_then(|v| v.into_string().ok()).filter(|v| !v.is_empty()));
+    match execute(cli.command, profile, env, out, err) {
         Ok(code) => code,
         Err(fail) => {
-            report(err, &fail);
+            report(err, "dybw", &fail);
             1
         }
     }
 }
 
-pub fn main() -> ExitCode {
-    ExitCode::from(run(std::env::args_os(), &Env::real(), &mut std::io::stdout().lock(), &mut std::io::stderr().lock()))
+/// `run`, or the rbw shim when argv[0] is `rbw` (a symlink to this binary).
+pub fn dispatch(args: Vec<std::ffi::OsString>, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let as_rbw = args.first().and_then(|a| std::path::Path::new(a).file_name()).is_some_and(|n| n == "rbw");
+    if as_rbw { rbw::run(args, env, out, err) } else { run(args, env, out, err) }
 }
 
+pub fn main() -> ExitCode {
+    let args = std::env::args_os().collect();
+    ExitCode::from(dispatch(args, &Env::real(), &mut std::io::stdout().lock(), &mut std::io::stderr().lock()))
+}
+
+#[cfg(test)]
+mod rbw_tests;
 #[cfg(test)]
 mod tests;
