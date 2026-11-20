@@ -207,6 +207,7 @@ mod tests {
 
     #[test]
     fn only_refused_or_missing_counts_as_stale() {
+        let false = crate::skipped_as_root(crate::ROOT_BYPASSES) else { return };
         let base = base();
         let dir = base.path().join("dybw");
         drop(bind(&dir, me()).unwrap());

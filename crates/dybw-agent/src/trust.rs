@@ -92,6 +92,7 @@ mod tests {
 
     #[test]
     fn a_good_home_is_kept_and_path_is_never_the_search() {
+        let false = crate::skipped_as_root(crate::ROOT_REFUSED) else { return };
         let dir = tempfile::tempdir().unwrap();
         let t = try_home(Some(dir.path())).unwrap();
         assert_eq!(t.home, Some(std::fs::canonicalize(dir.path()).unwrap()));
@@ -101,6 +102,7 @@ mod tests {
 
     #[test]
     fn home_comes_from_the_password_database_and_a_different_home_variable_stops_the_agent() {
+        let false = crate::skipped_as_root(crate::ROOT_REFUSED) else { return };
         let (real, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let start = |var: Option<&std::path::Path>| {
             trust_for(var.map(|v| v.as_os_str().to_owned()), me(), PathBuf::new(), Some(real.path().into()))
@@ -121,6 +123,7 @@ mod tests {
 
     #[test]
     fn home_must_be_known_present_a_real_directory_and_ours() {
+        let false = crate::skipped_as_root(crate::ROOT_REFUSED) else { return };
         let dir = tempfile::tempdir().unwrap();
         assert!(err(None).contains("password database"));
         assert!(err(Some(&dir.path().join("missing"))).contains("HOME"));
@@ -161,6 +164,7 @@ mod tests {
 
     #[test]
     fn pinentry_resolves_against_the_fixed_list_only() {
+        let false = crate::skipped_as_root(crate::ROOT_REFUSED) else { return };
         let dir = tempfile::tempdir().unwrap();
         let t = try_home(Some(dir.path())).unwrap();
         let e = format!("{:#}", resolve_pinentry(&t, "dybw-no-such-pinentry").unwrap_err());

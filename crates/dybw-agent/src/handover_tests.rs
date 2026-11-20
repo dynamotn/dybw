@@ -59,7 +59,6 @@ fn audited(rig: &Rig) -> Vec<(&'static str, Verdict)> {
     rig.audit.events().iter().filter(|e| e.kind == Some("login")).map(|e| (e.op, e.verdict)).collect()
 }
 
-/// One look at `ring`, with logind's sessions in `sessions`.
 /// One look at `ring`, with logind's sessions in `sessions`, and every worker's answer to it.
 async fn look(rig: &Rig, ring: &Ring, sessions: &Path) {
     for answer in rig.agent.handover(ring, sessions).await {

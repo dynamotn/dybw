@@ -149,6 +149,7 @@ mod tests {
 
     #[test]
     fn an_unwritable_place_names_the_file() {
+        let false = crate::skipped_as_root(crate::ROOT_BYPASSES) else { return };
         let dir = tempfile::tempdir().unwrap();
         let blocked = paths(&dir.path().join("f/x"));
         std::fs::write(dir.path().join("f"), "x").unwrap();

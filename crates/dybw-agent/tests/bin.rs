@@ -10,6 +10,18 @@ use dybw_proto::{Op, Reply, Request, Response, decode_response, encode};
 /// The agent with its home taken from DYBW_TEST_PASSWD_HOME (feature `test-home`).
 const AGENT: &str = env!("CARGO_BIN_EXE_dybw-agent-test-home");
 
+/// True under root, after saying which test is skipped: the agent refuses to run as root (`trust::root_is_refused`),
+/// and GitLab's `rust` image runs jobs as root.
+fn as_root() -> bool {
+    let root = rustix::process::geteuid().is_root();
+    let test = std::thread::current().name().unwrap_or("a test").to_owned();
+    eprint!(
+        "{}",
+        if root { format!("skipped {test} under root: the agent refuses to run as root\n") } else { String::new() }
+    );
+    root
+}
+
 fn agent(home: &std::path::Path, runtime: &std::path::Path) -> Child {
     Command::new(AGENT)
         .env("HOME", home)
@@ -75,6 +87,7 @@ fn prints_banner_and_exits_zero() {
 
 #[test]
 fn an_untrusted_home_stops_it_with_a_message() {
+    let false = as_root() else { return };
     let out = Command::new(env!("CARGO_BIN_EXE_dybw-agent")).env("HOME", "relative").output().expect("run");
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("HOME"));
@@ -82,6 +95,7 @@ fn an_untrusted_home_stops_it_with_a_message() {
 
 #[test]
 fn a_home_variable_other_than_the_users_home_stops_it() {
+    let false = as_root() else { return };
     let (home, runtime) = dirs();
     let other = tempfile::tempdir().expect("other");
     let out = Command::new(AGENT)
@@ -96,6 +110,7 @@ fn a_home_variable_other_than_the_users_home_stops_it() {
 
 #[test]
 fn stop_agent_ends_it_cleanly_and_a_second_agent_is_refused() {
+    let false = as_root() else { return };
     let (home, runtime) = dirs();
     let mut first = agent(home.path(), runtime.path());
     assert!(matches!(ask(runtime.path(), Op::Status { profile: None }), Reply::Error { .. }), "no profile defined");
@@ -116,11 +131,13 @@ fn ends_on(signal: &str) {
 
 #[test]
 fn sigterm_ends_it_cleanly() {
+    let false = as_root() else { return };
     ends_on("-TERM");
 }
 
 #[test]
 fn sigint_ends_it_cleanly() {
+    let false = as_root() else { return };
     ends_on("-INT");
 }
 
@@ -138,6 +155,7 @@ fn fails_with(home: &std::path::Path, runtime: &std::path::Path, text: &str) {
 
 #[test]
 fn a_bad_config_or_socket_directory_stops_it_before_serving() {
+    let false = as_root() else { return };
     let (home, runtime) = dirs();
     let config = home.path().join(".config/dybw");
     std::fs::create_dir_all(&config).expect("config dir");
@@ -152,6 +170,7 @@ fn a_bad_config_or_socket_directory_stops_it_before_serving() {
 
 #[test]
 fn the_config_comes_from_the_trusted_home_not_from_xdg_config_home() {
+    let false = as_root() else { return };
     let (home, runtime) = dirs();
     // A starter points XDG_CONFIG_HOME at a config of its own: it is never read.
     let elsewhere = tempfile::tempdir().expect("xdg");
@@ -170,6 +189,7 @@ fn the_config_comes_from_the_trusted_home_not_from_xdg_config_home() {
 
 #[test]
 fn the_shipped_binary_ignores_the_test_home_variable() {
+    let false = as_root() else { return };
     // The `dybw-agent` binary reads the password database only: a starter's DYBW_TEST_PASSWD_HOME is not obeyed.
     let (home, runtime) = dirs();
     let mut child = Command::new(env!("CARGO_BIN_EXE_dybw-agent"))

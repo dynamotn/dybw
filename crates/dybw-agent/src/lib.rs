@@ -50,6 +50,23 @@ pub(crate) fn current_user() -> std::io::Result<dybw_native::fsutil::User> {
     dybw_native::fsutil::User::current()
 }
 
+/// Tests only, why a test is skipped under root: root bypasses the permission check it needs refused.
+#[cfg(test)]
+pub(crate) const ROOT_BYPASSES: &str = "root bypasses the permission check it needs refused";
+/// Tests only, why a test is skipped under root: it checks the rules for an ordinary user, and the agent refuses root.
+#[cfg(test)]
+pub(crate) const ROOT_REFUSED: &str = "the agent refuses root (root_is_refused); this checks an ordinary user's rules";
+
+/// Tests only: true under root, after saying on stderr which test is skipped and `why`. GitLab's `rust` image runs
+/// jobs as root.
+#[cfg(test)]
+pub(crate) fn skipped_as_root(why: &str) -> bool {
+    let root = rustix::process::geteuid().is_root();
+    let test = std::thread::current().name().unwrap_or("a test").to_owned();
+    eprint!("{}", if root { format!("skipped {test} under root: {why}\n") } else { String::new() });
+    root
+}
+
 /// The line `dybw-agent` prints at start.
 pub fn banner() -> String {
     format!("dybw-agent {} (protocol {PROTOCOL_VERSION})", env!("CARGO_PKG_VERSION"))

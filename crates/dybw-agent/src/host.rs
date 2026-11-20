@@ -452,6 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_real_host_runs_a_trusted_pinentry() {
+        let false = crate::skipped_as_root(crate::ROOT_BYPASSES) else { return };
         // `true` is not a pinentry: it says nothing, which is a protocol error, and that proves it was run.
         let host = RealHost::new(trust(), "/usr/bin/true");
         let e = host.password("p", "x", None).await.err().unwrap();
