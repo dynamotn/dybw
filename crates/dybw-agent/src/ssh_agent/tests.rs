@@ -386,7 +386,16 @@ fn the_sign_context_says_what_is_signed_and_where_it_goes() {
     let mut conn = Conn::default();
     let unbound = conn.context("work".into(), &Userauth::new(&key).bytes(), &k);
     let login = |bound| Data::Login { user: "git".into(), bound };
-    assert_eq!(unbound, SignContext { profile: "work".into(), data: login(false), bound: None, bind_refused: false });
+    assert_eq!(
+        unbound,
+        SignContext {
+            profile: "work".into(),
+            data: login(false),
+            bound: None,
+            bind_refused: false,
+            client: Programs::default()
+        }
+    );
     assert_eq!(conn.context("work".into(), b"a git commit", &k).data, Data::Other);
 
     assert_eq!(bind(&mut conn, &bind_request(&hop1, &hop1, b"sid-1", false)), Some(true));
@@ -440,7 +449,12 @@ async fn sign_returns_a_signature_the_key_verifies_once_authorized() {
     let reply = c.sign(&blob(&w.beta), b"a git commit", 0).await;
     assert_eq!(verified(&w.beta, b"a git commit", &reply).algorithm(), Algorithm::Ed25519);
     let asked = w.auth.asked();
-    assert_eq!(asked, [SignContext { profile: "work".into(), data: Data::Other, bound: None, bind_refused: false }]);
+    // The client's programs come from the process table: the fake peer has no parent in it.
+    let client = Programs { exe: Some("/usr/local/bin/dybw".into()), parent: None };
+    assert_eq!(
+        asked,
+        [SignContext { profile: "work".into(), data: Data::Other, bound: None, bind_refused: false, client }]
+    );
     // Refused: the failure reply, and the connection stays open.
     w.auth.refuse.store(true, Ordering::SeqCst);
     assert_eq!(c.sign(&blob(&w.beta), b"x", 0).await, FAIL);
@@ -634,7 +648,13 @@ async fn refuse_all_refuses() {
     let rig = rig(dir.path());
     let resolved = crate::caller::Resolved::fixed(crate::agent::testing::invoker(), crate::agent::testing::peer());
     let key = Key { id: "k".into(), name: "n".into(), fingerprint: "f".into(), blob: vec![] };
-    let ctx = SignContext { profile: "work".into(), data: Data::Other, bound: None, bind_refused: false };
+    let ctx = SignContext {
+        profile: "work".into(),
+        data: Data::Other,
+        bound: None,
+        bind_refused: false,
+        client: Programs::default(),
+    };
     assert_eq!(RefuseAll.authorize_sign(&resolved, &key, &ctx).await, Decision::Refuse);
     drop(rig);
 }
@@ -911,7 +931,7 @@ async fn a_signature_is_confirmed_naming_the_key_the_client_and_that_it_is_not_a
         ("work", Some("data"), Some("sa"), Verdict::Confirmed)
     );
     assert_eq!(e.caller, ssh_client(500));
-    let ssh_audit = SignAudit { key: fingerprint(&w.alpha), dest: None, forwarded: false };
+    let ssh_audit = SignAudit { key: fingerprint(&w.alpha), ..SignAudit::default() };
     assert_eq!(e.ssh.as_ref(), Some(&ssh_audit));
 }
 
@@ -1050,9 +1070,16 @@ async fn a_no_signs_nothing_and_is_audited() {
     assert_eq!(verdicts(&w.rig), [Verdict::Declined]);
     // A profile that is not running refuses without a question.
     let key = Key { id: "k".into(), name: "n".into(), fingerprint: "f".into(), blob: vec![] };
-    let ctx = SignContext { profile: "home".into(), data: Data::Other, bound: None, bind_refused: false };
+    let ctx = SignContext {
+        profile: "home".into(),
+        data: Data::Other,
+        bound: None,
+        bind_refused: false,
+        client: Programs::default(),
+    };
     let confirm = Confirm(w.rig.agent.clone());
     assert_eq!(confirm.authorize_sign(&on_peer(ai()), &key, &ctx).await, Decision::Refuse);
+    assert_eq!(verdicts(&w.rig), [Verdict::Declined, Verdict::Failed], "audited as failed");
 }
 
 #[tokio::test]
@@ -1279,4 +1306,146 @@ async fn a_signature_waiting_for_the_screen_takes_the_always_given_meanwhile() {
     assert!(a && b);
     assert_eq!(confirmed(&w.rig).len(), 1);
     assert_eq!(verdicts(&w.rig), [Verdict::Remembered, Verdict::Granted]);
+}
+
+/// A profile locked between finding the key and the question asks nothing, and the refusal is audited.
+#[tokio::test]
+async fn a_profile_locked_after_the_key_was_found_asks_nothing() {
+    let w = world(vec![]).await;
+    let ssh = confirming(&w, &["work"]);
+    let (profile, key) = ssh.find(&blob(&w.alpha)).await.unwrap();
+    w.rig.agent.dispatch(Op::Lock { target: Target::Profile("work".into()) }).await;
+    let ctx = Conn::default().context(profile, b"x", &blob(&w.alpha));
+    w.rig.host.allow_always();
+    let confirm = Confirm(w.rig.agent.clone());
+    assert_eq!(confirm.authorize_sign(&on_peer(ssh_client(500)), &key, &ctx).await, Decision::Refuse);
+    assert!(confirmed(&w.rig).is_empty(), "no question");
+    assert_eq!(verdicts(&w.rig), [Verdict::Failed]);
+}
+
+/// A profile wiped while the question is open without the question being aborted (a crashed command) keeps no
+/// "always": it would outlive the lock.
+#[tokio::test]
+async fn no_always_outlives_a_profile_wiped_while_it_was_asked() {
+    let w = world(vec![]).await;
+    let ssh = confirming(&w, &["work"]);
+    let (who, conn) = (on_peer(ssh_client(500)), Conn::default());
+    w.rig.host.world().confirms.push_back(Answer::HeldAlways);
+    let release = w.rig.host.world().release.clone();
+    let worker = w.rig.agent.running("work").unwrap();
+    let crash = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        worker.call(Cmd::Panic, w.rig.agent.clock.mono()).await;
+        release.notify_one();
+    };
+    let (ok, ()) = tokio::join!(signed(&ssh, &who, &conn, &w.alpha, b"1"), crash);
+    assert!(!ok);
+    assert_eq!(verdicts(&w.rig), [Verdict::Failed]);
+    crate::agent::testing::unlock(&w.rig.agent, &w.rig.host, "work").await;
+    w.rig.host.allow();
+    assert!(signed(&ssh, &who, &Conn::default(), &w.alpha, b"2").await);
+    assert_eq!(confirmed(&w.rig).len(), 2, "asked again");
+}
+
+/// A lock while the question is open aborts it; the refusal is audited.
+#[tokio::test]
+async fn a_question_cut_short_by_a_lock_is_audited() {
+    let w = world(vec![]).await;
+    let ssh = confirming(&w, &["work"]);
+    w.rig.host.world().confirms.push_back(Answer::Held);
+    let lock = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        w.rig.agent.dispatch(Op::Lock { target: Target::Profile("work".into()) }).await;
+    };
+    let (who, conn) = (on_peer(ssh_client(500)), Conn::default());
+    let (ok, ()) = tokio::join!(signed(&ssh, &who, &conn, &w.alpha, b"x"), lock);
+    assert!(!ok);
+    assert_eq!(verdicts(&w.rig), [Verdict::Failed]);
+}
+
+/// A pinentry that fails is no answer of the user's.
+#[tokio::test]
+async fn a_prompt_that_fails_is_audited_as_failed() {
+    let w = world(vec![]).await;
+    let ssh = confirming(&w, &["work"]);
+    w.rig.host.world().confirms.push_back(Answer::Fail);
+    assert!(!signed(&ssh, &on_peer(ssh_client(500)), &Conn::default(), &w.alpha, b"x").await);
+    assert_eq!(verdicts(&w.rig), [Verdict::Failed]);
+}
+
+/// ADR 0012: the question and the audit name the SSH program and what ran it for every class, and an interpreter's
+/// script as what it claims.
+#[tokio::test]
+async fn every_class_of_client_is_named_by_its_programs() {
+    let w = world(vec![]).await;
+    let ssh = confirming(&w, &["work"]);
+    let programs = Programs { exe: Some("/usr/bin/ssh".into()), parent: Some("/usr/bin/git".into()) };
+    let at = At { pid: 9, start: 9, parent: Some("/bin/sh".into()), ..At::default() };
+    let script = Some("/home/u/sign.py".into());
+    let python = Caller::Invoker { exe: "/usr/bin/python3".into(), script, hash: "h".into(), relative: false, at };
+    let unknown = || Caller::Unknown { why: "orphan".into(), peer: None };
+    let named = "an SSH client /usr/bin/ssh (run by /usr/bin/git)";
+    let cases = [
+        (ai(), format!("allow {named} of the AI agent claude to sign")),
+        (unknown(), format!("allow {named} that cannot be identified (orphan), possibly an AI agent to sign")),
+        (
+            python,
+            "allow the SSH client /usr/bin/python3 which claims to run /home/u/sign.py (run by /bin/sh) to".into(),
+        ),
+    ];
+    let with = |caller| {
+        let mut who = on_peer(caller);
+        who.client = programs.clone();
+        who
+    };
+    for (n, (caller, want)) in cases.into_iter().enumerate() {
+        w.rig.host.allow();
+        assert!(signed(&ssh, &with(caller), &Conn::default(), &w.alpha, b"x").await);
+        assert!(confirmed(&w.rig)[n].contains(&want), "{}", confirmed(&w.rig)[n]);
+        assert_eq!(w.rig.audit.events().pop().unwrap().ssh.unwrap().client, programs);
+    }
+    // The unlock question names them, and so does the audit of an AI-class client's refused unlock.
+    w.rig.agent.dispatch(Op::Lock { target: Target::Profile("work".into()) }).await;
+    assert!(!signed(&ssh, &with(unknown()), &Conn::default(), &w.alpha, b"x").await);
+    let last = w.rig.host.world().asked.last().unwrap().0.clone();
+    assert!(last.ends_with(&format!("{named} that cannot be identified (orphan), possibly an AI agent")), "{last}");
+    assert!(!signed(&ssh, &with(ai()), &Conn::default(), &w.alpha, b"x").await);
+    assert_eq!(w.rig.audit.events().pop().unwrap().ssh.unwrap().client, programs);
+}
+
+/// Review Focus 3: a pid reused by another process (another start time) holds nothing.
+#[tokio::test]
+async fn an_always_is_not_for_another_process_with_the_same_pid() {
+    let w = world(vec![]).await;
+    let ssh = confirming(&w, &["work"]);
+    let reused = match ssh_client(500) {
+        Caller::Invoker { exe, script, hash, relative, at } => {
+            Caller::Invoker { exe, script, hash, relative, at: At { start: 9_999, ..at } }
+        }
+        other => other,
+    };
+    w.rig.host.allow_always();
+    assert!(signed(&ssh, &on_peer(ssh_client(500)), &Conn::default(), &w.alpha, b"1").await);
+    w.rig.host.allow();
+    assert!(signed(&ssh, &on_peer(reused), &Conn::default(), &w.alpha, b"2").await);
+    assert_eq!(verdicts(&w.rig), [Verdict::Remembered, Verdict::Confirmed]);
+}
+
+/// A key name, a login user and a parent path are the client's or the vault's to choose: line breaks, control and
+/// bidi characters cannot add or reorder text in the question.
+#[tokio::test]
+async fn names_users_and_paths_are_shown_on_one_line() {
+    let evil = ed25519(7);
+    let w = world(vec![ssh_item("se", "evil\nname\u{202e}txt", &evil)]).await;
+    let ssh = confirming(&w, &["work"]);
+    let at = At { pid: 7, start: 7, parent: Some("/usr/bin/\u{202e}tig\n\x1b[2Jx".into()), ..At::default() };
+    let caller = Caller::Invoker { exe: "/usr/bin/ssh".into(), script: None, hash: "h".into(), relative: false, at };
+    let login = Userauth { user: "root\n\x07\u{202e}".as_bytes(), ..Userauth::new(&evil) }.bytes();
+    w.rig.host.allow();
+    assert!(signed(&ssh, &on_peer(caller), &Conn::default(), &evil, &login).await);
+    let text = &confirmed(&w.rig)[0];
+    assert!(!text.chars().any(|c| c.is_control() || c == '\u{202e}'), "{text:?}");
+    assert!(text.contains("\"evil\u{fffd}name\u{fffd}txt\""), "{text}");
+    assert!(text.contains("log in as \"root\u{fffd}\u{fffd}\u{fffd}\""), "{text}");
+    assert!(text.contains("(run by /usr/bin/\u{fffd}tig\u{fffd}\u{fffd}[2Jx)"), "{text}");
 }

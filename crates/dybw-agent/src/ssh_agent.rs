@@ -25,7 +25,7 @@ use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
 use crate::agent::Agent;
-use crate::caller::{At, Caller, Resolved};
+use crate::caller::{At, Caller, Programs, Resolved};
 use crate::policy::{AuditEvent, SignAudit, Verdict, shown};
 use crate::ssh::{Key, RSA_SHA2_256, RSA_SHA2_512};
 use crate::worker::Cmd;
@@ -87,6 +87,8 @@ pub struct SignContext {
     /// A `session-bind@openssh.com` on this connection was refused (bad signature, a second bind of a login
     /// connection, ...): what the client says of its destination is not to be trusted.
     pub bind_refused: bool,
+    /// The client's programs (`Resolved::client`), named in the question and the audit for every class.
+    pub client: Programs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,26 +136,43 @@ impl Authorize for Confirm {
         ctx: &'a SignContext,
     ) -> Pin<Box<dyn Future<Output = Decision> + Send + 'a>> {
         Box::pin(async move {
-            let Some(worker) = self.0.running(&ctx.profile) else { return Decision::Refuse };
+            // The worker audits each decision; a profile that is not running or locked before one is made, here.
+            let locked = || {
+                tracing::warn!(profile = %ctx.profile, "refused an SSH signature: the profile is locked");
+                self.0.audit.record(sign_event(&who.caller, key, ctx, Verdict::Failed));
+                Decision::Refuse
+            };
+            let Some(worker) = self.0.running(&ctx.profile) else { return locked() };
             let cmd = Cmd::SshConfirm { caller: who.caller.clone(), key: key.clone(), ctx: ctx.clone() };
-            if worker.call(cmd, self.0.clock.mono()).await == Reply::Done { Decision::Allow } else { Decision::Refuse }
+            match worker.call(cmd, self.0.clock.mono()).await {
+                Reply::Done => Decision::Allow,
+                Reply::Error { error: dybw_proto::AgentError::Locked } => locked(),
+                _ => Decision::Refuse,
+            }
         })
     }
 }
 
 /// The SSH client a question or a log line names, with its class: the program and the one that ran it, an AI
-/// agent's client, or one that cannot be named.
-pub(crate) fn client(caller: &Caller) -> String {
+/// agent's client, or one that cannot be named. The programs the process table gave are named for every class
+/// (ADR 0012); an interpreter's script is only what the process claims.
+pub(crate) fn client(caller: &Caller, programs: &Programs) -> String {
     let path = |p: &std::path::Path| shown(&p.to_string_lossy(), 120);
+    let run_by = |p: Option<&std::path::Path>| p.map(|p| format!(" (run by {})", path(p))).unwrap_or_default();
+    let named = |exe: Option<&std::path::Path>| {
+        exe.map(|e| format!(" {}{}", path(e), run_by(programs.parent.as_deref()))).unwrap_or_default()
+    };
     match caller {
-        Caller::Invoker { exe, at: At { parent, detached, .. }, .. } => {
-            let parent = parent.as_deref().map(|p| format!(" (run by {})", path(p))).unwrap_or_default();
+        Caller::Invoker { exe, script, at: At { parent, detached, .. }, .. } => {
+            let script = script.as_deref().map(|s| format!(" which claims to run {}", path(s))).unwrap_or_default();
             let detached = if *detached { format!(", {}", crate::policy::DETACHED) } else { String::new() };
-            format!("the SSH client {}{parent}{detached}", path(exe))
+            format!("the SSH client {}{script}{}{detached}", path(exe), run_by(parent.as_deref()))
         }
-        Caller::Ai { harness, .. } => format!("an SSH client of the AI agent {}", one_line(harness)),
+        Caller::Ai { harness, .. } => {
+            format!("an SSH client{} of the AI agent {}", named(programs.exe.as_deref()), one_line(harness))
+        }
         Caller::Unknown { why, peer } => {
-            let exe = peer.as_deref().map(|p| format!(" {}", path(p))).unwrap_or_default();
+            let exe = named(programs.exe.as_deref().or(peer.as_deref()));
             format!("an SSH client{exe} that cannot be identified ({}), possibly an AI agent", one_line(why))
         }
     }
@@ -178,6 +197,7 @@ pub(crate) fn sign_event(caller: &Caller, key: &Key, ctx: &SignContext, verdict:
             key: key.fingerprint.clone(),
             dest: ctx.bound.as_ref().map(host_key),
             forwarded: ctx.bound.as_ref().is_some_and(|b| b.forwarded),
+            client: ctx.client.clone(),
         }),
     }
 }
@@ -290,13 +310,17 @@ impl SshAgent {
                     kind: None,
                     item: None,
                     verdict: Verdict::Denied,
-                    ssh: Some(SignAudit { key: fingerprint.unwrap_or_default(), dest: None, forwarded: false }),
+                    ssh: Some(SignAudit {
+                        key: fingerprint.unwrap_or_default(),
+                        client: who.client.clone(),
+                        ..SignAudit::default()
+                    }),
                 });
             }
             return None;
         }
         let _one = self.unlocking.lock().await;
-        let why = format!("an SSH signature asked by {}", client(&who.caller));
+        let why = format!("an SSH signature asked by {}", client(&who.caller, &who.client));
         for name in &self.profiles {
             if let Some(found) = self.find(blob).await {
                 return Some(found);
@@ -331,7 +355,7 @@ impl SshAgent {
             tracing::info!("refused to sign with a key that is not offered");
             return None;
         };
-        let ctx = conn.context(profile, data, blob);
+        let ctx = SignContext { client: who.client.clone(), ..conn.context(profile, data, blob) };
         let refuse = |verdict: Verdict, why: &str| {
             tracing::warn!(profile = %ctx.profile, "refused an SSH signature: {why}");
             self.agent.audit.record(sign_event(&who.caller, &key, &ctx, verdict));
@@ -547,7 +571,7 @@ impl Conn {
         };
         let forwarded = self.binds.iter().any(|b| b.forwarded);
         let bound = last.map(|b| Binding { host_key: b.host_key.clone(), forwarded });
-        SignContext { profile, data, bound, bind_refused: self.bind_refused }
+        SignContext { profile, data, bound, bind_refused: self.bind_refused, client: Programs::default() }
     }
 }
 

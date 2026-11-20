@@ -903,14 +903,22 @@ fn an_ssh_client_is_the_peer_itself_with_the_process_that_ran_it() {
 #[test]
 fn an_ssh_client_of_an_ai_agent_is_ai_and_one_that_cannot_be_named_is_unknown() {
     let t = Tree::new();
-    ssh(&t, 50, &[]);
+    let exe = ssh(&t, 50, &[]);
     t.add(50, Path::new("/usr/bin/git"), 10, Some(&["git"]), Some(&["CLAUDECODE"]));
     t.add(10, Path::new("/usr/bin/login"), 1, Some(&["login"]), Some(&[]));
-    assert_eq!(client(&t).caller, Caller::Ai { harness: "claude".into(), via: Via::Marker }, "its parent's marker");
+    let resolved = client(&t);
+    assert_eq!(resolved.caller, Caller::Ai { harness: "claude".into(), via: Via::Marker }, "its parent's marker");
+    // Its programs are still named, for the question and the audit.
+    let programs = |exe: PathBuf, parent: &str| Programs { exe: Some(exe), parent: Some(parent.into()) };
+    assert_eq!(resolved.client, programs(exe, "/usr/bin/git"));
     let t = Tree::new();
-    ssh(&t, 50, &[]);
+    let exe = ssh(&t, 50, &[]);
     t.add(50, Path::new("/usr/bin/sudo"), 1, Some(&["sudo"]), Some(&[]));
-    assert_eq!(unknown(&client(&t).caller), "run through a privilege wrapper");
+    let resolved = client(&t);
+    assert_eq!(unknown(&resolved.caller), "run through a privilege wrapper");
+    assert_eq!(resolved.client, programs(exe, "/usr/bin/sudo"));
+    // A `dybw` peer has none.
+    assert_eq!(t.resolver().resolve(resolved.peer.clone()).client, Programs::default());
     let t = Tree::new();
     ssh(&t, 50, &[]);
     assert_eq!(unknown(&client(&t).caller), "the ancestry could not be read to the top");

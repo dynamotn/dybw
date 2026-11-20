@@ -29,6 +29,12 @@ pub(super) async fn confirm<H: Host>(
     key: &Key,
     sign: &SignContext,
 ) -> Reply {
+    // A profile locked since the key was found asks nothing, and no "always" given to it may outlive the lock. The
+    // SSH agent audits this refusal.
+    let locked = || shared.state.borrow().slot.is_none();
+    if locked() {
+        return error(AgentError::Locked);
+    }
     // A deny entry of the caller policy for this program refuses before any question; an allow entry never skips it.
     let store = Store::new(&ctx.paths.policy, ctx.user.uid);
     let denied = matches!(caller, Caller::Invoker { .. })
@@ -48,6 +54,8 @@ pub(super) async fn confirm<H: Host>(
             Verdict::Granted
         } else {
             match session::confirm(host, &text(ctx, caller, key, sign, always), always).await {
+                // Wiped while the question was open without this task being aborted (a crashed command).
+                Ok(_) if locked() => return error(AgentError::Locked),
                 Ok(true) if always => {
                     let held = &mut shared.state.borrow_mut().ssh_held;
                     if held.len() >= MAX_HELD {
@@ -57,12 +65,17 @@ pub(super) async fn confirm<H: Host>(
                     Verdict::Remembered
                 }
                 Ok(_) => Verdict::Confirmed,
+                Err(AgentError::Prompt) => Verdict::Failed,
                 Err(_) => Verdict::Declined,
             }
         }
     };
     ctx.audit.record(sign_event(caller, key, sign, verdict));
-    if verdict == Verdict::Declined { error(AgentError::Denied) } else { Reply::Done }
+    match verdict {
+        Verdict::Declined => error(AgentError::Denied),
+        Verdict::Failed => error(AgentError::Prompt),
+        _ => Reply::Done,
+    }
 }
 
 /// The question: the profile, the client, what is signed (a login, and where to, or data that is not a login), the
@@ -102,7 +115,7 @@ fn text(ctx: &Ctx, caller: &Caller, key: &Key, s: &SignContext, always: bool) ->
     format!(
         "dybw profile {}: allow {} to {what}{dest} with the SSH key {} ({})?{forwarded}{refused}{scope}",
         ctx.profile.name,
-        client(caller),
+        client(caller, &s.client),
         quoted(&key.name),
         key.fingerprint
     )

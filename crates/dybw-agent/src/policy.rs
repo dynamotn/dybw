@@ -88,7 +88,7 @@ pub struct AuditEvent {
 }
 
 /// What an SSH signature's audit line adds: never the data signed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SignAudit {
     /// The key's `SHA256:` fingerprint.
     pub key: String,
@@ -96,6 +96,8 @@ pub struct SignAudit {
     pub dest: Option<String>,
     /// Some hop of the connection was forwarded (`ssh -A`).
     pub forwarded: bool,
+    /// The SSH client's programs, whatever its class (an AI-class or unknown caller names none of its own).
+    pub client: crate::caller::Programs,
 }
 
 /// Where decisions are recorded.

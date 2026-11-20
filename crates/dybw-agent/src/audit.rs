@@ -84,11 +84,14 @@ fn entry_of(event: &AuditEvent) -> Entry {
             ("invoker", Some(path(exe)), script.as_deref().map(path), None, None, at.peer.as_deref().map(path))
         }
     };
-    let parent = match &event.caller {
-        Caller::Invoker { at, .. } => at.parent.as_deref().map(path),
-        _ => None,
-    };
     let ssh = event.ssh.as_ref();
+    // An SSH client is named for every class: an AI-class or unknown caller carries no program of its own.
+    let exe = exe.or_else(|| ssh.and_then(|s| s.client.exe.as_deref()).map(path));
+    let parent = match &event.caller {
+        Caller::Invoker { at, .. } => at.parent.as_deref(),
+        _ => ssh.and_then(|s| s.client.parent.as_deref()),
+    };
+    let parent = parent.map(path);
     Entry {
         time: rfc3339(event.time),
         profile: text(&event.profile),

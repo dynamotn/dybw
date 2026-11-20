@@ -109,8 +109,9 @@ fn a_decision_is_one_json_line_without_a_value_or_a_name() {
     sign.op = "ssh-sign";
     sign.kind = Some("login");
     let dest = Some("SHA256:host".to_owned());
-    sign.ssh = Some(crate::policy::SignAudit { key: "SHA256:key".into(), dest, forwarded: true });
-    audit.record(sign);
+    let audited = crate::policy::SignAudit { key: "SHA256:key".into(), dest, forwarded: true, ..Default::default() };
+    sign.ssh = Some(audited.clone());
+    audit.record(sign.clone());
     let log = read(&path, me()).unwrap();
     let e = log.entries.last().unwrap();
     assert_eq!(
@@ -121,6 +122,21 @@ fn a_decision_is_one_json_line_without_a_value_or_a_name() {
         (e.key.as_deref(), e.dest.as_deref(), e.forwarded),
         (Some("SHA256:key"), Some("SHA256:host"), Some(true))
     );
+    // An AI-class or unknown SSH client is named by the programs the process table gave.
+    let client = crate::caller::Programs { exe: Some("/usr/bin/ssh".into()), parent: Some("/usr/bin/git".into()) };
+    for caller in [
+        Caller::Ai { harness: "claude".into(), via: crate::caller::Via::Ancestry },
+        Caller::Unknown { why: "orphan".into(), peer: None },
+    ] {
+        audit.record(AuditEvent {
+            caller,
+            ssh: Some(crate::policy::SignAudit { client: client.clone(), ..audited.clone() }),
+            ..sign.clone()
+        });
+        let log = read(&path, me()).unwrap();
+        let e = log.entries.last().unwrap();
+        assert_eq!((e.exe.as_deref(), e.parent.as_deref()), (Some("/usr/bin/ssh"), Some("/usr/bin/git")));
+    }
     // A line written before these fields existed still reads.
     let old = r#"{"time":"t","profile":"p","class":"ai","exe":null,"script":null,"harness":"h","op":"get","kind":null,"item":null,"verdict":"denied"}"#;
     assert!(serde_json::from_str::<Entry>(old).unwrap().why.is_none());

@@ -272,6 +272,15 @@ struct Seen {
     ppid: u32,
     start: u64,
     image: Vec<u8>,
+    exe: PathBuf,
+}
+
+/// An SSH client's programs as the process table names them, whatever its class: its own executable and the one of
+/// the process that ran it. The question and the audit name them for every class (ADR 0012).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Programs {
+    pub exe: Option<PathBuf>,
+    pub parent: Option<PathBuf>,
 }
 
 /// A caller together with what it was resolved from, so the answer can be re-checked before a reply is written.
@@ -280,17 +289,20 @@ pub struct Resolved {
     pub caller: Caller,
     peer: Peer,
     chain: Vec<Seen>,
+    /// For an SSH client ([`Resolver::resolve_client`]): its programs; empty otherwise.
+    pub(crate) client: Programs,
 }
 
 impl Resolved {
     /// Test only: a caller taken as given, held to `peer` alone.
     #[cfg(test)]
     pub(crate) fn fixed(caller: Caller, peer: Peer) -> Self {
-        Self { caller, peer, chain: Vec::new() }
+        Self { caller, peer, chain: Vec::new(), client: Programs::default() }
     }
 
     fn unknown(peer: Peer, why: &str) -> Self {
-        Self { caller: Caller::Unknown { why: why.into(), peer: None }, peer, chain: Vec::new() }
+        let caller = Caller::Unknown { why: why.into(), peer: None };
+        Self { caller, peer, chain: Vec::new(), client: Programs::default() }
     }
 }
 
@@ -345,7 +357,7 @@ impl Resolver {
     /// Resolve the peer on this thread.
     pub fn resolve(&self, peer: Peer) -> Resolved {
         let (caller, chain) = self.classify(&peer, false);
-        Resolved { caller, peer, chain }
+        Resolved { caller, peer, chain, client: Programs::default() }
     }
 
     /// Resolve an SSH client (profiles §8): the peer itself is the caller, named by its own executable, with the
@@ -354,7 +366,9 @@ impl Resolver {
     /// file that cannot be hashed make it unknown.
     pub fn resolve_client(&self, peer: Peer) -> Resolved {
         let (caller, chain) = self.classify(&peer, true);
-        Resolved { caller, peer, chain }
+        let exe = |n: usize| chain.get(n).map(|s| s.exe.clone());
+        let client = Programs { exe: exe(0), parent: exe(1) };
+        Resolved { caller, peer, chain, client }
     }
 
     /// Is the peer still the process it was, with the same program, and every process the answer rests on unchanged
@@ -394,7 +408,7 @@ impl Resolver {
         let seen: Vec<Seen> = pids
             .iter()
             .zip(&chain)
-            .map(|(&pid, p)| Seen { pid, ppid: p.ppid, start: p.start, image: p.image.clone() })
+            .map(|(&pid, p)| Seen { pid, ppid: p.ppid, start: p.start, image: p.image.clone(), exe: p.exe.clone() })
             .collect();
         let invoker = if client { chain.first().map(|p| (0, p)) } else { invoker_index(&chain) };
         let marked = if client { chain.get(1) } else { invoker.map(|(_, p)| p) };
