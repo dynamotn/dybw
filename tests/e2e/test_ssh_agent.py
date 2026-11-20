@@ -181,9 +181,12 @@ def test_each_key_type_logs_in_after_a_yes_naming_the_destination(world, keys, s
     for part in (f"dybw profile e2e: allow the SSH client {SSH}", f'log in as "{USER}"',
                  f"to the host whose key is {sshd.host_fp}", f'with the SSH key "{key["name"]}" ({key["fp"]})'):
         assert part in p["text"], (part, p["text"])
-    assert p["always"] and "NOT an SSH login" not in p["text"], p
+    # `ssh` is a launcher: never offered "always" (the main socket's rule).
+    assert not p["always"] and "NOT an SSH login" not in p["text"], p
     if kind == "rsa":
         # The signature sshd checked: an RSA key signs with SHA-2 (rsa-sha2-256/512), never ssh-rsa (SHA-1).
+        # sshd's auth2-pubkey.c logs `debug2_f("%s user %s %s public key %s %s", valid, user, "attempting", pkalg,
+        # keystring)`: the word after "attempting public key " is the signature algorithm the client used.
         log = sshd.log.read_text()[mark:]
         algs = {line.split("attempting public key ")[1].split()[0] for line in log.splitlines()
                 if "attempting public key " in line}
@@ -287,8 +290,11 @@ def test_ssh_add_d_and_capital_d_change_only_the_agents_view(world, account, key
     assert r.returncode == 0, r.stderr
     listed = ssh_add(world, "-l").stdout
     assert gone["fp"] not in listed and keys["ed25519"]["fp"] in listed, listed
-    r = ssh(world, sshd, gone, confirm="always")
-    assert r.returncode == 255 and prompts() == []
+    # No OpenSSH client asks for a key the agent does not list: the protocol client does, and gets a failure with no
+    # question.
+    r = raw_sign(world, gone, b"challenge", confirm="once")
+    assert r.returncode == 1 and r.stdout == "", r
+    assert prompts() == [] and "GETPIN" not in log_text()
     r = ssh_add(world, "-D")
     assert r.returncode == 0, r.stderr
     r = ssh_add(world, "-l")
@@ -314,5 +320,11 @@ def test_the_audit_log_records_each_signature_decision(world, keys, sshd):
     # The AI-marked client refused an unlock: audited as denied, with no question.
     (refused,) = [e for e in signs if e["class"] == "ai" and e["verdict"] == "denied"]
     assert refused["key"] == keys["ed25519"]["fp"] and refused.get("item") is None, refused
+    # The removed key's sign was refused before any item of ours: denied, with no item.
+    gone = [e for e in signs if e["key"] == keys["p384"]["fp"] and e["verdict"] == "denied"]
+    assert gone and all(e.get("item") is None for e in gone), gone
+    # Every removal is audited: the key's fingerprint for `-d`, "all" for `-D`.
+    removes = [e for e in lines if e["op"] == "ssh-remove"]
+    assert [(e["key"], e["verdict"]) for e in removes] == [(keys["p384"]["fp"], "granted"), ("all", "granted")], removes
     r = world("audit", "-n", "500")
     assert r.returncode == 0 and "ssh-sign" in r.stdout, r.stderr
