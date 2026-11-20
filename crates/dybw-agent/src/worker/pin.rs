@@ -53,9 +53,8 @@ fn audit(ctx: &Ctx, caller: &Caller, op: &'static str, verdict: Verdict) {
 
 /// The device id and the machine fingerprint a blob is bound to; `None` when either cannot be read.
 fn binding<H: Host>(host: &H, ctx: &Ctx) -> Option<(String, String)> {
-    let device = device_id_for(&ctx.paths, ctx.user.uid)
-        .map_err(|e| tracing::warn!(profile = %ctx.profile.name, "local unlock: device id: {e:#}"))
-        .ok()?;
+    // An unreadable device id stops the master password path too, which logs why.
+    let device = device_id_for(&ctx.paths, ctx.user.uid).ok()?;
     let Some(machine) = host.machine() else {
         tracing::warn!(profile = %ctx.profile.name, "local unlock: the machine fingerprint cannot be read");
         return None;
