@@ -391,8 +391,12 @@ NEW_PW = "e2e new login password"
 
 @pytest.fixture
 def keyring():
-    if not shutil.which("keyctl") or subprocess.run(["keyctl", "show", "@u"], capture_output=True).returncode:
-        pytest.skip("no usable user keyring (keyutils missing, or a seccomp filter refuses keyctl)")
+    if shutil.which("keyctl") and subprocess.run(["keyctl", "show", "@u"], capture_output=True).returncode == 0:
+        return
+    # Only where CI says it has no keyring (GitLab's Docker runners, whose seccomp filter refuses keyctl).
+    if os.environ.get("DYBW_NO_KEYRING_TESTS") == "1":
+        pytest.skip("no usable user keyring here (DYBW_NO_KEYRING_TESTS=1)")
+    pytest.fail("no usable user keyring: install keyutils and run without Docker's seccomp filter (scripts/e2e.sh)")
 
 
 def keyring_put(name, payload):
@@ -442,16 +446,20 @@ def test_the_login_password_in_the_keyring_unlocks_and_is_taken(world, account, 
     assert "unlock-login" in world("audit", "-n", "20").stdout
 
 
-def test_a_wrong_login_password_keeps_the_protector(world, account, keyring):
+def test_a_login_password_that_opens_nothing_invalidates_the_protector(world, account, keyring):
+    # A password reset by root: the new password comes with no old one.
     assert world("lock").returncode == 0
-    keyring_put("dybw:login", "not the password")
-    assert eventually(lambda: not keyring_has("dybw:login"))
-    time.sleep(2)
+    keyring_put("dybw:login", "reset by root")
+    assert eventually(lambda: not (unlock_dir() / "login").exists()), world.log.read_text()
     assert world("unlocked").returncode == 1
-    assert (unlock_dir() / "login").exists()
+    assert "unlock-login-dropped" in world("audit", "-n", "20").stdout
 
 
 def test_a_password_change_is_confirmed_by_the_next_login(world, account, keyring):
+    ensure_unlocked(world, account)
+    r = named(world, "unlock", "add", "login", pins=[account.password, LOGIN_PW, LOGIN_PW])
+    assert r.returncode == 0, (r.stderr, world.log.read_text())
+    assert world("lock").returncode == 0
     keyring_put("dybw:login-old", LOGIN_PW)
     keyring_put("dybw:login", NEW_PW)
     pending = unlock_dir() / "login.pending"

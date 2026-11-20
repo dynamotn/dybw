@@ -116,17 +116,24 @@ async fn a_login_protector_is_kept_on_disk_and_the_password_handed_over_unlocks(
 }
 
 #[tokio::test]
-async fn a_wrong_password_keeps_the_protector_and_asks_nothing() {
+async fn a_password_that_opens_nothing_invalidates_the_protector_and_asks_nothing() {
+    // A reset by root: the new password came with no old one, so nothing was re-wrapped (ruling C1).
     let (dir, rig) = enrolled().await;
-    assert!(!login(&rig, "not it").await);
-    assert!(blob(&dir).exists());
+    assert!(!login(&rig, "reset by root").await);
+    assert!(!blob(&dir).exists());
     assert!(asked(&rig).is_empty());
-    assert_eq!(audited(&rig)[1..], [("unlock-login", Verdict::Denied)]);
-    // No attempt limit: the right one still opens it after many wrong ones.
-    for _ in 0..5 {
-        assert!(!login(&rig, "not it").await);
-    }
-    assert!(login(&rig, PW).await);
+    assert_eq!(audited(&rig)[1..], [("unlock-login", Verdict::Denied), ("unlock-login-dropped", Verdict::Failed)]);
+    // Nothing is left to open: the keyring is not even read, and enrolling again needs the master password.
+    let ring = Ring::default();
+    hand(&rig, ring.put(LOGIN, PW)).await;
+    assert_eq!(ring.left(), [LOGIN]);
+    assert!(!unlocked(&rig).await && protectors(&rig).await.is_empty());
+
+    // With a pending re-wrap too: both go.
+    let (dir, rig) = enrolled().await;
+    change(&rig, PW, NEW).await;
+    assert!(!login(&rig, "a third one").await);
+    assert!(!blob(&dir).exists() && !pending(&dir).exists());
 }
 
 #[tokio::test]
@@ -156,8 +163,10 @@ async fn a_password_change_is_rewrapped_and_the_next_login_confirms_it() {
     assert!(login(&rig, NEW).await);
     assert!(!pending(&dir).exists(), "the new wrap is now the protector");
     assert_eq!(rig.agent.dispatch(lock_op()).await, Reply::Done);
-    assert!(!login(&rig, PW).await, "the old password no longer opens it");
-    assert!(login(&rig, NEW).await);
+    assert!(login(&rig, NEW).await, "the new wrap opens again");
+    assert_eq!(rig.agent.dispatch(lock_op()).await, Reply::Done);
+    assert!(!login(&rig, PW).await, "the old password no longer opens it, and invalidates it");
+    assert!(!blob(&dir).exists());
 }
 
 #[tokio::test]
@@ -167,14 +176,14 @@ async fn a_change_that_did_not_happen_keeps_the_old_password() {
     assert!(login(&rig, PW).await);
     assert!(!pending(&dir).exists(), "the pending wrap is dropped");
     assert_eq!(rig.agent.dispatch(lock_op()).await, Reply::Done);
-    assert!(!login(&rig, NEW).await);
+    assert!(login(&rig, PW).await, "the old password still opens it");
 }
 
 #[tokio::test]
 async fn a_second_change_before_a_login_rewraps_the_pending_key_and_a_wrong_old_one_nothing() {
     let (dir, rig) = enrolled().await;
     change(&rig, "not it", NEW).await;
-    assert!(!pending(&dir).exists());
+    assert!(!pending(&dir).exists() && blob(&dir).exists(), "a wrong old password re-wraps and deletes nothing");
     assert_eq!(audited(&rig)[1..], [("unlock-login-rewrap", Verdict::Denied)]);
     change(&rig, PW, NEW).await;
     change(&rig, NEW, "third password").await;
@@ -368,6 +377,8 @@ async fn the_last_session_closed_locks_every_profile_and_another_open_one_does_n
 #[cfg(target_os = "linux")]
 #[test]
 fn the_real_keyring_answers_none_for_an_absent_or_unreadable_entry() {
+    // A keyring refused by seccomp passes only where CI says it has none (`DYBW_NO_KEYRING_TESTS=1`).
+    assert!(dybw_peer::keyring::tests_skipped() || dybw_peer::keyring::readable().is_ok(), "keyctl is refused");
     assert_eq!(UserKeyring.take("dybw:test-absent"), None);
     // A name the kernel cannot take is an error, logged once: no entry.
     assert_eq!(UserKeyring.take("a\0b"), None);

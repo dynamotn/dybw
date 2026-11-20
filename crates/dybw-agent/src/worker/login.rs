@@ -6,10 +6,12 @@
 //!
 //! A password change gives the old and the new password: the key is wrapped again for the new one into
 //! `login.pending`, and the old blob stays until a login shows which password is current (ruling L5): the pending
-//! blob opens, and it replaces the old one; the old one opens, and the pending one goes. A wrong password keeps the
-//! blobs: the password may have changed elsewhere (or root reset it); that is logged and audited, and the next unlock
-//! asks for the PIN or the master password. Any other failure (another device, a rotated key, an unreadable blob)
-//! deletes the blobs, logged and audited.
+//! blob opens, and it replaces the old one; the old one opens, and the pending one goes. A login password that opens
+//! neither invalidates the protector (ADR 0006: a password reset by root, or one changed where `pam_bwss` did not see
+//! it), as does any other failure (another device, a rotated key, an unreadable blob): the blobs are deleted, logged
+//! and audited, and the next unlock asks for the PIN or the master password; enrolling again needs the master
+//! password. An old password that does not open the protector at a change re-wraps nothing and deletes nothing: the
+//! next login decides.
 
 use std::path::PathBuf;
 
@@ -146,13 +148,15 @@ async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, agent: &Caller, t
     let user = match user {
         Ok(user) => user,
         Err(e) => {
+            // Wrong: the password changed without a re-wrap (a reset by root), so the protector is no longer the
+            // login password's (ruling C1).
             audit_as(ctx, agent, LOGIN, "unlock-login", Verdict::Denied);
-            if e == ProtectorError::Wrong {
-                let why = "the login password does not open the login protector (changed elsewhere?); it is kept";
-                tracing::warn!(profile = %ctx.profile.name, "{why}");
+            let why = if e == ProtectorError::Wrong {
+                "the login password opens it no more".to_owned()
             } else {
-                drop_login(ctx, agent, &e.to_string());
-            }
+                e.to_string()
+            };
+            drop_login(ctx, agent, &why);
             return error(AgentError::Denied);
         }
     };
