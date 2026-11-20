@@ -6,7 +6,6 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use clap::Parser as _;
 use dybw_proto::{AgentError, Field, Op, Reply, Select, Target};
 
 use super::*;
