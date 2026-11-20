@@ -23,11 +23,12 @@ fake = []
 [dependencies]
 libc.workspace = true
 thiserror.workspace = true
+# The enclave's secrets, and the clipboard tools' wiped buffers.
+zeroize.workspace = true
 
 # The clipboard tools' content hash and wiped buffers (Linux only; the tests run them everywhere).
 [target.'cfg(target_os = "linux")'.dependencies]
 sha2.workspace = true
-zeroize.workspace = true
 
 # The pasteboard through typed bindings: no unsafe needed for the calls made.
 [target.'cfg(target_os = "macos")'.dependencies]
