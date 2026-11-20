@@ -420,3 +420,61 @@ fn the_real_keyring_answers_none_for_an_absent_or_unreadable_entry() {
     assert_eq!(UserKeyring.take("a\0b"), None);
     assert_eq!(UserKeyring.take("a\0b"), None);
 }
+
+#[tokio::test]
+async fn a_pin_and_a_login_protector_live_side_by_side() {
+    const PIN: &str = "246813";
+    let pin_add = || Op::UnlockAdd { profile: org(), protector: "pin".into() };
+    let remove = |p: &str| Op::UnlockRemove { profile: org(), protector: p.into() };
+    let info = |name: &str, left| ProtectorInfo { name: name.into(), attempts_left: left };
+    let (dir, rig) = world();
+    answer(&rig, &[PASSWORD, PIN, PIN]);
+    assert_eq!(rig.agent.dispatch(pin_add()).await, Reply::Done);
+    answer(&rig, &[PASSWORD, PW, PW]);
+    assert_eq!(rig.agent.dispatch(add()).await, Reply::Done);
+    assert_eq!(rig.agent.dispatch(lock_op()).await, Reply::Done);
+    // One wrong PIN, then cancels: a count of 4 left.
+    answer(&rig, &["000000"]);
+    assert_eq!(rig.agent.dispatch(Op::Unlock { profile: org() }).await, err(AgentError::Denied));
+    assert_eq!(protectors(&rig).await, [info("pin", Some(4)), info("login", None)]);
+    asked(&rig);
+
+    // A login password unlocks and leaves the PIN and its count alone.
+    assert!(login(&rig, PW).await);
+    assert!(asked(&rig).is_empty());
+    assert_eq!(protectors(&rig).await, [info("pin", Some(4)), info("login", None)]);
+
+    // A password that comes while the PIN is being typed waits for it, then does nothing.
+    assert_eq!(rig.agent.dispatch(lock_op()).await, Reply::Done);
+    rig.host.answer(Answer::HeldText(PIN));
+    let agent = rig.agent.clone();
+    let typing = tokio::spawn(async move { agent.dispatch(Op::Unlock { profile: org() }).await });
+    crate::read_tests::until(|| rig.host.world().prompts.len() == 1).await;
+    let answers = rig.agent.handover(Ring::default().put(LOGIN, PW), Path::new("/x")).await;
+    rig.host.world().release.notify_one();
+    assert_eq!(typing.await.unwrap(), Reply::Done);
+    for answer in answers {
+        assert_eq!(answer.await.unwrap(), Reply::Done);
+    }
+    let logins = |rig: &Rig| audited(rig).iter().filter(|(op, _)| *op == "unlock-login").count();
+    assert_eq!(logins(&rig), 1, "only the first password unlocked");
+    assert_eq!(protectors(&rig).await, [info("pin", Some(5)), info("login", None)], "the right PIN reset the count");
+
+    // A password that opens nothing drops the login protector only.
+    assert_eq!(rig.agent.dispatch(lock_op()).await, Reply::Done);
+    assert!(!login(&rig, "reset by root").await);
+    assert!(!blob(&dir).exists());
+    assert_eq!(protectors(&rig).await, [info("pin", Some(5))]);
+
+    // Removing one keeps the other, both ways.
+    answer(&rig, &[PIN]);
+    assert_eq!(rig.agent.dispatch(Op::Unlock { profile: org() }).await, Reply::Done);
+    answer(&rig, &[PASSWORD, PW, PW]);
+    assert_eq!(rig.agent.dispatch(add()).await, Reply::Done);
+    assert_eq!(rig.agent.dispatch(remove("pin")).await, Reply::Done);
+    assert_eq!(protectors(&rig).await, [info("login", None)]);
+    answer(&rig, &[PASSWORD, PIN, PIN]);
+    assert_eq!(rig.agent.dispatch(pin_add()).await, Reply::Done);
+    assert_eq!(rig.agent.dispatch(remove("login")).await, Reply::Done);
+    assert_eq!(protectors(&rig).await, [info("pin", Some(5))]);
+}

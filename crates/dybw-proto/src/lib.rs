@@ -331,7 +331,7 @@ pub enum Op {
     /// The SSH agent's keys (profiles §8): names, fingerprints, types and profiles, no secret.
     SshList,
     /// Enrol a local unlock protector (ADR 0006) on this device: the agent asks for the master password, then for
-    /// the factor (a PIN twice), in the pinentry. Only `pin` exists so far.
+    /// the factor twice, in the pinentry: `pin` (a PIN), or `login` (the login password; Linux only).
     UnlockAdd {
         profile: Option<String>,
         protector: String,
