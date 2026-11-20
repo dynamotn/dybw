@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use dybw_core::crypto::SymmetricKey;
 use dybw_core::vault::item::{self, Data};
 use serde_json::Value;
-use signature::Signer;
+use signature::{Signer, Verifier};
 use ssh_key::encoding::Encode;
 use ssh_key::private::KeypairData;
 use ssh_key::{Algorithm, HashAlg, PrivateKey, PublicKey};
@@ -52,7 +52,8 @@ pub enum SshError {
 }
 
 /// The personal SSH key items of `sync` that are not in the trash, by any type the agent can sign with
-/// (Ed25519, RSA, ECDSA P-256/384/521). An item that does not read or holds no such public key is left out.
+/// (Ed25519, RSA, ECDSA P-256/384/521). An item that does not read or holds no such public key is left out, and so
+/// is one whose key an earlier item already holds.
 pub fn keys(sync: &Value, user: &SymmetricKey) -> Vec<Key> {
     let read = |c: &Value| {
         let public = item::ssh_public(c, user, &BTreeMap::new()).ok()?;
@@ -66,7 +67,13 @@ pub fn keys(sync: &Value, user: &SymmetricKey) -> Vec<Key> {
         })
     };
     let all: Vec<&Value> = personal_ssh(sync).collect();
-    let keys: Vec<Key> = all.iter().copied().filter_map(read).collect();
+    let mut keys: Vec<Key> = Vec::new();
+    // One key held by several items is listed once, as the first, so a blob names one item.
+    for key in all.iter().copied().filter_map(read) {
+        if find(&keys, &key.blob).is_none() {
+            keys.push(key);
+        }
+    }
     if keys.len() < all.len() {
         tracing::info!(skipped = all.len() - keys.len(), "SSH key items that cannot be used are left out");
     }
@@ -113,7 +120,11 @@ pub fn sign(
         }
         other => other.try_sign(data),
     };
-    signature.map_err(|_| SshError::Sign)?.encode_vec().map_err(|_| SshError::Sign)
+    let signature = signature.map_err(|_| SshError::Sign)?;
+    // ssh-key never checks the private scalar against the public half it carries: a signature the listed key does
+    // not verify was made by another key.
+    Verifier::verify(&stored, data, &signature).map_err(|_| SshError::KeyMismatch)?;
+    signature.encode_vec().map_err(|_| SshError::Sign)
 }
 
 /// The personal SSH key items not in the trash; organization items are left out in P4.5.
@@ -133,7 +144,7 @@ mod tests {
     use serde_json::{Value, json};
     use signature::Verifier;
     use ssh_key::encoding::Decode;
-    use ssh_key::private::{Ed25519Keypair, KeypairData, RsaKeypair, SkEd25519};
+    use ssh_key::private::{EcdsaKeypair, Ed25519Keypair, KeypairData, RsaKeypair, SkEd25519};
     use ssh_key::rand_core::{TryCryptoRng, TryRng};
     use ssh_key::{Algorithm, EcdsaCurve, LineEnding, PrivateKey, Signature, public};
 
@@ -249,6 +260,8 @@ mod tests {
         for (n, key) in generated.iter().enumerate() {
             world.key(&format!("k{n}"), key);
         }
+        // Listing never reads the private key: one that does not decrypt is still listed.
+        world.sync["ciphers"][1]["sshKey"]["privateKey"] = json!("2.not|a|cipher");
         let before = opens();
         let listed = world.keys();
         assert_eq!(opens(), before, "listing opens nothing");
@@ -358,6 +371,36 @@ mod tests {
         assert_eq!(world.sign("swapped", &blob(&other), 0), Err(SshError::KeyMismatch));
         // The client asked for another key than this item's.
         assert_eq!(world.sign("k", &blob(&other), 0), Err(SshError::KeyMismatch));
+    }
+
+    #[test]
+    fn a_key_held_by_several_items_is_listed_once_as_the_first() {
+        let mut world = World::new();
+        let (key, other) = (generate(Algorithm::Ed25519), generate(Algorithm::Ed25519));
+        world.key("first", &key);
+        world.key("other", &other);
+        world.key("second", &key);
+        let listed = world.keys();
+        assert_eq!(listed.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(), ["first", "other"]);
+        assert_eq!(find(&listed, &blob(&key)).unwrap().id, "first");
+    }
+
+    #[test]
+    fn a_private_key_whose_scalar_is_not_its_public_half_does_not_sign() {
+        let mut world = World::new();
+        let (key, other) = (generate(ecdsa(EcdsaCurve::NistP256)), generate(ecdsa(EcdsaCurve::NistP256)));
+        use EcdsaKeypair::NistP256;
+        let KeypairData::Ecdsa(NistP256 { public, .. }) = key.key_data() else { panic!() };
+        let KeypairData::Ecdsa(NistP256 { private, .. }) = other.key_data() else { panic!() };
+        // `key`'s public half with `other`'s private scalar: it parses and matches the item and the request.
+        let forged = NistP256 { public: *public, private: private.clone() };
+        let forged = PrivateKey::new(KeypairData::from(forged), "").unwrap();
+        world.item(
+            "forged",
+            Some(&forged.to_openssh(LineEnding::LF).unwrap()),
+            Some(&key.public_key().to_openssh().unwrap()),
+        );
+        assert_eq!(world.sign("forged", &blob(&key), 0), Err(SshError::KeyMismatch));
     }
 
     #[test]
