@@ -32,8 +32,21 @@ fn swap(sig: i32, new: &libc::sigaction) -> std::io::Result<libc::sigaction> {
     if unsafe { libc::sigaction(sig, new, &mut old) } == 0 { Ok(old) } else { Err(std::io::Error::last_os_error()) }
 }
 
+/// `sig`'s current action.
+fn current(sig: i32) -> std::io::Result<libc::sigaction> {
+    // SAFETY: all-zero is a valid `sigaction`, used as an out-parameter only.
+    let mut now: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a null new action only reads the current one into `now`, a live, aligned out-parameter.
+    if unsafe { libc::sigaction(sig, std::ptr::null(), &mut now) } == 0 {
+        Ok(now)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 impl Deferred {
-    /// Note the signals from now on instead of acting on them. Waits while another `Deferred` lives.
+    /// Note the signals from now on instead of acting on them; one this process ignores stays ignored (as `system(3)`
+    /// does: `nohup` keeps SIGHUP away). Waits while another `Deferred` lives.
     pub fn new() -> std::io::Result<Deferred> {
         let one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         CAUGHT.store(0, Ordering::SeqCst);
@@ -46,6 +59,9 @@ impl Deferred {
         action.sa_flags = libc::SA_RESTART;
         let mut held = Deferred { old: Vec::with_capacity(SIGNALS.len()), _one: one };
         for sig in SIGNALS {
+            if current(sig)?.sa_sigaction == libc::SIG_IGN {
+                continue;
+            }
             // A failure drops `held`, which puts back the ones already swapped.
             let old = swap(sig, &action)?;
             held.old.push((sig, old));
@@ -73,16 +89,34 @@ impl Drop for Deferred {
 mod tests {
     use super::*;
 
+    /// The tests that change dispositions take turns.
+    static TURN: Mutex<()> = Mutex::new(());
+
     fn handler(sig: i32) -> libc::sighandler_t {
-        // SAFETY: a null new action only reads the current one into `old`, a live out-parameter.
-        let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
-        // SAFETY: as above.
-        assert_eq!(unsafe { libc::sigaction(sig, std::ptr::null(), &mut old) }, 0);
-        old.sa_sigaction
+        current(sig).unwrap().sa_sigaction
+    }
+
+    #[test]
+    fn a_signal_this_process_ignores_stays_ignored() {
+        let _turn = TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: as in `swap`; every field that matters is set below.
+        let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
+        ignore.sa_sigaction = libc::SIG_IGN;
+        let before = swap(libc::SIGHUP, &ignore).unwrap();
+        let held = Deferred::new().unwrap();
+        assert_eq!(handler(libc::SIGHUP), libc::SIG_IGN, "as under nohup");
+        // SAFETY: SIGHUP is ignored: raising it does nothing.
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        assert_eq!(held.caught(), None);
+        assert_ne!(handler(libc::SIGINT), libc::SIG_IGN, "the others are held");
+        drop(held);
+        assert_eq!(handler(libc::SIGHUP), libc::SIG_IGN);
+        swap(libc::SIGHUP, &before).unwrap();
     }
 
     #[test]
     fn signals_are_noted_while_deferred_and_the_old_actions_come_back() {
+        let _turn = TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let before: Vec<_> = SIGNALS.iter().map(|s| handler(*s)).collect();
         let held = Deferred::new().unwrap();
         assert_eq!(held.caught(), None);
@@ -103,5 +137,6 @@ mod tests {
         // SAFETY: as in `swap`.
         let action: libc::sigaction = unsafe { std::mem::zeroed() };
         assert!(swap(libc::SIGKILL, &action).is_err());
+        assert!(current(0).is_err(), "no signal 0");
     }
 }
