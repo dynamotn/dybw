@@ -297,11 +297,16 @@ impl Worker {
 
     /// Run `cmd` on the worker. A worker that panicked or died answers `Internal`, so a profile never hangs.
     pub async fn call(&self, cmd: Cmd, now: Instant) -> Reply {
+        self.post(cmd, now).await.unwrap_or_else(|_| internal())
+    }
+
+    /// Queue `cmd` now, in order with every other command, without waiting for it: its answer comes on the receiver,
+    /// which may be dropped. A dead worker's receiver answers an error at once.
+    pub fn post(&self, cmd: Cmd, now: Instant) -> oneshot::Receiver<Reply> {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(Msg { cmd, now, reply }).is_err() {
-            return internal();
-        }
-        rx.await.unwrap_or_else(|_| internal())
+        // A send to a dead worker drops `reply`, which closes `rx`.
+        let _ = self.tx.send(Msg { cmd, now, reply });
+        rx
     }
 
     /// False once the worker thread is gone.

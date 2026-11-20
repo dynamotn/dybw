@@ -137,14 +137,15 @@ pub(crate) fn the_agent() -> Caller {
 /// again.
 async fn new_secret<H: Host>(host: &H, ctx: &Ctx, kind: Protector) -> Result<Zeroizing<String>, AgentError> {
     let name = &ctx.profile.name;
-    let (label, first, min, differ) = if kind == Protector::Pin {
+    let (label, first, min, short, differ) = if kind == Protector::Pin {
         let first = format!(
             "dybw profile {name}: choose a PIN of at least {MIN_PIN} characters to unlock this profile on this device. \
              It stays in the agent's memory only; {MAX_ATTEMPTS} wrong PINs drop it."
         );
-        ("PIN", first, MIN_PIN, "The two PINs differ.")
+        ("PIN", first, MIN_PIN, "The PIN is too short.", "The two PINs differ.")
     } else {
-        ("Login password", login::enrol_text(name), 1, "The two passwords differ.")
+        // An empty answer is a cancel, so a login password is never too short.
+        ("Login password", login::enrol_text(name), 1, "The login password is too short.", "The two passwords differ.")
     };
     let again = format!("dybw profile {name}: type the same {} again.", label.to_lowercase());
     let (prompt, prompt_again) = (format!("{label}:"), format!("{label} again:"));
@@ -152,7 +153,7 @@ async fn new_secret<H: Host>(host: &H, ctx: &Ctx, kind: Protector) -> Result<Zer
     for _ in 0..TRIES {
         let secret = session::ask(host, &prompt, &first, wrong).await?;
         if secret.chars().count() < min {
-            wrong = Some("The PIN is too short.");
+            wrong = Some(short);
             continue;
         }
         if *session::ask(host, &prompt_again, &again, None).await? == *secret {
@@ -230,6 +231,8 @@ async fn enrol<H: Host>(
         shared.state.borrow_mut().pin = Some(blob);
         return Ok(());
     }
+    // One write of the protector's files at a time: a password handed over meanwhile waits (ruling L3).
+    let _op = shared.op.lock().await;
     login::save(ctx, login::LOGIN, &blob).map_err(|e| {
         tracing::warn!(profile = %ctx.profile.name, "the login protector was not saved: {}", e.kind());
         failed(AgentError::Internal)

@@ -1,7 +1,7 @@
 //! The `login` protector and the keyring handover (ADR 0006), against a fake keyring and the scripted host:
 //! enrolment, unlock by the handed-over password, a password change (ruling L5), what drops the protector, and the
 //! lock at the last session's close. The `org` vector account is used, as for the PIN.
-#![expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
+#![expect(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -60,8 +60,11 @@ fn audited(rig: &Rig) -> Vec<(&'static str, Verdict)> {
 }
 
 /// One look at `ring`, with logind's sessions in `sessions`.
+/// One look at `ring`, with logind's sessions in `sessions`, and every worker's answer to it.
 async fn look(rig: &Rig, ring: &Ring, sessions: &Path) {
-    rig.agent.handover(ring, sessions).await;
+    for answer in rig.agent.handover(ring, sessions).await {
+        answer.await.unwrap();
+    }
 }
 
 /// One look, with no logind.
@@ -323,12 +326,40 @@ async fn a_login_password_waits_for_an_unlock_in_flight_and_then_does_nothing() 
     let typing = tokio::spawn(async move { agent.dispatch(Op::Unlock { profile: org() }).await });
     crate::read_tests::until(|| rig.host.world().prompts.len() == 1).await;
     let agent = rig.agent.clone();
-    let handed = tokio::spawn(async move { agent.handover(Ring::default().put(LOGIN, PW), Path::new("/")).await });
+    let answers = agent.handover(Ring::default().put(LOGIN, PW), Path::new("/")).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     rig.host.world().release.notify_one();
     assert_eq!(typing.await.unwrap(), Reply::Done);
-    handed.await.unwrap();
+    for answer in answers {
+        assert_eq!(answer.await.unwrap(), Reply::Done);
+    }
     assert_eq!(audited(&rig).len(), 1, "the login password unlocked nothing");
+}
+
+#[tokio::test]
+async fn a_worker_busy_with_a_pinentry_does_not_stall_the_next_look() {
+    let (_dir, rig) = enrolled().await;
+    rig.host.answer(Answer::Hang);
+    let agent = rig.agent.clone();
+    let typing = tokio::spawn(async move { agent.dispatch(Op::Unlock { profile: org() }).await });
+    crate::read_tests::until(|| rig.host.world().prompts.len() == 1).await;
+    // The password waits for the unlock in flight; the look does not.
+    let second = std::time::Duration::from_secs(2);
+    let ring = Ring::default();
+    let answers = tokio::time::timeout(second, rig.agent.handover(ring.put(LOGIN, PW), Path::new("/x")));
+    let answers = answers.await.expect("the look waited for a busy worker");
+    // A session close in the next look is not held up either: it locks, which cancels the question.
+    tokio::time::timeout(second, look(&rig, Ring::default().put(LOCK, "c1"), Path::new("/x"))).await.unwrap();
+    assert_eq!(typing.await.unwrap(), err(AgentError::Locked));
+    drop(answers);
+}
+
+#[tokio::test]
+async fn a_leftover_old_password_equal_to_the_new_one_is_a_plain_login() {
+    let (dir, rig) = enrolled().await;
+    hand(&rig, Ring::default().put(LOGIN_OLD, PW).put(LOGIN, PW)).await;
+    assert!(unlocked(&rig).await && !pending(&dir).exists());
+    assert_eq!(audited(&rig)[1..], [("unlock-login", Verdict::Confirmed)]);
 }
 
 /// A logind session file.
@@ -369,7 +400,13 @@ async fn the_last_session_closed_locks_every_profile_and_another_open_one_does_n
     look(&rig, ring.put(LOCK, "3"), sessions.path()).await;
     assert!(ring.left().is_empty() && unlocked(&rig).await, "no session named, then session 2 still open");
     std::fs::remove_file(sessions.path().join("2")).unwrap();
+    // A profile without the protector, running, locks too, and is audited.
+    let _ = rig.agent.dispatch(Op::Status { profile: Some("work".into()) }).await;
     look(&rig, ring.put(LOCK, "3"), sessions.path()).await;
+    let mut locked: Vec<_> =
+        rig.audit.events().into_iter().filter(|e| e.op == "lock-session").map(|e| e.profile).collect();
+    locked.sort();
+    assert_eq!(locked, ["org", "work"]);
     assert!(!unlocked(&rig).await);
     assert_eq!(audited(&rig).last(), Some(&("lock-session", Verdict::Confirmed)));
 }

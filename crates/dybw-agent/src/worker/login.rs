@@ -127,13 +127,10 @@ async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, agent: &Caller, t
         Some(blob) => open(blob, &bound, &account.0, token).await,
         None => Err(ProtectorError::Wrong),
     };
+    // The new password is the current one when the pending wrap opens: it replaces the old once the account took it.
+    let promote = pending.is_ok();
     let user = match pending {
-        Ok(user) => {
-            // The new password is the current one: its wrap replaces the old.
-            let promoted = std::fs::rename(path(ctx, PENDING), path(ctx, LOGIN)).is_ok();
-            tracing::info!(profile = %ctx.profile.name, promoted, "the login protector of the new password is in use");
-            Ok(user)
-        }
+        Ok(user) => Ok(user),
         Err(e) => {
             if e != ProtectorError::Wrong {
                 tracing::warn!(profile = %ctx.profile.name, "the pending login protector was deleted: {e}");
@@ -162,6 +159,10 @@ async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, agent: &Caller, t
     };
     match session::unlock_with_key(ctx, user, account).await {
         Ok(session) => {
+            if promote {
+                let promoted = std::fs::rename(path(ctx, PENDING), path(ctx, LOGIN)).is_ok();
+                tracing::info!(profile = %ctx.profile.name, promoted, "the login protector of the new password is in use");
+            }
             opened(shared, session);
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
             shared.state.borrow_mut().handover = Some(now.as_secs());

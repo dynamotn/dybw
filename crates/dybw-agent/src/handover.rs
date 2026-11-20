@@ -14,6 +14,8 @@
 use std::path::Path;
 use std::time::SystemTime;
 
+use dybw_proto::Reply;
+use tokio::sync::oneshot::Receiver;
 use zeroize::Zeroizing;
 
 use crate::agent::Agent;
@@ -61,7 +63,7 @@ pub async fn watch(agent: std::sync::Arc<Agent>, keyring: std::sync::Arc<dyn Key
     let mut tick = tokio::time::interval(POLL);
     loop {
         tick.tick().await;
-        agent.handover(&*keyring, Path::new("/run/systemd/sessions")).await;
+        drop(agent.handover(&*keyring, Path::new("/run/systemd/sessions")).await);
     }
 }
 
@@ -88,37 +90,47 @@ impl Agent {
         self.config.names().into_iter().filter(|n| self.config.profile(Some(n)).is_ok_and(|p| enrolled(&p))).collect()
     }
 
-    /// One look at the keyring (see the module's text); `sessions` is logind's session directory.
-    pub(crate) async fn handover(&self, keyring: &dyn Keyring, sessions: &Path) {
+    /// One look at the keyring (see the module's text); `sessions` is logind's session directory. Every entry is taken
+    /// first; a lock is done before this returns; a password is queued on each profile's worker, in order with the
+    /// rest of its work, and not waited for (a worker busy with a pinentry must not stall the next look). The answers
+    /// come on the receivers returned, which the watch drops.
+    pub(crate) async fn handover(&self, keyring: &dyn Keyring, sessions: &Path) -> Vec<Receiver<Reply>> {
         let names = self.with_login();
         if names.is_empty() {
-            return;
+            return Vec::new();
         }
-        if let Some(lock) = keyring.take(LOCK) {
-            self.lock_session(&lock, sessions, &names).await;
+        let lock = keyring.take(LOCK);
+        let token = keyring.take(LOGIN);
+        // The old password comes only with a new one; one equal to it (a leftover) is no change.
+        let old = token.as_ref().and_then(|_| keyring.take(LOGIN_OLD)).filter(|old| Some(old) != token.as_ref());
+        if let Some(lock) = lock {
+            self.lock_session(&lock, sessions).await;
         }
-        let Some(token) = keyring.take(LOGIN) else { return };
-        let old = keyring.take(LOGIN_OLD);
+        let Some(token) = token else { return Vec::new() };
         tracing::info!(change = old.is_some(), "a login password was handed over");
+        let mut answers = Vec::new();
         for name in &names {
-            let cmd = Cmd::LoginToken { token: Token(token.clone()), old: old.clone().map(Token) };
-            self.on_profile(Some(name), cmd).await;
+            let worker = self.config.profile(Some(name)).ok().and_then(|p| self.worker(&p));
+            let cmd = || Cmd::LoginToken { token: Token(token.clone()), old: old.clone().map(Token) };
+            answers.extend(worker.map(|w| w.post(cmd(), self.clock.mono())));
         }
+        answers
     }
 
-    /// A session closed: lock every profile when it was the user's last.
-    async fn lock_session(&self, id: &[u8], sessions: &Path, names: &[String]) {
+    /// A session closed: lock every profile when it was the user's last, each audited.
+    async fn lock_session(&self, id: &[u8], sessions: &Path) {
         let id = String::from_utf8_lossy(id);
         // `-`: pam_systemd did not run before pam_bwss, so the session is unknown.
         if id == "-" || others_open(sessions, self.uid, &id) {
             return;
         }
         tracing::info!("the last session closed: locking every profile");
-        self.each(|| Cmd::Lock).await;
-        for name in names {
+        for name in self.config.names() {
+            let Some(worker) = self.running(&name) else { continue };
+            worker.call(Cmd::Lock, self.clock.mono()).await;
             self.audit.record(AuditEvent {
                 time: SystemTime::now(),
-                profile: name.clone(),
+                profile: name,
                 caller: the_agent(),
                 op: "lock-session",
                 kind: Some(PROTECTOR),

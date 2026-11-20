@@ -165,7 +165,7 @@ impl Agent {
 
     /// The worker of a profile, started on first use and again after it died (its keys died with it).
     /// `None` once `shutdown` has begun.
-    fn worker(&self, profile: &Profile) -> Option<Arc<Worker>> {
+    pub(crate) fn worker(&self, profile: &Profile) -> Option<Arc<Worker>> {
         let mut workers = self.workers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.closed.load(Ordering::SeqCst) {
             return None;
