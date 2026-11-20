@@ -865,10 +865,11 @@ fn verdicts(rig: &Rig) -> Vec<Verdict> {
     rig.audit.events().iter().filter(|e| e.op == "ssh-sign").map(|e| e.verdict).collect()
 }
 
-/// An `ssh` process `pid` (started at `pid`) run by `/usr/bin/git`.
+/// An `ssh-keygen` process `pid` (started at `pid`) run by `/usr/bin/git` (a signed commit). Not `ssh`: that is a
+/// launcher, never offered "always" (the main socket's rule).
 fn ssh_client(pid: u32) -> Caller {
     let at = At { pid, start: u64::from(pid), parent: Some("/usr/bin/git".into()), ..At::default() };
-    Caller::Invoker { exe: "/usr/bin/ssh".into(), script: None, hash: "h-ssh".into(), relative: false, at }
+    Caller::Invoker { exe: "/usr/bin/ssh-keygen".into(), script: None, hash: "h-ssh".into(), relative: false, at }
 }
 
 fn ai() -> Caller {
@@ -912,8 +913,8 @@ async fn a_signature_is_confirmed_naming_the_key_the_client_and_that_it_is_not_a
     assert!(signed(&ssh, &who, &Conn::default(), &w.alpha, b"a git commit").await);
     let text = &confirmed(&w.rig)[0];
     let want = format!(
-        "dybw profile work: allow the SSH client /usr/bin/ssh (run by /usr/bin/git) to sign data that is NOT an SSH \
-         login (a git commit, a file, a challenge) with the SSH key \"alpha\" ({})? [always: this process and this \
+        "dybw profile work: allow the SSH client /usr/bin/ssh-keygen (run by /usr/bin/git) to sign data that is NOT an \
+         SSH login (a git commit, a file, a challenge) with the SSH key \"alpha\" ({})? [always: this process and this \
          key, until the profile locks]",
         fingerprint(&w.alpha)
     );
@@ -983,8 +984,9 @@ async fn a_login_names_its_destination_and_a_forwarded_or_unproven_connection_sa
         (Some("login"), true, false),
         (Some("login"), true, true),
         (Some("login"), false, false),
-        (Some("data"), true, false),
-        (Some("data"), true, true),
+        // Data on a bound connection is not proven to go to that host: no `dest` in the audit.
+        (Some("data"), false, false),
+        (Some("data"), false, true),
     ];
     assert_eq!(lines, want);
     assert_eq!(events[0].ssh.as_ref().unwrap().dest, Some(fingerprint(&host)));
@@ -1095,6 +1097,19 @@ async fn at_most_so_many_answers_and_cancelled_clients_are_kept() {
     assert!(signed(&ssh, &on_peer(ssh_client(1000)), &Conn::default(), &w.alpha, b"x").await);
     assert!(signed(&ssh, &on_peer(ssh_client(1064)), &Conn::default(), &w.alpha, b"x").await);
     assert_eq!(confirmed(&w.rig).len(), 66);
+    // "No" counts: two for the first client, then 64 others push it out, so its third "no" counts as its first.
+    let first = on_peer(ssh_client(3000));
+    for _ in 0..2 {
+        assert!(!signed(&ssh, &first, &Conn::default(), &w.alpha, b"x").await);
+    }
+    for pid in 1..65 {
+        assert!(!signed(&ssh, &on_peer(ssh_client(3000 + pid)), &Conn::default(), &w.alpha, b"x").await);
+    }
+    let before = confirmed(&w.rig).len();
+    for _ in 0..2 {
+        assert!(!signed(&ssh, &first, &Conn::default(), &w.alpha, b"x").await);
+    }
+    assert_eq!(confirmed(&w.rig).len(), before + 2, "the oldest count is forgotten");
     w.rig.agent.dispatch(Op::Lock { target: Target::Profile("work".into()) }).await;
     for pid in 0..65 {
         assert!(!signed(&ssh, &on_peer(ssh_client(2000 + pid)), &Conn::default(), &w.alpha, b"x").await);
@@ -1115,7 +1130,7 @@ async fn a_key_of_a_locked_profile_asks_to_unlock_naming_the_client_then_to_conf
     assert!(signed(&ssh, &on_peer(ssh_client(500)), &Conn::default(), &w.alpha, b"x").await);
     let asked = w.rig.host.world().asked.clone();
     let want = "Unlock dybw profile work (pbkdf2@vectors.invalid): an SSH signature asked by the SSH client \
-                /usr/bin/ssh (run by /usr/bin/git)";
+                /usr/bin/ssh-keygen (run by /usr/bin/git)";
     assert_eq!(asked[unlocks..].iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>(), [want]);
     assert_eq!(confirmed(&w.rig).len(), 1, "then confirmed");
     // An unknown client may unlock, as on the main socket, and is named as one.
@@ -1146,11 +1161,12 @@ async fn an_ai_client_never_gets_an_unlock_question() {
     // The main socket refuses it the same way.
     let unlock = Op::Unlock { profile: Some("work".into()) };
     assert_eq!(w.rig.agent.dispatch_as(unlock, ai()).await, Reply::Error { error: dybw_proto::AgentError::Denied });
-    // Every profile unlocked: a key no profile holds is refused with nothing to audit.
+    // Every profile unlocked: a key no profile holds is refused and audited with no profile.
     crate::agent::testing::unlock(&w.rig.agent, &w.rig.host, "work").await;
-    let lines = w.rig.audit.events().len();
     assert!(!signed(&ssh, &on_peer(ai()), &Conn::default(), &ed25519(5), b"x").await);
-    assert_eq!(w.rig.audit.events().len(), lines);
+    let e = w.rig.audit.events().pop().unwrap();
+    assert_eq!((e.op, e.profile.as_str(), e.verdict, e.item), ("ssh-sign", "", Verdict::Denied, None));
+    assert_eq!(e.ssh.unwrap().key, fingerprint(&ed25519(5)));
 }
 
 /// A deny entry of the caller policy refuses the program before any question; an allow entry does not skip it.
@@ -1164,7 +1180,7 @@ async fn a_policy_deny_refuses_the_client_and_an_allow_does_not_skip_the_questio
         crate::agent::testing::me(),
     );
     let entry = |rule| dybw_proto::PolicyEntry {
-        exe: "/usr/bin/ssh".into(),
+        exe: "/usr/bin/ssh-keygen".into(),
         script: None,
         hash: "h-ssh".into(),
         rule,
@@ -1231,7 +1247,15 @@ async fn a_cancelled_unlock_is_not_asked_again_for_that_client_until_the_profile
     w.rig.host.allow();
     assert!(signed(&ssh, &one, &Conn::default(), &w.alpha, b"x").await);
     assert_eq!(asked(), before + 1);
-    assert!(verdicts(&w.rig).iter().all(|v| *v == Verdict::Confirmed), "a refused unlock decides no signature");
+    // A cancelled unlock and one not asked again are refused signatures with no item, on the locked profile.
+    let denied = Verdict::Denied;
+    assert_eq!(verdicts(&w.rig), [denied, denied, denied, Verdict::Confirmed]);
+    let refused: Vec<_> = w.rig.audit.events().into_iter().filter(|e| e.verdict == denied).collect();
+    assert!(
+        refused
+            .iter()
+            .all(|e| e.profile == "work" && e.item.is_none() && e.ssh.as_ref().unwrap().key == fingerprint(&w.alpha))
+    );
 }
 
 #[tokio::test]
@@ -1448,4 +1472,107 @@ async fn names_users_and_paths_are_shown_on_one_line() {
     assert!(text.contains("\"evil\u{fffd}name\u{fffd}txt\""), "{text}");
     assert!(text.contains("log in as \"root\u{fffd}\u{fffd}\u{fffd}\""), "{text}");
     assert!(text.contains("(run by /usr/bin/\u{fffd}tig\u{fffd}\u{fffd}[2Jx)"), "{text}");
+}
+
+/// An "always" covers one kind of data (a login, or data that is not one) and never a forwarded request: none is
+/// offered for one, and a held grant is not used by one.
+#[tokio::test]
+async fn an_always_covers_neither_a_forwarded_request_nor_another_kind_of_data() {
+    let w = world(vec![]).await;
+    let ssh = confirming(&w, &["work"]);
+    let who = on_peer(ssh_client(500));
+    let login = Userauth::new(&w.alpha).bytes();
+    w.rig.host.allow_always();
+    assert!(signed(&ssh, &who, &Conn::default(), &w.alpha, &login).await);
+    w.rig.host.allow();
+    assert!(signed(&ssh, &who, &Conn::default(), &w.alpha, b"a commit").await, "a login's always: data is asked");
+    w.rig.host.allow_always();
+    assert!(signed(&ssh, &who, &Conn::default(), &w.alpha, b"data").await);
+    assert!(signed(&ssh, &who, &Conn::default(), &w.alpha, b"more").await, "held for data now");
+    // Forwarded: asked although data is held, and "always" is not offered.
+    let host = ed25519(9);
+    let mut forwarded = Conn::default();
+    assert_eq!(bind(&mut forwarded, &bind_request(&host, &host, b"sid-1", true)), Some(true));
+    w.rig.host.allow_always();
+    assert!(signed(&ssh, &who, &forwarded, &w.alpha, b"x").await);
+    w.rig.host.allow();
+    assert!(signed(&ssh, &who, &forwarded, &w.alpha, b"y").await);
+    let v = Verdict::Confirmed;
+    let want = [Verdict::Remembered, v, Verdict::Remembered, Verdict::Granted, v, v];
+    assert_eq!(verdicts(&w.rig), want);
+    assert_eq!(w.rig.host.world().offered, [true, true, true, false, false]);
+}
+
+/// The main socket's rule for "always": never for a launcher (`ssh` itself) or a bare interpreter.
+#[tokio::test]
+async fn always_is_not_offered_to_a_launcher_or_a_bare_interpreter() {
+    let w = world(vec![]).await;
+    let ssh = confirming(&w, &["work"]);
+    for exe in ["/usr/bin/ssh", "/usr/bin/python3"] {
+        let at = At { pid: 7, start: 7, parent: Some("/usr/bin/git".into()), ..At::default() };
+        let caller = Caller::Invoker { exe: exe.into(), script: None, hash: "h".into(), relative: false, at };
+        for _ in 0..2 {
+            w.rig.host.allow_always();
+            assert!(signed(&ssh, &on_peer(caller.clone()), &Conn::default(), &w.alpha, b"x").await);
+        }
+    }
+    assert_eq!(w.rig.host.world().offered, [false; 4]);
+    assert_eq!(verdicts(&w.rig), [Verdict::Confirmed; 4]);
+}
+
+/// After three "no" answers a client is asked nothing more until the profile locks or unlocks; the refusals are
+/// audited. Another client is still asked.
+#[tokio::test]
+async fn a_client_refused_three_times_is_not_asked_again_until_a_lock() {
+    let w = world(vec![]).await;
+    let ssh = confirming(&w, &["work"]);
+    let who = on_peer(ssh_client(500));
+    for _ in 0..4 {
+        assert!(!signed(&ssh, &who, &Conn::default(), &w.alpha, b"x").await);
+    }
+    assert_eq!(confirmed(&w.rig).len(), 3, "the fourth is not asked");
+    let d = Verdict::Declined;
+    assert_eq!(verdicts(&w.rig), [d, d, d, Verdict::Denied]);
+    w.rig.host.allow();
+    assert!(signed(&ssh, &on_peer(ssh_client(501)), &Conn::default(), &w.alpha, b"x").await, "another process");
+    w.rig.agent.dispatch(Op::Lock { target: Target::Profile("work".into()) }).await;
+    crate::agent::testing::unlock(&w.rig.agent, &w.rig.host, "work").await;
+    w.rig.host.allow();
+    assert!(signed(&ssh, &who, &Conn::default(), &w.alpha, b"x").await, "asked again after a lock");
+}
+
+/// `ssh-add -d`/`-D` from an AI-class client fail; every removal is audited (`ssh-remove`, the key or "all").
+#[tokio::test]
+async fn removals_are_audited_and_refused_to_an_ai_client() {
+    let w = world(vec![]).await;
+    let ai = on_peer(ai());
+    let mut conn = Conn::default();
+    let remove = message(REMOVE_IDENTITY, &[&blob(&w.alpha)]);
+    assert_eq!(w.ssh.answer(&ai, &mut conn, &remove).await.unwrap(), FAIL);
+    assert_eq!(w.ssh.answer(&ai, &mut conn, &message(REMOVE_ALL_IDENTITIES, &[])).await.unwrap(), FAIL);
+    assert_eq!(w.ssh.keys().await.len(), 2, "nothing removed");
+    let me = on_peer(ssh_client(500));
+    assert_eq!(w.ssh.answer(&me, &mut conn, &remove).await.unwrap(), OK);
+    assert_eq!(w.ssh.answer(&me, &mut conn, &remove).await.unwrap(), FAIL, "no longer offered");
+    assert_eq!(w.ssh.answer(&me, &mut conn, &message(REMOVE_ALL_IDENTITIES, &[])).await.unwrap(), OK);
+    let garbage = message(REMOVE_IDENTITY, &[b"not a key"]);
+    assert_eq!(w.ssh.answer(&me, &mut conn, &garbage).await.unwrap(), FAIL);
+    let lines: Vec<_> = w
+        .rig
+        .audit
+        .events()
+        .into_iter()
+        .filter(|e| e.op == "ssh-remove")
+        .map(|e| (e.profile, e.verdict, e.ssh.unwrap().key, e.caller == ai.caller))
+        .collect();
+    let alpha = fingerprint(&w.alpha);
+    let want = [
+        (String::new(), Verdict::Denied, alpha.clone(), true),
+        (String::new(), Verdict::Denied, "all".to_owned(), true),
+        ("work".to_owned(), Verdict::Granted, alpha.clone(), false),
+        (String::new(), Verdict::Failed, alpha, false),
+        (String::new(), Verdict::Granted, "all".to_owned(), false),
+        (String::new(), Verdict::Failed, "not a public key".to_owned(), false),
+    ];
+    assert_eq!(lines, want);
 }

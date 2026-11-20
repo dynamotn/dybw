@@ -178,6 +178,12 @@ pub(crate) fn client(caller: &Caller, programs: &Programs) -> String {
     }
 }
 
+/// The `SHA256:` fingerprint of a wire-format public key, or what is wrong with it.
+fn fingerprint(blob: &[u8]) -> String {
+    PublicKey::from_bytes(blob)
+        .map_or_else(|_| "not a public key".to_owned(), |k| k.fingerprint(HashAlg::Sha256).to_string())
+}
+
 /// The `SHA256:` fingerprint of the host key a connection is bound to.
 pub(crate) fn host_key(bound: &Binding) -> String {
     bound.host_key.fingerprint(HashAlg::Sha256).to_string()
@@ -195,7 +201,8 @@ pub(crate) fn sign_event(caller: &Caller, key: &Key, ctx: &SignContext, verdict:
         verdict,
         ssh: Some(SignAudit {
             key: key.fingerprint.clone(),
-            dest: ctx.bound.as_ref().map(host_key),
+            // Only a login bound to its session goes to that host; data on a bound connection is not proven to.
+            dest: ctx.bound.as_ref().filter(|_| matches!(ctx.data, Data::Login { bound: true, .. })).map(host_key),
             forwarded: ctx.bound.as_ref().is_some_and(|b| b.forwarded),
             client: ctx.client.clone(),
         }),
@@ -298,25 +305,7 @@ impl SshAgent {
     async fn unlock_for(&self, who: &Resolved, blob: &[u8]) -> Option<(String, Key)> {
         // The main socket's rule: no master-password question on behalf of an AI-class client.
         if !crate::agent::may_unlock(&who.caller) {
-            let locked = self.by_profile().await.into_iter().find(|(_, keys)| keys.is_none());
-            if let Some((profile, _)) = locked {
-                tracing::warn!(%profile, "refused to unlock for an AI-class SSH client");
-                let fingerprint = PublicKey::from_bytes(blob).map(|k| k.fingerprint(HashAlg::Sha256).to_string());
-                self.agent.audit.record(AuditEvent {
-                    time: std::time::SystemTime::now(),
-                    profile,
-                    caller: who.caller.clone(),
-                    op: "ssh-sign",
-                    kind: None,
-                    item: None,
-                    verdict: Verdict::Denied,
-                    ssh: Some(SignAudit {
-                        key: fingerprint.unwrap_or_default(),
-                        client: who.client.clone(),
-                        ..SignAudit::default()
-                    }),
-                });
-            }
+            tracing::warn!("refused to unlock for an AI-class SSH client");
             return None;
         }
         let _one = self.unlocking.lock().await;
@@ -330,17 +319,43 @@ impl SshAgent {
         self.find(blob).await
     }
 
-    /// Take `blob`, or every key offered now (`None`), out of the view; false when `blob` is not offered.
-    async fn remove(&self, blob: Option<&[u8]>) -> bool {
-        let keys = self.keys().await;
-        let mut removed = self.removed.lock().unwrap_or_else(PoisonError::into_inner);
-        match blob {
-            None => {
-                removed.extend(keys.into_iter().map(|(_, k)| k.blob));
-                true
-            }
-            Some(blob) => keys.iter().any(|(_, k)| k.blob == blob) && removed.insert(blob.to_vec()),
+    /// Take `blob`, or every key offered now (`None`), out of the view; false when `blob` is not offered, and for an
+    /// AI-class client, which may not hide keys from the user's own clients. Every removal is audited.
+    async fn remove(&self, who: &Resolved, blob: Option<&[u8]>) -> bool {
+        let what = blob.map_or_else(|| "all".to_owned(), fingerprint);
+        if matches!(who.caller, Caller::Ai { .. }) {
+            self.audit_blob(who, "ssh-remove", String::new(), what, Verdict::Denied);
+            return false;
         }
+        let keys = self.keys().await;
+        let profile = blob.and_then(|b| keys.iter().find(|(_, k)| k.blob == b)).map(|(p, _)| p.clone());
+        let done = {
+            let mut removed = self.removed.lock().unwrap_or_else(PoisonError::into_inner);
+            match blob {
+                None => {
+                    removed.extend(keys.into_iter().map(|(_, k)| k.blob));
+                    true
+                }
+                Some(blob) => profile.is_some() && removed.insert(blob.to_vec()),
+            }
+        };
+        let verdict = if done { Verdict::Granted } else { Verdict::Failed };
+        self.audit_blob(who, "ssh-remove", profile.unwrap_or_default(), what, verdict);
+        done
+    }
+
+    /// An audit line about a public key, not an item: a sign refused before any key of ours was found, or a removal.
+    fn audit_blob(&self, who: &Resolved, op: &'static str, profile: String, key: String, verdict: Verdict) {
+        self.agent.audit.record(AuditEvent {
+            time: std::time::SystemTime::now(),
+            profile,
+            caller: who.caller.clone(),
+            op,
+            kind: None,
+            item: None,
+            verdict,
+            ssh: Some(SignAudit { key, client: who.client.clone(), ..SignAudit::default() }),
+        });
     }
 
     /// A signature with `blob` over `data`: found among the offered keys (or once a locked profile is unlocked for
@@ -352,7 +367,12 @@ impl SshAgent {
             None => self.unlock_for(who, blob).await,
         };
         let Some((profile, key)) = found else {
+            // Not offered, an unlock refused (AI-class client), cancelled or not asked again: no key of ours is
+            // involved, so the line names the first locked profile, or none.
             tracing::info!("refused to sign with a key that is not offered");
+            let locked = self.by_profile().await.into_iter().find(|(_, keys)| keys.is_none());
+            let profile = locked.map(|(profile, _)| profile).unwrap_or_default();
+            self.audit_blob(who, "ssh-sign", profile, fingerprint(blob), Verdict::Denied);
             return None;
         };
         let ctx = SignContext { client: who.client.clone(), ..conn.context(profile, data, blob) };
@@ -421,8 +441,8 @@ impl SshAgent {
                     None => status(false),
                 }
             }
-            REMOVE_IDENTITY => status(self.remove(Some(msg.string()?)).await),
-            REMOVE_ALL_IDENTITIES => status(self.remove(None).await),
+            REMOVE_IDENTITY => status(self.remove(who, Some(msg.string()?)).await),
+            REMOVE_ALL_IDENTITIES => status(self.remove(who, None).await),
             // OpenSSH answers an unknown extension with a plain failure, as the draft asks, not EXTENSION_FAILURE.
             EXTENSION => status(msg.string()? == SESSION_BIND && conn.bind(&mut msg)?),
             // Adding keys (17, 25), smartcards (20, 21, 26), lock and unlock (22, 23), and anything unknown.

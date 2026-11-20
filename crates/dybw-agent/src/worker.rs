@@ -199,11 +199,14 @@ struct State {
     /// Memory only, dropped by a lock. A grant whose process exited can never match again (a new process has
     /// another start time or image); shortcut: it stays until the lock, at most [`MAX_HELD`] of them.
     held: Vec<Caller>,
-    /// SSH "always" answers: a client process (its caller, with pid, start and image) and a key's blob. Memory only,
-    /// dropped by a lock; at most [`MAX_HELD`].
-    ssh_held: Vec<(Caller, Vec<u8>)>,
+    /// SSH "always" answers: a client process (its caller, with pid, start and image), a key's blob, and whether it
+    /// was for a login (`true`) or for data. Memory only, dropped by a lock; at most [`MAX_HELD`].
+    ssh_held: Vec<(Caller, Vec<u8>, bool)>,
     /// SSH clients that cancelled an unlock this profile asked for them: not asked again until it unlocks.
     ssh_declined: Vec<Caller>,
+    /// How many SSH signatures each client (a process; the class for a caller with no pid) was refused by the user:
+    /// past [`sign::MAX_NOES`] it is asked nothing more until the profile locks or unlocks. At most [`MAX_HELD`].
+    ssh_noes: Vec<(Caller, u8)>,
 }
 
 /// Most per-process grants kept; the oldest goes first.
@@ -418,6 +421,7 @@ fn lock(shared: &Shared) {
     st.slot = None;
     st.held.clear();
     st.ssh_held.clear();
+    st.ssh_noes.clear();
 }
 
 /// Run a long command in a task of its own, and answer from a second one. `reply` is `None` for the periodic
@@ -1012,6 +1016,7 @@ async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, why: Option<&str>
         Ok(session) => {
             let mut st = shared.state.borrow_mut();
             st.ssh_declined.clear();
+            st.ssh_noes.clear();
             // The idle timeout runs from the answer, not from a request that waited on the user.
             st.last_used = st.seen;
             st.slot = Some(session);

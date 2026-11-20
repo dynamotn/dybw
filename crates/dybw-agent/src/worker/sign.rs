@@ -12,15 +12,29 @@ use crate::session::{self, Ctx};
 use crate::ssh::Key;
 use crate::ssh_agent::{Data, SignContext, client, host_key, sign_event};
 
-/// May "always" be offered to this SSH client? Only to a named one whose parent is still there: never to an AI-class
-/// or unknown client (confirmed every time, ADR 0012), nor to a detached one.
-fn rememberable(caller: &Caller) -> bool {
-    matches!(caller, Caller::Invoker { .. }) && !caller.detached()
+/// The "no" answers after which a client is asked nothing more until the profile locks or unlocks.
+pub(super) const MAX_NOES: u8 = 3;
+
+/// Count a "no" for `caller`.
+fn note_no(shared: &Shared, caller: &Caller) {
+    let noes = &mut shared.state.borrow_mut().ssh_noes;
+    match noes.iter_mut().find(|(c, _)| c == caller) {
+        Some((_, n)) => *n = n.saturating_add(1),
+        None => {
+            if noes.len() >= MAX_HELD {
+                noes.remove(0);
+            }
+            noes.push((caller.clone(), 1));
+        }
+    }
 }
 
 /// Ask whether `caller` may sign with `key`, unless this very process (pid, start time and image) holds an "always"
-/// for this key. One question on the screen at a time; a held answer is looked for again once this request has the
-/// screen. Every decision is audited. `Done` allows the signature.
+/// for this key and this kind of data (a login or not). "Always" follows the main socket's rule (a grant that can
+/// last, never for a detached, AI-class or unknown caller, ADR 0012) and is never offered for, nor used by, a
+/// forwarded request. One question on the screen at a time; a held answer is looked for again once this request has
+/// the screen. A client refused [`MAX_NOES`] times is asked nothing more. Every decision is audited. `Done` allows
+/// the signature.
 pub(super) async fn confirm<H: Host>(
     shared: &Shared,
     host: &H,
@@ -43,15 +57,20 @@ pub(super) async fn confirm<H: Host>(
         ctx.audit.record(sign_event(caller, key, sign, Verdict::Denied));
         return error(AgentError::Denied);
     }
-    let always = rememberable(caller);
-    let grant = (caller.clone(), key.blob.clone());
+    let forwarded = sign.bound.as_ref().is_some_and(|b| b.forwarded);
+    let always = caller.rememberable() && !forwarded;
+    let grant = (caller.clone(), key.blob.clone(), matches!(sign.data, Data::Login { .. }));
     let held = || always && shared.state.borrow().ssh_held.contains(&grant);
+    let refused_enough = || shared.state.borrow().ssh_noes.iter().any(|(c, n)| c == caller && *n >= MAX_NOES);
     let verdict = if held() {
         Verdict::Granted
     } else {
         let _screen = shared.asking.lock().await;
         if held() {
             Verdict::Granted
+        } else if refused_enough() {
+            tracing::info!(profile = %ctx.profile.name, "not asking again for an SSH client refused {MAX_NOES} times");
+            Verdict::Denied
         } else {
             match session::confirm(host, &text(ctx, caller, key, sign, always), always).await {
                 // Wiped while the question was open without this task being aborted (a crashed command).
@@ -66,13 +85,16 @@ pub(super) async fn confirm<H: Host>(
                 }
                 Ok(_) => Verdict::Confirmed,
                 Err(AgentError::Prompt) => Verdict::Failed,
-                Err(_) => Verdict::Declined,
+                Err(_) => {
+                    note_no(shared, caller);
+                    Verdict::Declined
+                }
             }
         }
     };
     ctx.audit.record(sign_event(caller, key, sign, verdict));
     match verdict {
-        Verdict::Declined => error(AgentError::Denied),
+        Verdict::Declined | Verdict::Denied => error(AgentError::Denied),
         Verdict::Failed => error(AgentError::Prompt),
         _ => Reply::Done,
     }
