@@ -7,7 +7,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use dybw_proto::{Op, Reply, Sealed};
+use dybw_proto::{Op, RbwItem, Reply, Sealed};
 use zeroize::Zeroizing;
 
 use super::*;
@@ -117,6 +117,12 @@ fn edit_starts_from_the_current_password_and_notes_and_sends_the_new_ones() {
     // Notes removed: sent empty, which clears them, as rbw's `None` does.
     let ed = editor(w.path(), "ed", "printf 'pw\\n' > \"$f\"");
     let (_, ops) = with_editor(vec![edit_reply(login_for_edit()), Act::Reply(Reply::Done)], &ed, &["edit", "n", "-i"]);
+    assert_eq!(ops[1], edit("c1", sealed("pw"), sealed("")));
+    // A login that has no notes starts from its password alone.
+    let ed = editor(w.path(), "ed", &format!("{RECORD}\nprintf 'pw\\n' > \"$f\""));
+    let no_notes = RbwItem { notes: None, ..login_for_edit() };
+    let (_, ops) = with_editor(vec![edit_reply(no_notes), Act::Reply(Reply::Done)], &ed, &["edit", "n", "-i"]);
+    assert_eq!(read(w.path(), "seen"), format!("pw\n{HELP_PW}"));
     assert_eq!(ops[1], edit("c1", sealed("pw"), sealed("")));
     // A note: only its notes, read after a blank first line as rbw does; its old text and rbw's help to start from.
     let ed = editor(w.path(), "ed", &format!("{RECORD}\nprintf 'new 1\\n\\nnew 2\\n# c\\n' > \"$f\""));
