@@ -40,7 +40,7 @@ uuid = { version = "1.28.0", features = ["v4"] }
 url = "2.5.8"
 regex-automata = { version = "0.4.18", default-features = false, features = ["std", "syntax", "meta", "unicode"] }
 # The SSH agent's keys (owner decision 2026-11-20); no default features, no key-file encryption.
-ssh-key = { version = "0.7.0-rc.12", default-features = false, features = ["std", "ed25519", "rsa", "p256", "p384", "p521"] }
+ssh-key = { version = "=0.7.0-rc.12", default-features = false, features = ["std", "ed25519", "rsa", "p256", "p384", "p521"] }
 # The `Signer` and `Verifier` traits behind ssh-key's signatures, which it does not re-export (already in the tree).
 signature = { version = "3.0.0", default-features = false }
 zeroize = { version = "1.9.1", features = ["derive", "serde"] }
