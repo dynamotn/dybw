@@ -203,8 +203,9 @@ mod tests {
     #[test]
     fn creating_a_key_works_or_says_why() {
         // An enclave key held only by its handle is not stored anywhere: nothing to clean up.
+        let here = available();
         let created = create(Policy::CurrentSet, false);
-        assert!(created.as_ref().map_or_else(|e| !available() || matches!(e, Error::Other(_)), |c| c.public[0] == 4));
+        assert!(created.as_ref().map_or_else(|e| !here || matches!(e, Error::Other(_)), |c| here && c.public[0] == 4));
     }
 
     #[cfg(not(target_os = "macos"))]
