@@ -174,6 +174,7 @@ class Account:
             "name": d(c["name"]),
             "password": d(login.get("password")),
             "username": d(login.get("username")),
+            "uris": [d(u["uri"]) for u in (login.get("uris") or [])],
             "notes": d(c.get("notes")),
             "fields": dict(fields),
             "field_list": fields,
@@ -217,8 +218,8 @@ class Account:
         body["encryptedFor"] = self.user_id
         return http("PUT", f"{self.server}/api/ciphers/{cipher_id}", body, self._auth())
 
-    def _new(self, folder, type_, name, notes, login, fields, extra=None, reprompt=0, history=None):
-        k = self.user_key
+    def _new(self, folder, type_, name, notes, login, fields, extra=None, reprompt=0, history=None, item_key=None):
+        k = item_key or self.user_key
         body = {
             "type": type_,
             "folderId": self.folder_id(folder) if folder else None,
@@ -227,12 +228,14 @@ class Account:
             "notes": encrypt(notes.encode(), k) if notes else None,
             "favorite": False,
             "reprompt": reprompt,
-            "fields": [{"type": 0, "name": encrypt(n.encode(), k), "value": encrypt(v.encode(), k)} for n, v in (fields or {}).items()],
+            "fields": self._new_fields(fields, k),
             "passwordHistory": [
                 {"password": encrypt(p.encode(), k), "lastUsedDate": d} for p, d in (history or [])
             ],
             "encryptedFor": self.user_id,
         }
+        if item_key:
+            body["key"] = encrypt(item_key, self.user_key)
         if type_ == 1:
             body["login"] = login
         elif type_ == 2:
@@ -242,16 +245,30 @@ class Account:
         return http("POST", f"{self.server}/api/ciphers", body, self._auth())
 
     def add_login(self, folder, name, password, fields=None, username=None, uri=None, notes=None, reprompt=0, history=None,
-                  totp=None):
-        """Add a login; `folder` may be None for no folder."""
-        k = self.user_key
+                  totp=None, uris=None, item_key=None):
+        """Add a login; `folder` may be None for no folder. `uris` is [(uri, match type or None)]; `item_key` (64
+        bytes) gives the item its own key."""
+        k = item_key or self.user_key
+        uris = [(uri, None)] if uri else uris
         login = {
             "username": encrypt(username.encode(), k) if username else None,
-            "password": encrypt(password.encode(), k),
-            "uris": [{"uri": encrypt(uri.encode(), k), "match": None}] if uri else None,
+            "password": encrypt(password.encode(), k) if password is not None else None,
+            "uris": [{"uri": encrypt(u.encode(), k), "match": m} for u, m in uris] if uris else None,
             "totp": encrypt(totp.encode(), k) if totp else None,
         }
-        return self._new(folder, 1, name, notes, login, fields, reprompt=reprompt, history=history)
+        return self._new(folder, 1, name, notes, login, fields, reprompt=reprompt, history=history, item_key=item_key)
+
+    @staticmethod
+    def _new_fields(fields, k):
+        """`fields` is {name: value} (text fields) or [(type, name, value, linked id or None)]."""
+        if isinstance(fields, dict):
+            fields = [(0, n, v, None) for n, v in fields.items()]
+        return [{"type": t, "name": encrypt(n.encode(), k), "value": encrypt(v.encode(), k) if v is not None else None,
+                 "linkedId": linked} for t, n, v, linked in (fields or [])]
+
+    def trash(self, cipher_id):
+        """Move an item to the trash (a soft delete)."""
+        return http("PUT", f"{self.server}/api/ciphers/{cipher_id}/delete", None, self._auth())
 
     def add_typed(self, folder, type_, name, key, payload, notes=None, fields=None):
         """Add a card (3, key "card"), identity (4, "identity") or SSH key (5, "sshKey") with string `payload`."""

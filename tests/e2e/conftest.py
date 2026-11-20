@@ -26,3 +26,12 @@ def account():
     if not URL:
         pytest.skip("BW_E2E_URL not set")
     return Account(URL)
+
+
+def pytest_terminal_summary(terminalreporter):
+    """Print the conformance run's case lines (test_rbw_conformance.py), the source of docs/rbw-conformance.md."""
+    results = Path("/tmp/rbw-conformance.jsonl")
+    if os.environ.get("DYBW_E2E_CONTAINER") and results.exists():
+        terminalreporter.section("rbw conformance")
+        for line in results.read_text().splitlines():
+            terminalreporter.write_line(line)
