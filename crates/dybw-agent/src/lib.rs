@@ -16,6 +16,7 @@ pub mod read;
 pub mod server;
 pub mod session;
 pub mod socket;
+pub mod ssh;
 pub mod trust;
 pub mod worker;
 

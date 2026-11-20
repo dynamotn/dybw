@@ -4,6 +4,9 @@
 //! between requests: every opened item is wiped before these functions return, and the reply carries only what was
 //! asked. No function here prompts or waits.
 
+use std::collections::BTreeMap;
+
+use dybw_core::crypto::SymmetricKey;
 use dybw_core::profile::UnlockedVault;
 use dybw_core::totp::TotpKey;
 use dybw_core::vault::folder::{FolderNames, folder_names};
@@ -49,15 +52,23 @@ thread_local! {
     pub(crate) static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The only place an item is opened.
 fn open(cipher: &Value, vault: &UnlockedVault) -> Result<Item, Uninspectable> {
+    open_with(cipher, vault.keys.user(), vault.keys.orgs())
+}
+
+/// The only place an item is opened.
+pub(crate) fn open_with(
+    cipher: &Value,
+    user: &SymmetricKey,
+    orgs: &BTreeMap<String, SymmetricKey>,
+) -> Result<Item, Uninspectable> {
     #[cfg(test)]
     OPENS.with(|n| n.set(n.get() + 1));
-    item::open(cipher, vault.keys.user(), vault.keys.orgs())
+    item::open(cipher, user, orgs)
 }
 
 /// The vault's ciphers that are not in the trash.
-fn ciphers(sync: &Value) -> impl Iterator<Item = &Value> {
+pub(crate) fn ciphers(sync: &Value) -> impl Iterator<Item = &Value> {
     let all = sync.get("ciphers").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     all.iter().filter(|c| c.get("deletedDate").is_none_or(Value::is_null))
 }
