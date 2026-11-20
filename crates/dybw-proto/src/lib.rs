@@ -328,6 +328,8 @@ pub enum Op {
         profile: Option<String>,
         action: PolicyAction,
     },
+    /// The SSH agent's keys (profiles §8): names, fingerprints, types and profiles, no secret.
+    SshList,
     StopAgent,
     /// Any op this build does not know; refused by `decode_request`, never sent.
     #[serde(other)]
@@ -342,6 +344,25 @@ pub struct ProfileStatus {
     /// Unix seconds of the last sync (or the offline copy the profile last wrote); `None` before the first.
     #[serde(default)]
     pub last_sync: Option<u64>,
+}
+
+/// One key the SSH agent offers (`dybw ssh list`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshKey {
+    /// The item's name.
+    pub name: String,
+    /// `SHA256:…`.
+    pub fingerprint: String,
+    /// The key type as SSH names it (`ssh-ed25519`, `ssh-rsa`, `ecdsa-sha2-nistp256`, ...).
+    pub kind: String,
+    pub profile: String,
+}
+
+/// A profile of `[ssh_agent] profiles`: a locked one offers no keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshProfile {
+    pub name: String,
+    pub unlocked: bool,
 }
 
 /// One `list`/`search` row: only the fields asked for are `Some`; `id` is always set.
@@ -570,6 +591,13 @@ pub enum Reply {
     /// `Policy` with `Show`.
     Policy {
         entries: Vec<PolicyEntry>,
+    },
+    /// `SshList`: the keys offered now, the profiles of `[ssh_agent] profiles` in order, and how many key listings
+    /// SSH clients asked for since the agent started.
+    SshKeys {
+        keys: Vec<SshKey>,
+        profiles: Vec<SshProfile>,
+        lists: u64,
     },
     Error {
         error: AgentError,
@@ -914,6 +942,7 @@ mod tests {
             },
             Op::Policy { profile: None, action: PolicyAction::Deny { invoker: s("/bin/sh"), script: None } },
             Op::Policy { profile: None, action: PolicyAction::Forget { invoker: s("/bin/sh") } },
+            Op::SshList,
             Op::StopAgent,
         ];
         for op in ops {
@@ -976,6 +1005,16 @@ mod tests {
                     rule: PolicyRule::Deny,
                     detached: false,
                 }],
+            },
+            Reply::SshKeys {
+                keys: vec![SshKey {
+                    name: s("k"),
+                    fingerprint: s("SHA256:x"),
+                    kind: s("ssh-ed25519"),
+                    profile: s("w"),
+                }],
+                profiles: vec![SshProfile { name: s("w"), unlocked: true }],
+                lists: 3,
             },
             Reply::Error {
                 error: AgentError::Ambiguous { candidates: vec![Candidate { id: s("i"), name: s("n"), user: None }] },
