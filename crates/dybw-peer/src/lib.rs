@@ -11,6 +11,8 @@
 //!
 //! [`clipboard`] copies a value marked as secret and clears it later if it is unchanged.
 //!
+//! `keyring` takes `pam_bwss`'s handover from the user's kernel keyring (Linux only).
+//!
 //! [`enclave`] reaches the Secure Enclave and Touch ID through a Swift shim (macOS; a stub elsewhere).
 
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -26,6 +28,8 @@ pub mod clipboard;
 pub mod enclave;
 #[cfg(feature = "fake")]
 mod fake;
+#[cfg(target_os = "linux")]
+pub mod keyring;
 #[cfg(all(feature = "fake", not(debug_assertions)))]
 compile_error!("the `fake` feature is for tests only and must not be built in release");
 #[cfg(target_os = "linux")]
