@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 
 use crate::agent::Agent;
 use crate::caller::Resolved;
-use crate::ssh::Key;
+use crate::ssh::{Key, RSA_SHA2_256, RSA_SHA2_512};
 use crate::worker::Cmd;
 
 /// OpenSSH's `AGENT_MAX_LEN`: the largest message either side accepts.
@@ -33,6 +33,9 @@ pub const MAX_MESSAGE: usize = 256 * 1024;
 /// minutes covers a login waiting on other prompts and still reaps connections a client leaked. Once a message has
 /// begun, the rest of it is due within the agent's read timeout.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Most SSH connections served at once. Idle ones may stay open for [`IDLE_TIMEOUT`]: past the cap a new one is
+/// closed at once, so they cannot take every descriptor of the agent.
+pub const MAX_CONNECTIONS: usize = 64;
 
 const FAILURE: u8 = 5;
 const SUCCESS: u8 = 6;
@@ -124,11 +127,20 @@ pub struct SshAgent {
     /// is never touched.
     removed: Mutex<HashSet<Vec<u8>>>,
     pub(crate) idle_timeout: Duration,
+    /// One permit per connection served, [`MAX_CONNECTIONS`] in all.
+    pub(crate) slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl SshAgent {
     pub fn new(agent: Arc<Agent>, profiles: Vec<String>, authorize: Arc<dyn Authorize>) -> SshAgent {
-        SshAgent { agent, profiles, authorize, removed: Mutex::default(), idle_timeout: IDLE_TIMEOUT }
+        SshAgent {
+            agent,
+            profiles,
+            authorize,
+            removed: Mutex::default(),
+            idle_timeout: IDLE_TIMEOUT,
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+        }
     }
 
     /// The keys offered now, each once, with its profile: those of the unlocked profiles, less the removed ones.
@@ -170,12 +182,27 @@ impl SshAgent {
             tracing::info!("refused to sign with a key that is not offered");
             return None;
         };
+        // As OpenSSH's process_sign_request: a connection whose session-bind failed, and that has no bind, signs
+        // nothing.
+        if conn.bind_refused && conn.binds.is_empty() {
+            tracing::warn!("refused to sign on a connection whose session-bind failed");
+            return None;
+        }
+        // Certain to fail in `ssh::sign`: refused before anyone is asked.
+        if Reader(blob).string() == Some(b"ssh-rsa") && flags & (RSA_SHA2_256 | RSA_SHA2_512) == 0 {
+            tracing::info!("refused an RSA signature with SHA-1 (no rsa-sha2 flag)");
+            return None;
+        }
         let ctx = conn.context(profile, data, blob);
         if self.authorize.authorize_sign(who, &key, &ctx).await != Decision::Allow {
             return None;
         }
         if !self.agent.resolver.recheck(who) {
             tracing::warn!("the SSH client changed while it was being served: refused");
+            return None;
+        }
+        // `ssh-add -d` may have taken the key out of the view while the user was being asked.
+        if self.removed.lock().unwrap_or_else(PoisonError::into_inner).contains(blob) {
             return None;
         }
         let worker = self.agent.running(&ctx.profile)?;
@@ -230,6 +257,10 @@ impl SshAgent {
 
 /// Serve one connection until the client closes it, idles past the idle timeout, or sends a bad message.
 pub async fn handle(ssh: Arc<SshAgent>, mut stream: UnixStream) {
+    let Ok(_slot) = ssh.slots.clone().try_acquire_owned() else {
+        tracing::warn!("too many SSH agent connections: closed a new one");
+        return;
+    };
     let Some(who) = crate::server::identify(&ssh.agent, &stream).await else { return };
     let limit = ssh.agent.read_timeout;
     let mut conn = Conn::default();

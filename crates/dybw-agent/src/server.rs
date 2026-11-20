@@ -86,20 +86,33 @@ type Accept<'a> = dyn FnMut() -> Accepting<'a> + Send + 'a;
 type Handling = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type On<'a> = dyn Fn(UnixStream) -> Handling + Sync + 'a;
 
-/// Ends only on an accept error (out of descriptors, a dead socket): better to stop than to spin. Each connection
-/// is served by `on` in a task of `handlers`. Trait objects, not generics, so both sockets and the test share one
-/// body.
+/// How long the accept loop waits after a transient accept error before it tries again.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// An accept error that passes: out of descriptors or memory, a connection aborted before it was taken.
+fn transient(e: &std::io::Error) -> bool {
+    use rustix::io::Errno;
+    let transient = [Errno::MFILE, Errno::NFILE, Errno::CONNABORTED, Errno::NOBUFS, Errno::NOMEM, Errno::INTR];
+    e.raw_os_error().is_some_and(|n| transient.iter().any(|t| t.raw_os_error() == n))
+}
+
+/// Ends only on an accept error that does not pass (a dead socket): better to stop than to spin. A transient one
+/// (out of descriptors, ...) is logged and retried after [`ACCEPT_BACKOFF`]. Each connection is served by `on` in a
+/// task of `handlers`. Trait objects, not generics, so both sockets and the test share one body.
 async fn accept_loop(accept: &mut Accept<'_>, on: &On<'_>, handlers: &mut JoinSet<()>) -> std::io::Result<()> {
-    let err = loop {
+    loop {
         while handlers.try_join_next().is_some() {}
         match accept().await {
             Ok(stream) => {
                 handlers.spawn(on(stream));
             }
-            Err(e) => break e,
+            Err(e) if transient(&e) => {
+                tracing::warn!(%e, "accept failed, trying again shortly");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+            }
+            Err(e) => return Err(e),
         }
-    };
-    Err(err)
+    }
 }
 
 /// The caller on a new connection, worked out while the peer is still what it was at connect. A peer that cannot
@@ -318,6 +331,35 @@ mod tests {
         let (agent, _) = agent(dir.path());
         let (listener, _lock) = crate::socket::bind(&dir.path().join("run"), me()).unwrap();
         serve(agent, listener, None, async { Ok(()) }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_transient_accept_error_is_retried_after_a_pause() {
+        use rustix::io::Errno;
+        let mut script: Vec<std::io::Result<Tokio>> = vec![
+            Err(std::io::Error::other("dead socket")),
+            Ok(Tokio::pair().unwrap().0),
+            Err(Errno::CONNABORTED.into()),
+            Err(Errno::MFILE.into()),
+        ];
+        let mut accept = || -> Accepting<'_> {
+            let next = script.pop().unwrap();
+            Box::pin(async { next })
+        };
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let on = |_| -> Handling {
+            let served = served.clone();
+            Box::pin(async move {
+                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let (mut handlers, started) = (JoinSet::new(), std::time::Instant::now());
+        let e = accept_loop(&mut accept, &on, &mut handlers).await.unwrap_err();
+        assert_eq!(e.to_string(), "dead socket", "out of descriptors and an aborted connection pass");
+        assert!(started.elapsed() >= 2 * ACCEPT_BACKOFF, "each after a pause");
+        while handlers.join_next().await.is_some() {}
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!transient(&std::io::Error::other("x")));
     }
 
     #[tokio::test(flavor = "multi_thread")]

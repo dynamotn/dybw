@@ -47,6 +47,8 @@ struct Double {
     refuse: AtomicBool,
     asked: Mutex<Vec<SignContext>>,
     lock_on_ask: Mutex<Option<Arc<Agent>>>,
+    /// Run once while asked.
+    on_ask: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Double {
@@ -63,6 +65,9 @@ impl Authorize for Double {
         ctx: &'a SignContext,
     ) -> Pin<Box<dyn Future<Output = Decision> + Send + 'a>> {
         self.asked.lock().unwrap().push(ctx.clone());
+        if let Some(f) = self.on_ask.lock().unwrap().take() {
+            f();
+        }
         let lock = self.lock_on_ask.lock().unwrap().take();
         Box::pin(async move {
             if let Some(agent) = lock {
@@ -134,7 +139,8 @@ impl Client {
 
     /// The agent closed the connection: no reply, and the handler has ended.
     async fn closed(mut self) -> bool {
-        let none = self.recv().await.is_none();
+        // Bounded: a connection the agent keeps open would otherwise wait out the idle timeout.
+        let none = tokio::time::timeout(Duration::from_secs(5), self.recv()).await.is_ok_and(|r| r.is_none());
         tokio::time::timeout(Duration::from_secs(5), self.task).await.is_ok() && none
     }
 
@@ -190,7 +196,12 @@ const OK: [u8; 1] = [SUCCESS];
 
 /// `session-bind@openssh.com` for `host` over `session_id`, signed by `signer`.
 fn bind_request(host: &PrivateKey, signer: &PrivateKey, session_id: &[u8], forwarded: bool) -> Vec<u8> {
-    let signature = Signer::<Signature>::try_sign(signer, session_id).unwrap().encode_vec().unwrap();
+    bind_signed(host, &Signer::<Signature>::try_sign(signer, session_id).unwrap(), session_id, forwarded)
+}
+
+/// `session-bind@openssh.com` for `host` over `session_id` with `signature`.
+fn bind_signed(host: &PrivateKey, signature: &Signature, session_id: &[u8], forwarded: bool) -> Vec<u8> {
+    let signature = signature.encode_vec().unwrap();
     let mut out = message(EXTENSION, &[SESSION_BIND, &blob(host), session_id, &signature]);
     out.push(u8::from(forwarded));
     out
@@ -475,6 +486,7 @@ async fn rsa_without_a_sha2_flag_is_refused_and_signs_with_one() {
     let w = world(vec![ssh_item("r1", "rsa", &rsa)]).await;
     let mut c = connect(&w.ssh).await;
     assert_eq!(c.sign(&blob(&rsa), b"x", 0).await, FAIL, "legacy ssh-rsa (SHA-1)");
+    assert!(w.auth.asked().is_empty(), "refused before anyone is asked");
     let signature = verified(&rsa, b"x", &c.sign(&blob(&rsa), b"x", crate::ssh::RSA_SHA2_512).await);
     assert_eq!(signature.algorithm(), Algorithm::Rsa { hash: Some(ssh_key::HashAlg::Sha512) });
 }
@@ -744,4 +756,69 @@ async fn openssh_clients_list_sign_and_remove() {
     assert!(removed.status.success(), "{removed:?}");
     assert!(!after.status.success(), "no identities left: {after:?}");
     served.abort();
+}
+
+#[test]
+fn session_bind_verifies_rsa_sha2_512_and_ecdsa_host_keys() {
+    let rsa = generate(Algorithm::Rsa { hash: None });
+    let KeypairData::Rsa(pair) = rsa.key_data() else { panic!() };
+    let signature = Signer::<Signature>::try_sign(&(pair, Some(ssh_key::HashAlg::Sha512)), b"sid").unwrap();
+    assert_eq!(signature.algorithm(), Algorithm::Rsa { hash: Some(ssh_key::HashAlg::Sha512) });
+    assert_eq!(bind(&mut Conn::default(), &bind_signed(&rsa, &signature, b"sid", false)), Some(true));
+    assert_eq!(bind(&mut Conn::default(), &bind_signed(&rsa, &signature, b"other sid", false)), Some(false));
+    let ecdsa = generate(Algorithm::Ecdsa { curve: ssh_key::EcdsaCurve::NistP256 });
+    assert_eq!(bind(&mut Conn::default(), &bind_request(&ecdsa, &ecdsa, b"sid", false)), Some(true));
+    assert_eq!(bind(&mut Conn::default(), &bind_request(&ecdsa, &ed25519(3), b"sid", false)), Some(false));
+}
+
+#[tokio::test]
+async fn a_connection_whose_session_bind_failed_signs_nothing() {
+    let w = world(vec![]).await;
+    let (host, other) = (ed25519(9), ed25519(8));
+    let mut c = connect(&w.ssh).await;
+    assert_eq!(c.ask(&bind_request(&host, &other, b"sid", false)).await, FAIL);
+    assert_eq!(c.sign(&blob(&w.alpha), b"x", 0).await, FAIL);
+    assert!(w.auth.asked().is_empty(), "refused before anyone is asked");
+    // A forwarded connection with a good bind and a refused one still signs (the refusal is on record).
+    let mut fwd = connect(&w.ssh).await;
+    assert_eq!(fwd.ask(&bind_request(&host, &host, b"s1", true)).await, OK);
+    assert_eq!(fwd.ask(&bind_request(&other, &host, b"s2", false)).await, FAIL);
+    verified(&w.alpha, b"x", &fwd.sign(&blob(&w.alpha), b"x", 0).await);
+    assert!(w.auth.asked()[0].bind_refused);
+}
+
+#[tokio::test]
+async fn a_key_removed_while_the_user_was_asked_does_not_sign() {
+    let w = world(vec![]).await;
+    let (ssh, alpha) = (w.ssh.clone(), blob(&w.alpha));
+    *w.auth.on_ask.lock().unwrap() = Some(Box::new(move || {
+        ssh.removed.lock().unwrap().insert(alpha);
+    }));
+    let mut c = connect(&w.ssh).await;
+    assert_eq!(c.sign(&blob(&w.alpha), b"x", 0).await, FAIL);
+    assert_eq!(w.auth.asked().len(), 1, "asked, then refused");
+}
+
+#[tokio::test]
+async fn connections_past_the_cap_are_closed_at_once() {
+    let mut w = world(vec![]).await;
+    Arc::get_mut(&mut w.ssh).unwrap().slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let mut first = connect(&w.ssh).await;
+    assert_eq!(first.keys().await.len(), 2);
+    assert!(connect(&w.ssh).await.closed().await, "over the cap");
+    drop(first.stream);
+    first.task.await.unwrap();
+    assert_eq!(connect(&w.ssh).await.keys().await.len(), 2, "its slot is free again");
+}
+
+#[tokio::test]
+async fn an_item_whose_private_key_does_not_parse_signs_nothing() {
+    let broken = ed25519(4);
+    let mut item = ssh_item("sx", "broken", &broken);
+    item["sshKey"]["privateKey"] = json!(enc("-----BEGIN OPENSSH PRIVATE KEY-----"));
+    let w = world(vec![item]).await;
+    let mut c = connect(&w.ssh).await;
+    assert_eq!(c.keys().await.len(), 3, "listed from its public key");
+    assert_eq!(c.sign(&blob(&broken), b"x", 0).await, FAIL);
+    assert_eq!(w.auth.asked().len(), 1, "asked, then the key failed");
 }
