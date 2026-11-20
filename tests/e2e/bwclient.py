@@ -275,6 +275,11 @@ class Account:
         enc = {n: encrypt(v.encode(), self.user_key) for n, v in payload.items()}
         return self._new(folder, type_, name, notes, None, fields, extra={key: enc})
 
+    def ssh_public(self, cipher_id):
+        """The public key of an SSH key item, decrypted from the vault."""
+        c = self._cipher(cipher_id)
+        return self._dec(c)(c["sshKey"]["publicKey"])
+
     def add_note(self, folder, name, notes, fields=None):
         return self._new(folder, 2, name, notes, None, fields)
 
