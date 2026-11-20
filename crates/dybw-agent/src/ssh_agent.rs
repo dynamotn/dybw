@@ -276,6 +276,25 @@ impl SshAgent {
     /// unlocked profile asks nothing, and one whose unlock this client cancelled asks it nothing more until it
     /// unlocks.
     async fn unlock_for(&self, who: &Resolved, blob: &[u8]) -> Option<(String, Key)> {
+        // The main socket's rule: no master-password question on behalf of an AI-class client.
+        if !crate::agent::may_unlock(&who.caller) {
+            let locked = self.by_profile().await.into_iter().find(|(_, keys)| keys.is_none());
+            if let Some((profile, _)) = locked {
+                tracing::warn!(%profile, "refused to unlock for an AI-class SSH client");
+                let fingerprint = PublicKey::from_bytes(blob).map(|k| k.fingerprint(HashAlg::Sha256).to_string());
+                self.agent.audit.record(AuditEvent {
+                    time: std::time::SystemTime::now(),
+                    profile,
+                    caller: who.caller.clone(),
+                    op: "ssh-sign",
+                    kind: None,
+                    item: None,
+                    verdict: Verdict::Denied,
+                    ssh: Some(SignAudit { key: fingerprint.unwrap_or_default(), dest: None, forwarded: false }),
+                });
+            }
+            return None;
+        }
         let _one = self.unlocking.lock().await;
         let why = format!("an SSH signature asked by {}", client(&who.caller));
         for name in &self.profiles {

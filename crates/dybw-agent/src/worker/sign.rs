@@ -7,7 +7,7 @@ use dybw_proto::{AgentError, Reply};
 use super::{MAX_HELD, Shared, error, quoted, unlock as unlock_profile};
 use crate::caller::Caller;
 use crate::host::Host;
-use crate::policy::Verdict;
+use crate::policy::{self, Access, Decision, Store, Verdict};
 use crate::session::{self, Ctx};
 use crate::ssh::Key;
 use crate::ssh_agent::{Data, SignContext, client, host_key, sign_event};
@@ -29,6 +29,14 @@ pub(super) async fn confirm<H: Host>(
     key: &Key,
     sign: &SignContext,
 ) -> Reply {
+    // A deny entry of the caller policy for this program refuses before any question; an allow entry never skips it.
+    let store = Store::new(&ctx.paths.policy, ctx.user.uid);
+    let denied = matches!(caller, Caller::Invoker { .. })
+        && policy::decide(caller, &store.load(), &[], Access::Value) == Decision::Deny;
+    if denied {
+        ctx.audit.record(sign_event(caller, key, sign, Verdict::Denied));
+        return error(AgentError::Denied);
+    }
     let always = rememberable(caller);
     let grant = (caller.clone(), key.blob.clone());
     let held = || always && shared.state.borrow().ssh_held.contains(&grant);

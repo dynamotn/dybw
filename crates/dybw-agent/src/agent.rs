@@ -79,6 +79,12 @@ fn policy_op(action: &PolicyAction) -> &'static str {
     }
 }
 
+/// May a master-password question (an unlock or a login) be raised on behalf of `caller`? Never for an AI-class
+/// caller (ADR 0012); an unknown one may. The main socket and the SSH agent's unlock-on-sign share this rule.
+pub(crate) fn may_unlock(caller: &Caller) -> bool {
+    !matches!(caller, Caller::Ai { .. })
+}
+
 pub struct SystemClock;
 
 impl Clock for SystemClock {
@@ -234,11 +240,7 @@ impl Agent {
             Op::Policy { profile, action } => Some((policy_op(action), None, profile.clone())),
             _ => None,
         };
-        let barred = match who.caller {
-            Caller::Ai { .. } => true,
-            Caller::Unknown { .. } => write,
-            Caller::Invoker { .. } => false,
-        };
+        let barred = !may_unlock(&who.caller) || (matches!(who.caller, Caller::Unknown { .. }) && write);
         if let Some(s) = refused
             && barred
         {
@@ -327,7 +329,7 @@ impl Agent {
 
     async fn serve(&self, op: Op, who: &Resolved) -> Reply {
         let caller = || who.caller.clone();
-        let ai = matches!(who.caller, Caller::Ai { .. });
+        let ai = !may_unlock(&who.caller);
         let (resolver, resolved) = (self.resolver.clone(), who.clone());
         let still = || {
             Recheck::new({

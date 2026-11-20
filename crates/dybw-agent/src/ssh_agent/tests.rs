@@ -1091,11 +1091,69 @@ async fn a_key_of_a_locked_profile_asks_to_unlock_naming_the_client_then_to_conf
                 /usr/bin/ssh (run by /usr/bin/git)";
     assert_eq!(asked[unlocks..].iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>(), [want]);
     assert_eq!(confirmed(&w.rig).len(), 1, "then confirmed");
-    // An AI-class client is named as one.
+    // An unknown client may unlock, as on the main socket, and is named as one.
     w.rig.agent.dispatch(Op::Lock { target: Target::Profile("work".into()) }).await;
-    assert!(!signed(&ssh, &on_peer(ai()), &Conn::default(), &w.alpha, b"x").await);
+    let unknown = Caller::Unknown { why: "orphan".into(), peer: None };
+    assert!(!signed(&ssh, &on_peer(unknown), &Conn::default(), &w.alpha, b"x").await);
     let last = w.rig.host.world().asked.last().unwrap().0.clone();
-    assert!(last.ends_with("an SSH signature asked by an SSH client of the AI agent claude"), "{last}");
+    assert!(
+        last.ends_with(
+            "an SSH signature asked by an SSH client that cannot be identified (orphan), possibly an AI agent"
+        ),
+        "{last}"
+    );
+}
+
+/// The main socket's rule: no unlock question on behalf of an AI-class client. Refused and audited.
+#[tokio::test]
+async fn an_ai_client_never_gets_an_unlock_question() {
+    let w = world(vec![]).await;
+    let ssh = confirming(&w, &["work"]);
+    w.rig.agent.dispatch(Op::Lock { target: Target::Profile("work".into()) }).await;
+    let asked = w.rig.host.world().asked.len();
+    assert!(!signed(&ssh, &on_peer(ai()), &Conn::default(), &w.alpha, b"x").await);
+    assert_eq!(w.rig.host.world().asked.len(), asked, "no question");
+    let e = w.rig.audit.events().pop().unwrap();
+    assert_eq!((e.op, e.profile.as_str(), e.verdict, e.caller), ("ssh-sign", "work", Verdict::Denied, ai()));
+    assert_eq!(e.ssh.unwrap().key, fingerprint(&w.alpha));
+    // The main socket refuses it the same way.
+    let unlock = Op::Unlock { profile: Some("work".into()) };
+    assert_eq!(w.rig.agent.dispatch_as(unlock, ai()).await, Reply::Error { error: dybw_proto::AgentError::Denied });
+    // Every profile unlocked: a key no profile holds is refused with nothing to audit.
+    crate::agent::testing::unlock(&w.rig.agent, &w.rig.host, "work").await;
+    let lines = w.rig.audit.events().len();
+    assert!(!signed(&ssh, &on_peer(ai()), &Conn::default(), &ed25519(5), b"x").await);
+    assert_eq!(w.rig.audit.events().len(), lines);
+}
+
+/// A deny entry of the caller policy refuses the program before any question; an allow entry does not skip it.
+#[tokio::test]
+async fn a_policy_deny_refuses_the_client_and_an_allow_does_not_skip_the_question() {
+    let w = world(vec![]).await;
+    let ssh = confirming(&w, &["work"]);
+    let profile = w.rig.agent.config.profile(Some("work")).unwrap();
+    let store = crate::policy::Store::new(
+        &crate::paths::ProfilePaths::with(&w.rig.agent.home, &profile).policy,
+        crate::agent::testing::me(),
+    );
+    let entry = |rule| dybw_proto::PolicyEntry {
+        exe: "/usr/bin/ssh".into(),
+        script: None,
+        hash: "h-ssh".into(),
+        rule,
+        detached: false,
+    };
+    store.set(entry(dybw_proto::PolicyRule::Allow)).unwrap();
+    w.rig.host.allow();
+    assert!(signed(&ssh, &on_peer(ssh_client(500)), &Conn::default(), &w.alpha, b"x").await);
+    assert_eq!(confirmed(&w.rig).len(), 1, "an allow entry still asks");
+    store.set(entry(dybw_proto::PolicyRule::Deny)).unwrap();
+    w.rig.host.allow();
+    assert!(!signed(&ssh, &on_peer(ssh_client(501)), &Conn::default(), &w.alpha, b"x").await);
+    assert_eq!(confirmed(&w.rig).len(), 1, "denied without a question");
+    assert_eq!(verdicts(&w.rig), [Verdict::Confirmed, Verdict::Denied]);
+    // Not an invoker: the entries do not name it, it is asked.
+    assert!(signed(&ssh, &on_peer(ai()), &Conn::default(), &w.alpha, b"x").await);
 }
 
 #[tokio::test]
