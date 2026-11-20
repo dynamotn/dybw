@@ -110,7 +110,7 @@ jobs:
       - name: Install test clients
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3-pytest python3-cryptography
+          sudo apt-get install -y --no-install-recommends python3-pytest python3-cryptography keyutils
       - run: cargo build --locked --release
       - name: Wait for Vaultwarden
         run: |

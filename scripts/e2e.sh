@@ -28,6 +28,8 @@ if ((alive == 0)); then
   echo "e2e: Vaultwarden did not answer within 120 s" >&2
   exit 1
 fi
+# Docker's default seccomp profile refuses keyctl, which the login protector's handover tests need (pam_bwss's keyring).
 docker run --rm --name dybw-e2e-run --network container:dybw-bw-it -e BW_E2E_URL=http://127.0.0.1:80 \
+  --security-opt seccomp=unconfined \
   -e E2E_TESTS="${E2E_TESTS:-tests/e2e}" \
   -v "${PWD}":/src -v dybw-target:/target -v dybw-cargo:/usr/local/cargo/registry dybw-e2e

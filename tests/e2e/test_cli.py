@@ -12,6 +12,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -319,6 +320,18 @@ def test_offline_unlock_from_the_cache(world, account):
 PIN = "246813"
 
 
+def named(world, *args, pins=()):
+    """`dybw args` run by `bash <script>`: a caller the agent can name. Enrolling a protector is a write, refused to
+    an unknown caller, and `python3 -m pytest` cannot be named."""
+    script = world.root / "named.sh"
+    if not script.exists():
+        script.write_text('#!/bin/bash\n"$DYBW" "$@"\n')
+        time.sleep(1.2)  # a file written less than a second before the run looks changed after the start (Linux)
+    pinentry(pins=list(pins), confirm="deny")
+    env = {**world.env, "DYBW": world.bin}
+    return subprocess.run(["bash", str(script), *args], env=env, capture_output=True, text=True, timeout=60)
+
+
 def pins_asked():
     log = Path("/tmp/fake-pinentry.log").read_text()
     return [line for line in log.splitlines() if line.startswith("SETPROMPT")]
@@ -327,7 +340,7 @@ def pins_asked():
 def test_unlock_add_pin_then_a_lock_keeps_it(world, account):
     ensure_unlocked(world, account)
     Path("/tmp/fake-pinentry.log").unlink(missing_ok=True)
-    r = world("unlock", "add", "pin", pins=[account.password, PIN, PIN])
+    r = named(world, "unlock", "add", "pin", pins=[account.password, PIN, PIN])
     assert r.returncode == 0, (r.stderr, world.log.read_text())
     assert world("unlock", "list").stdout == "e2e\tpin\t5 tries left\n"
     assert world("status").stdout.split("\t")[4] == "pin\n"
@@ -358,7 +371,7 @@ def test_five_wrong_pins_fall_back_to_the_master_password(world, account):
 
 def test_a_new_login_drops_the_pin(world, account):
     ensure_unlocked(world, account)
-    assert world("unlock", "add", "pin", pins=[account.password, PIN, PIN]).returncode == 0
+    assert named(world, "unlock", "add", "pin", pins=[account.password, PIN, PIN]).returncode == 0
     r = world("login", pins=[account.client_id, account.client_secret])
     assert r.returncode == 0, r.stderr
     assert world("unlock", "list").stdout == ""
@@ -366,3 +379,96 @@ def test_a_new_login_drops_the_pin(world, account):
     Path("/tmp/fake-pinentry.log").unlink(missing_ok=True)
     assert world("unlock", pins=[account.password]).returncode == 0
     assert pins_asked() == ["SETPROMPT Master password:"]
+
+
+# The `login` protector and the agent as the consumer of pam_bwss's keyring handover (ADR 0006, Linux). The entries
+# are written with keyctl exactly as pam_bwss writes them (bwss P4.6 Task 5 contract: a `user` key in the user
+# keyring @u, 60 s); pam_bwss itself, run by a real login, is the owner's manual check.
+
+LOGIN_PW = "e2e login password"
+NEW_PW = "e2e new login password"
+
+
+@pytest.fixture
+def keyring():
+    if not shutil.which("keyctl") or subprocess.run(["keyctl", "show", "@u"], capture_output=True).returncode:
+        pytest.skip("no usable user keyring (keyutils missing, or a seccomp filter refuses keyctl)")
+
+
+def keyring_put(name, payload):
+    """As pam_bwss writes it: made in a fresh session keyring, 60 s, linked into @u, then possessor and user may
+    view, read and search only."""
+    steps = f'id=$(keyctl padd user "{name}" @s) && keyctl timeout "$id" 60 && keyctl link "$id" @u ' \
+        '&& keyctl setperm "$id" 0x0b0b0000'
+    r = subprocess.run(["keyctl", "session", "-", "bash", "-c", steps], input=payload.encode(), capture_output=True)
+    assert r.returncode == 0, r.stderr
+
+
+def keyring_has(name):
+    return subprocess.run(["keyctl", "search", "@u", "user", name], capture_output=True).returncode == 0
+
+
+def eventually(check, seconds=15):
+    for _ in range(seconds * 10):
+        if check():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def unlock_dir():
+    return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state/dybw/profiles/e2e/unlock"
+
+
+def test_unlock_add_login_keeps_a_bound_blob_on_disk(world, account, keyring):
+    ensure_unlocked(world, account)
+    r = named(world, "unlock", "add", "login", pins=[account.password, LOGIN_PW, LOGIN_PW])
+    assert r.returncode == 0, (r.stderr, world.log.read_text())
+    assert "Without a TPM2" in r.stderr
+    blob = unlock_dir() / "login"
+    assert (blob.stat().st_mode & 0o777, blob.parent.stat().st_mode & 0o777) == (0o600, 0o700)
+    assert '"protector":"login"' in blob.read_text()
+    assert "e2e\tlogin\t-\n" in world("unlock", "list").stdout
+
+
+def test_the_login_password_in_the_keyring_unlocks_and_is_taken(world, account, keyring):
+    assert world("lock").returncode == 0
+    Path("/tmp/fake-pinentry.log").unlink(missing_ok=True)
+    keyring_put("dybw:login", LOGIN_PW)
+    assert eventually(lambda: world("unlocked").returncode == 0), world.log.read_text()
+    assert not keyring_has("dybw:login"), "read once, invalidated at once"
+    assert not Path("/tmp/fake-pinentry.log").exists() or pins_asked() == [], "nothing was asked"
+    assert get(world, "login-item") == "login-pw\n"
+    assert "unlock-login" in world("audit", "-n", "20").stdout
+
+
+def test_a_wrong_login_password_keeps_the_protector(world, account, keyring):
+    assert world("lock").returncode == 0
+    keyring_put("dybw:login", "not the password")
+    assert eventually(lambda: not keyring_has("dybw:login"))
+    time.sleep(2)
+    assert world("unlocked").returncode == 1
+    assert (unlock_dir() / "login").exists()
+
+
+def test_a_password_change_is_confirmed_by_the_next_login(world, account, keyring):
+    keyring_put("dybw:login-old", LOGIN_PW)
+    keyring_put("dybw:login", NEW_PW)
+    pending = unlock_dir() / "login.pending"
+    assert eventually(pending.exists), world.log.read_text()
+    assert world("unlocked").returncode == 1, "a password change does not unlock"
+    keyring_put("dybw:login", NEW_PW)
+    assert eventually(lambda: world("unlocked").returncode == 0), world.log.read_text()
+    assert not pending.exists()
+
+
+def test_the_last_session_closing_locks_every_profile(world, account, keyring):
+    assert world("unlocked").returncode == 0
+    keyring_put("dybw:lock", "-")
+    assert eventually(lambda: not keyring_has("dybw:lock"))
+    time.sleep(1.5)
+    assert world("unlocked").returncode == 0, "no session named: nothing locks"
+    # No logind in the container: the session named is the user's last.
+    keyring_put("dybw:lock", "c1")
+    assert eventually(lambda: world("unlocked").returncode == 1), world.log.read_text()
+    assert "lock-session" in world("audit", "-n", "20").stdout

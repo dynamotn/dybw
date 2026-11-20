@@ -12,7 +12,7 @@ FROM rust:1-trixie
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 python3-pytest python3-cryptography \
-    openssh-client openssh-server \
+    openssh-client openssh-server keyutils \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=rbw /opt/rbw/bin/rbw /opt/rbw/bin/rbw-agent /opt/rbw/bin/
