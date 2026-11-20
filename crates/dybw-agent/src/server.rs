@@ -31,6 +31,9 @@ pub async fn serve(
         None => None,
     };
     let ticker = tokio::spawn(ticker(agent.clone()));
+    // pam_bwss's handover of the login password (ADR 0006).
+    #[cfg(target_os = "linux")]
+    let watch = tokio::spawn(crate::handover::watch(agent.clone(), Arc::new(crate::handover::UserKeyring)));
     let (mut handlers, mut ssh_handlers) = (JoinSet::new(), JoinSet::new());
     let mut accept = || -> Accepting<'_> { Box::pin(async { listener.accept().await.map(|(stream, _)| stream) }) };
     let on = |stream| -> Handling {
@@ -54,6 +57,8 @@ pub async fn serve(
         out = ssh_loop => out,
     };
     ticker.abort();
+    #[cfg(target_os = "linux")]
+    watch.abort();
     ssh_handlers.shutdown().await;
     wind_down(&agent, handlers).await;
     out

@@ -542,6 +542,7 @@ fn logged(logged_in: bool) -> Reply {
             unlocked: false,
             last_sync: None,
             protectors: vec![],
+            login_handover: None,
         }],
     }
 }

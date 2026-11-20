@@ -50,13 +50,16 @@ impl Config {
         let doc = read_doc(path)?.unwrap_or_default();
         let config = Config { doc, shown: path.display().to_string() };
         // profiles §1: a misspelt key is always an error, in an unused profile too.
-        let names: Vec<String> =
-            config.doc.get("profiles").and_then(Value::as_table).into_iter().flat_map(Table::keys).cloned().collect();
-        for name in names {
+        for name in config.names() {
             config.profile(Some(&name))?;
         }
         config.ssh_agent_profiles()?;
         Ok(config)
+    }
+
+    /// The names of every `[profiles.*]` section.
+    pub fn names(&self) -> Vec<String> {
+        self.doc.get("profiles").and_then(Value::as_table).into_iter().flat_map(Table::keys).cloned().collect()
     }
 
     /// `[ssh_agent] profiles` (profiles §1 and §8): the profiles whose SSH keys the agent offers, in order; none

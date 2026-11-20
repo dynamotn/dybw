@@ -523,6 +523,7 @@ mod tests {
             credentials: dir.join("state/credentials"),
             policy: dir.join("state/policy.json"),
             device: dir.join("state/devices/dybw"),
+            unlock: dir.join("state/unlock"),
             cache: dir.join("cache"),
         };
         Ctx {

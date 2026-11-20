@@ -153,6 +153,7 @@ pub(crate) fn status(unlocked: bool) -> Reply {
             unlocked,
             last_sync: Some(1_700_000_000),
             protectors: vec![],
+            login_handover: None,
         }],
     }
 }
@@ -469,6 +470,7 @@ fn status_prints_one_line_per_profile() {
                 unlocked: true,
                 last_sync: Some(7),
                 protectors: vec![s("pin")],
+                login_handover: None,
             },
             ProfileStatus {
                 profile: s("home"),
@@ -476,6 +478,7 @@ fn status_prints_one_line_per_profile() {
                 unlocked: false,
                 last_sync: None,
                 protectors: vec![],
+                login_handover: None,
             },
         ],
     };
@@ -1087,7 +1090,76 @@ fn unlock_list_prints_each_protector_and_needs_no_agent() {
 fn an_unknown_protector_is_named_in_the_error() {
     let (r, _) = one(&["unlock", "add", "nfc"], Reply::Error { error: AgentError::NoSuchProtector(s("nfc")) });
     assert_eq!(r.0, 1);
-    assert!(r.2.contains("no such protector: nfc (this device offers: pin)"), "{}", r.2);
+    assert!(r.2.contains("no such protector: nfc (dybw offers pin, and login on Linux)"), "{}", r.2);
+}
+
+#[test]
+fn enrolling_the_login_protector_warns_about_a_stolen_disk() {
+    let (r, op) = one(&["unlock", "add", "login"], Reply::Done);
+    assert_eq!(op, Op::UnlockAdd { profile: None, protector: s("login") });
+    assert_eq!((r.0, r.1.as_str()), (0, ""));
+    assert!(r.2.contains("Without a TPM2, someone who takes this disk can guess that password offline"), "{}", r.2);
+    let (r, _) = one(&["unlock", "add", "pin"], Reply::Done);
+    assert_eq!(r, (0, s(""), s("")));
+    let (r, _) = one(&["unlock", "add", "login"], Reply::Error { error: AgentError::Denied });
+    assert!(r.0 == 1 && !r.2.contains("TPM2"), "{}", r.2);
+}
+
+/// The `login` protector's file of profile `work` under `base`.
+fn login_blob(base: &Path) -> PathBuf {
+    base.join(".local/state/dybw/profiles/work/unlock/login")
+}
+
+#[test]
+fn unlock_list_without_an_agent_shows_the_login_protector_on_disk() {
+    let base = base();
+    write_config(base.path());
+    std::fs::create_dir_all(login_blob(base.path()).parent().unwrap()).unwrap();
+    std::fs::write(login_blob(base.path()), "{}").unwrap();
+    assert_eq!(run_in(&env_in(base.path(), None, None), &["unlock", "list"]), (0, s("work\tlogin\t-\n"), s("")));
+}
+
+#[test]
+fn doctor_reports_the_login_protector_the_keyring_and_the_last_handover() {
+    let base = base();
+    let file = login_blob(base.path());
+    let doctor = |keyring, handover: Option<Option<u64>>| {
+        let mut out = vec![];
+        let mut r = crate::doctor::Report { out: &mut out, failed: false };
+        crate::doctor::login_unlock(&file, keyring, &|| handover, &mut r).unwrap();
+        let failed = r.failed;
+        (failed, String::from_utf8(out).unwrap())
+    };
+    let (failed, out) = doctor(Ok(()), None);
+    assert!(!failed && out.starts_with("[ok] login unlock: none;"), "{out}");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "{}").unwrap();
+    let (failed, out) = doctor(Ok(()), None);
+    assert!(!failed, "{out}");
+    for want in ["unlock/login, bound to this device", "[ok] keyring: the user keyring is readable"] {
+        assert!(out.contains(want), "{want}: {out}");
+    }
+    assert!(out.ends_with("[ok] last handover: the agent is not running\n"), "{out}");
+    assert!(doctor(Ok(()), Some(None)).1.ends_with("none since the agent started\n"));
+    assert!(doctor(Ok(()), Some(Some(5))).1.ends_with("at unix time 5\n"));
+    let (failed, out) = doctor(Err(dybw_peer::Error::Os(1)), None);
+    assert!(failed && out.contains("[problem] keyring: the user keyring cannot be read"), "{out}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn doctor_asks_the_agent_when_the_login_password_last_unlocked() {
+    let mut handed = status(true);
+    if let Reply::Status { profiles, .. } = &mut handed {
+        profiles[0].login_handover = Some(7);
+    }
+    let f = fake(vec![Act::Reply(status(true)), Act::Reply(handed)]);
+    write_config(f.base.path());
+    std::fs::create_dir_all(login_blob(f.base.path()).parent().unwrap()).unwrap();
+    std::fs::write(login_blob(f.base.path()), "{}").unwrap();
+    let (_, out) = doctor_with(&env_in(f.base.path(), None, None), None, true);
+    assert!(out.contains("[ok] last handover: at unix time 7"), "{out}");
+    f.ops();
 }
 
 // doctor

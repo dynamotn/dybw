@@ -32,10 +32,26 @@ use crate::session::{self, Ctx, Session};
 use crate::ssh::{self, Key, SshError};
 use crate::ssh_agent::SignContext;
 
+mod login;
 mod pin;
 mod sign;
 mod write;
 pub use write::Write;
+
+/// The protector a name names, when this build offers it (`dybw unlock add`).
+pub(crate) use pin::offered;
+/// For the keyring handover (Linux).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) use {login::LOGIN, pin::the_agent};
+
+/// A login password `pam_bwss` handed over (ADR 0006): wiped when dropped, never printed.
+pub struct Token(pub zeroize::Zeroizing<Vec<u8>>);
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token")
+    }
+}
 
 /// Is the peer still the process that asked? Asked again once the user has answered.
 #[derive(Clone)]
@@ -88,6 +104,12 @@ pub enum Cmd {
     /// The profile's protectors (`dybw unlock list`); with `names_only`, no attempt counts (an AI-class caller).
     Protectors {
         names_only: bool,
+    },
+    /// A login password `pam_bwss` handed over: unlock with the `login` protector; with `old`, a password change,
+    /// wrap it again for the new one. Not a use of the profile.
+    LoginToken {
+        token: Token,
+        old: Option<Token>,
     },
     /// Fetch `/sync` now.
     Sync,
@@ -189,6 +211,7 @@ enum Long {
     Login(Caller),
     Unlock(Caller),
     UnlockAdd(String, Caller, Recheck),
+    LoginToken(Token, Option<Token>),
     Sync,
     /// A value request, and whose request it is.
     Read(Lookup, Read, Caller, Recheck),
@@ -231,6 +254,8 @@ struct State {
     ssh_noes: Vec<(Caller, u8)>,
     /// The `pin` protector (ADR 0006): memory only, kept across locks ([`pin`]).
     pin: Option<dybw_core::profile::protector::ProtectorBlob>,
+    /// Unix seconds of the last unlock by a login password `pam_bwss` handed over.
+    handover: Option<u64>,
 }
 
 /// Most per-process grants kept; the oldest goes first.
@@ -337,7 +362,7 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
     {
         let mut st = shared.state.borrow_mut();
         st.seen = Some(now);
-        if !matches!(cmd, Cmd::Status | Cmd::IdleCheck | Cmd::SshKeys(_)) {
+        if !matches!(cmd, Cmd::Status | Cmd::IdleCheck | Cmd::SshKeys(_) | Cmd::LoginToken { .. }) {
             st.last_used = Some(now);
         }
     }
@@ -400,6 +425,7 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
         Cmd::Login { caller } => Long::Login(caller),
         Cmd::Unlock { caller } => Long::Unlock(caller),
         Cmd::UnlockAdd { protector, caller, still } => Long::UnlockAdd(protector, caller, still),
+        Cmd::LoginToken { token, old } => Long::LoginToken(token, old),
         Cmd::Sync => Long::Sync,
         #[cfg(test)]
         Cmd::Panic => Long::Panic,
@@ -423,7 +449,8 @@ fn status(shared: &Shared, ctx: &Ctx) -> Reply {
             logged_in: ctx.paths.credentials.exists(),
             unlocked: shared.state.borrow().slot.is_some(),
             last_sync: ctx.last_sync(),
-            protectors: shared.state.borrow().pin.iter().map(|_| pin::PIN.to_owned()).collect(),
+            protectors: pin::infos(shared, ctx, true).into_iter().map(|p| p.name).collect(),
+            login_handover: shared.state.borrow().handover,
         }],
     }
 }
@@ -488,12 +515,15 @@ async fn run_long<H: Host>(shared: Rc<Shared>, host: Rc<H>, ctx: Rc<Ctx>, long: 
             let done = session::login(&*host, &ctx).await;
             // A new login is a new account session: a PIN enrolled before it is not carried over (ADR 0006).
             if done.is_ok() {
-                pin::drop_pin(&shared, &ctx, &caller, "a new login");
+                pin::drop_all(&shared, &ctx, &caller, "a new login");
             }
             outcome(done)
         }
         Long::Unlock(caller) => unlock(&shared, &*host, &ctx, &caller, None, true).await,
         Long::UnlockAdd(name, caller, still) => pin::add(&shared, &*host, &ctx, &caller, &still, &name).await,
+        Long::LoginToken(token, old) => {
+            login::on_token(&shared, &*host, &ctx, &token.0, old.as_ref().map(|o| &o.0[..])).await
+        }
         Long::Sync => sync(&shared, &*host, &ctx, wait).await,
         Long::Read(find, read, caller, still) => get(&shared, &*host, &ctx, &caller, &still, find, read).await,
         Long::Write(change, caller, still) => write::write(&shared, &*host, &ctx, &caller, &still, change).await,
@@ -1022,7 +1052,7 @@ async fn purge<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, s
         st.held.clear();
         st.ssh_held.clear();
     }
-    pin::drop_pin(shared, ctx, caller, "the profile was purged");
+    pin::drop_all(shared, ctx, caller, "the profile was purged");
     let removed = match std::fs::remove_dir_all(&ctx.paths.cache) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
@@ -1070,23 +1100,28 @@ async fn open<H: Host>(
     }
     let by_pin = if use_pin { pin::unlock(shared, host, ctx, caller, why).await } else { None };
     let typed = by_pin.is_none();
-    let opened = match by_pin {
+    let result = match by_pin {
         Some(session) => Ok(session),
         None => session::unlock(host, ctx, why).await,
     };
-    let reply = match opened {
+    let reply = match result {
         Ok(session) => {
-            let mut st = shared.state.borrow_mut();
-            st.ssh_declined.clear();
-            st.ssh_noes.clear();
-            // The idle timeout runs from the answer, not from a request that waited on the user.
-            st.last_used = st.seen;
-            st.slot = Some(session);
+            opened(shared, session);
             Reply::Done
         }
         Err(e) => error(e),
     };
     (reply, typed)
+}
+
+/// Hold an unlocked session: the SSH refusals of the locked time are forgotten.
+fn opened(shared: &Shared, session: Session) {
+    let mut st = shared.state.borrow_mut();
+    st.ssh_declined.clear();
+    st.ssh_noes.clear();
+    // The idle timeout runs from the answer, not from a request that waited on the user.
+    st.last_used = st.seen;
+    st.slot = Some(session);
 }
 
 /// Fetch `/sync`, keep it as the offline copy and show it to the vault. `wait` is false for the periodic sync, which

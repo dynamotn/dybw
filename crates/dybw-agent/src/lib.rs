@@ -6,6 +6,8 @@ pub mod caller;
 pub mod config;
 pub mod credentials;
 pub mod device;
+#[cfg(any(target_os = "linux", test))]
+pub mod handover;
 pub mod hardening;
 pub mod host;
 pub mod paths;

@@ -359,9 +359,13 @@ pub struct ProfileStatus {
     /// Unix seconds of the last sync (or the offline copy the profile last wrote); `None` before the first.
     #[serde(default)]
     pub last_sync: Option<u64>,
-    /// The names of the local unlock protectors enrolled on this device (`pin`).
+    /// The names of the local unlock protectors enrolled on this device (`pin`, `login`).
     #[serde(default)]
     pub protectors: Vec<String>,
+    /// Unix seconds of the last login password handed over by `pam_bwss` that unlocked this profile, since the agent
+    /// started (Linux).
+    #[serde(default)]
+    pub login_handover: Option<u64>,
 }
 
 /// One local unlock protector of a profile (`dybw unlock list`): no secret.
@@ -571,7 +575,7 @@ pub enum AgentError {
     #[error("internal agent error")]
     Internal,
     /// `dybw unlock add/remove` named a protector this device does not offer, or the profile does not have.
-    #[error("no such protector: {0} (this device offers: pin)")]
+    #[error("no such protector: {0} (dybw offers pin, and login on Linux)")]
     NoSuchProtector(String),
 }
 
@@ -1015,7 +1019,8 @@ mod tests {
                     logged_in: true,
                     unlocked: false,
                     last_sync: Some(1_700_000_000),
-                    protectors: vec![s("pin")],
+                    protectors: vec![s("pin"), s("login")],
+                    login_handover: Some(1_700_000_001),
                 }],
             },
             Reply::Protectors {

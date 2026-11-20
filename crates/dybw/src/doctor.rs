@@ -184,6 +184,42 @@ pub(crate) fn local_unlock(machine: Result<String, dybw_peer::Error>, r: &mut Re
     }
 }
 
+/// The `login` protector (ADR 0006, Linux): enrolled or not; when it is, whether the user keyring `pam_bwss` writes to
+/// can be read, and when a login password handed over last unlocked the profile (`handover`: `None` without an agent).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn login_unlock(
+    file: &std::path::Path,
+    keyring: Result<(), dybw_peer::Error>,
+    handover: &dyn Fn() -> Option<Option<u64>>,
+    r: &mut Report<'_>,
+) -> std::io::Result<()> {
+    if !file.exists() {
+        return r.ok("login unlock", "none; with pam_bwss installed, `dybw unlock add login` sets one");
+    }
+    r.ok("login unlock", &format!("{}, bound to this device", file.display()))?;
+    match keyring {
+        Ok(()) => r.ok("keyring", "the user keyring is readable")?,
+        Err(e) => {
+            let note = format!("the user keyring cannot be read ({e}): no login password reaches the agent");
+            r.problem("keyring", &note)?;
+        }
+    }
+    let note = match handover() {
+        None => "the agent is not running".to_owned(),
+        Some(None) => "none since the agent started".to_owned(),
+        Some(Some(t)) => format!("at unix time {t}"),
+    };
+    r.ok("last handover", &note)
+}
+
+/// When the agent last unlocked `profile` by a login password: `None` when no agent answers.
+#[cfg(target_os = "linux")]
+fn handover(env: &Env, profile: &str) -> Option<Option<u64>> {
+    let status = crate::client::call(env, Op::Status { profile: Some(profile.to_owned()) }, false).ok().flatten();
+    let Some(Reply::Status { profiles, .. }) = status else { return None };
+    Some(profiles.first().and_then(|p| p.login_handover))
+}
+
 /// The profile in use: its pinentry, local unlock and its policy file.
 fn profile_checks(
     env: &Env,
@@ -203,6 +239,11 @@ fn profile_checks(
         Err(e) => r.problem("pinentry", &format!("{}: {e}", profile.pinentry))?,
     }
     local_unlock(dybw_peer::machine_id(), r)?;
+    #[cfg(target_os = "linux")]
+    {
+        let file = ProfilePaths::with(home, &profile).unlock.join("login");
+        login_unlock(&file, dybw_peer::keyring::readable(), &|| handover(env, &profile.name), r)?;
+    }
     let file = ProfilePaths::with(home, &profile).policy;
     let shown = file.display();
     match Store::new(&file, env.uid).read() {

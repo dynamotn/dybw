@@ -249,8 +249,9 @@ impl Agent {
             | Op::Purge { .. } => sensitive.clone(),
             Op::StopAgent => Some((kind(&op), None, None)),
             Op::Unlock { profile } | Op::Login { profile } => Some((kind(&op), None, profile.clone())),
-            Op::UnlockAdd { profile, .. } | Op::UnlockRemove { profile, .. } => {
-                Some((kind(&op), Some("pin"), profile.clone()))
+            Op::UnlockAdd { profile, protector } | Op::UnlockRemove { profile, protector } => {
+                let named = crate::worker::offered(protector).map(dybw_core::profile::protector::Protector::name);
+                Some((kind(&op), named, profile.clone()))
             }
             Op::Policy { profile, action } => Some((policy_op(action), None, profile.clone())),
             _ => None,
@@ -478,7 +479,7 @@ impl Agent {
         value.expose().parse().unwrap_or(usize::MAX)
     }
 
-    async fn on_profile(&self, name: Option<&str>, cmd: Cmd) -> Reply {
+    pub(crate) async fn on_profile(&self, name: Option<&str>, cmd: Cmd) -> Reply {
         match self.config.profile(name) {
             Ok(profile) => match self.worker(&profile) {
                 Some(worker) => worker.call(cmd, self.clock.mono()).await,
@@ -524,7 +525,7 @@ impl Agent {
         first
     }
 
-    async fn each(&self, cmd: impl Fn() -> Cmd) {
+    pub(crate) async fn each(&self, cmd: impl Fn() -> Cmd) {
         for w in self.live() {
             w.call(cmd(), self.clock.mono()).await;
         }
@@ -777,6 +778,7 @@ mod tests {
                     unlocked: false,
                     last_sync: None,
                     protectors: vec![],
+                    login_handover: None,
                 }],
             }
         );

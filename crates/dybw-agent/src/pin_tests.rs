@@ -12,14 +12,14 @@ use crate::caller::{Caller, Via};
 use crate::host::fake::Answer;
 use crate::policy::Verdict;
 
-const PASSWORD: &str = "vectors-org-password";
+pub(crate) const PASSWORD: &str = "vectors-org-password";
 const PIN: &str = "246813";
 
-fn org() -> Option<String> {
+pub(crate) fn org() -> Option<String> {
     Some("org".into())
 }
 
-fn err(error: AgentError) -> Reply {
+pub(crate) fn err(error: AgentError) -> Reply {
     Reply::Error { error }
 }
 
@@ -31,16 +31,16 @@ fn unlock_op() -> Op {
     Op::Unlock { profile: org() }
 }
 
-fn lock_op() -> Op {
+pub(crate) fn lock_op() -> Op {
     Op::Lock { target: Target::Profile("org".into()) }
 }
 
-fn ai() -> Caller {
+pub(crate) fn ai() -> Caller {
     Caller::Ai { harness: "claude".into(), via: Via::Ancestry }
 }
 
 /// The org account's vault, logged in, locked.
-fn world() -> (tempfile::TempDir, Rig) {
+pub(crate) fn world() -> (tempfile::TempDir, Rig) {
     let dir = tempfile::tempdir().unwrap();
     let rig = rig(dir.path());
     rig.host.vault(include_str!("../tests/fixtures/org-vault.json"));
@@ -48,12 +48,12 @@ fn world() -> (tempfile::TempDir, Rig) {
     (dir, rig)
 }
 
-fn answer(rig: &Rig, texts: &[&'static str]) {
+pub(crate) fn answer(rig: &Rig, texts: &[&'static str]) {
     texts.iter().for_each(|t| rig.host.answer(Answer::Text(t)));
 }
 
 /// The field labels asked since the last call.
-fn asked(rig: &Rig) -> Vec<String> {
+pub(crate) fn asked(rig: &Rig) -> Vec<String> {
     std::mem::take(&mut rig.host.world().prompts)
 }
 
@@ -62,14 +62,14 @@ fn audited(rig: &Rig) -> Vec<(&'static str, Verdict)> {
     rig.audit.events().iter().filter(|e| e.op.starts_with("unlock")).map(|e| (e.op, e.verdict)).collect()
 }
 
-async fn protectors(rig: &Rig) -> Vec<ProtectorInfo> {
+pub(crate) async fn protectors(rig: &Rig) -> Vec<ProtectorInfo> {
     match rig.agent.dispatch(Op::UnlockList { profile: org() }).await {
         Reply::Protectors { profile, protectors } if profile == "org" => protectors,
         other => panic!("{other:?}"),
     }
 }
 
-async fn unlocked(rig: &Rig) -> bool {
+pub(crate) async fn unlocked(rig: &Rig) -> bool {
     let status = rig.agent.dispatch(Op::Status { profile: org() }).await;
     format!("{status:?}").contains("unlocked: true")
 }

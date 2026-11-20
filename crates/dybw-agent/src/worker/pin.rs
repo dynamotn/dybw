@@ -3,9 +3,10 @@
 //! dropped when the agent exits, on a new login or a purge, on a user-key rotation seen at a sync, after
 //! [`MAX_ATTEMPTS`] wrong PINs, and when it no longer fits this device or account.
 //!
-//! Enrolment needs the master password, typed on this device (ADR 0006); `config.toml` cannot add a protector. An
-//! unlock tries the PIN first: a cancel goes on to the master password, a wrong PIN is counted, and every other
-//! failure drops the blob, is logged and audited, and goes on to the master password.
+//! Enrolment needs the master password, typed on this device (ADR 0006); `config.toml` cannot add a protector. The
+//! enrolment, removal and listing here serve every protector this build offers ([`offered`]): the `login` one is
+//! kept on disk ([`super::login`]). An unlock tries the PIN first: a cancel goes on to the master password, a wrong
+//! PIN is counted, and every other failure drops the blob, is logged and audited, and goes on to the master password.
 
 use dybw_core::crypto::{KdfParams, SymmetricKey};
 use dybw_core::profile::protector::{
@@ -16,35 +17,50 @@ use dybw_native::ports::random::OsRandom;
 use dybw_proto::{AgentError, ProtectorInfo, Reply};
 use zeroize::Zeroizing;
 
-use super::{Recheck, Shared, error, open as open_profile, with_vault};
+use super::{Recheck, Shared, error, login, open as open_profile, with_vault};
 use crate::caller::Caller;
 use crate::device::device_id_for;
 use crate::host::Host;
 use crate::policy::{AuditEvent, Verdict};
 use crate::session::{self, Ctx, Session};
 
-/// The only protector this build offers.
+/// The protector kept in memory.
 pub(crate) const PIN: &str = "pin";
 
-/// Argon2id for a PIN: above ADR 0006's floors (64 MiB, t = 3, p = 1) in memory, the cost that hurts a GPU most.
-/// An unlock with it takes about 0.35 s on an Apple M-series Mac.
+/// Argon2id for a PIN or a login password: above ADR 0006's floors (64 MiB, t = 3, p = 1) in memory, the cost that
+/// hurts a GPU most. An unlock with it takes about 0.35 s on an Apple M-series Mac.
 pub(crate) const PIN_KDF: KdfParams = KdfParams::Argon2id { iterations: 3, memory_mib: 256, parallelism: 4 };
 
 /// The shortest PIN: six characters. Five tries against a million six-digit PINs is a 1 in 200,000 chance of a
 /// guess; a copy of the blob taken from the agent's memory costs about four CPU-days to search all six digits.
 pub(crate) const MIN_PIN: usize = 6;
 
-/// How often the PIN pair may be mistyped at enrolment before it gives up.
+/// How often the new secret may be mistyped at enrolment before it gives up.
 const TRIES: usize = 3;
 
+/// The protector `name` names, when this build offers it: `pin` everywhere, `login` on Linux only (`pam_bwss`).
+pub(crate) fn offered(name: &str) -> Option<Protector> {
+    match name {
+        PIN => Some(Protector::Pin),
+        #[cfg(any(target_os = "linux", test))]
+        login::LOGIN => Some(Protector::Login),
+        _ => None,
+    }
+}
+
 fn audit(ctx: &Ctx, caller: &Caller, op: &'static str, verdict: Verdict) {
-    tracing::info!(profile = %ctx.profile.name, op, ?verdict, "local unlock");
+    audit_as(ctx, caller, PIN, op, verdict);
+}
+
+/// One local unlock line in the log and the audit, for the protector `kind`; never a secret.
+pub(super) fn audit_as(ctx: &Ctx, caller: &Caller, kind: &'static str, op: &'static str, verdict: Verdict) {
+    tracing::info!(profile = %ctx.profile.name, op, kind, ?verdict, "local unlock");
     ctx.audit.record(AuditEvent {
         time: std::time::SystemTime::now(),
         profile: ctx.profile.name.clone(),
         caller: caller.clone(),
         op,
-        kind: Some(PIN),
+        kind: Some(kind),
         item: None,
         verdict,
         ssh: None,
@@ -52,7 +68,7 @@ fn audit(ctx: &Ctx, caller: &Caller, op: &'static str, verdict: Verdict) {
 }
 
 /// The device id and the machine fingerprint a blob is bound to; `None` when either cannot be read.
-fn binding<H: Host>(host: &H, ctx: &Ctx) -> Option<(String, String)> {
+pub(super) fn binding<H: Host>(host: &H, ctx: &Ctx) -> Option<(String, String)> {
     // An unreadable device id stops the master password path too, which logs why.
     let device = device_id_for(&ctx.paths, ctx.user.uid).ok()?;
     let Some(machine) = host.machine() else {
@@ -62,24 +78,37 @@ fn binding<H: Host>(host: &H, ctx: &Ctx) -> Option<(String, String)> {
     Some((device, machine))
 }
 
-/// `dybw unlock list`: names and attempts left (none with `names_only`), never a secret.
-pub(super) fn list(shared: &Shared, ctx: &Ctx, names_only: bool) -> Reply {
+/// The profile's protectors: names and attempts left (none with `names_only`, and none for `login`, which has no
+/// limit: the system checked its password before `pam_bwss` handed it over), never a secret.
+pub(super) fn infos(shared: &Shared, ctx: &Ctx, names_only: bool) -> Vec<ProtectorInfo> {
     let left = |b: &ProtectorBlob| (!names_only).then(|| MAX_ATTEMPTS.saturating_sub(b.attempts()));
-    let protectors =
-        shared.state.borrow().pin.as_ref().map(|b| ProtectorInfo { name: PIN.into(), attempts_left: left(b) });
-    Reply::Protectors { profile: ctx.profile.name.clone(), protectors: protectors.into_iter().collect() }
+    let pin = shared.state.borrow().pin.as_ref().map(|b| ProtectorInfo { name: PIN.into(), attempts_left: left(b) });
+    let login = login::enrolled(ctx).then(|| ProtectorInfo { name: login::LOGIN.into(), attempts_left: None });
+    pin.into_iter().chain(login).collect()
 }
 
-/// `dybw unlock remove pin`: refused to any caller but a named invoker, audited.
+/// `dybw unlock list`.
+pub(super) fn list(shared: &Shared, ctx: &Ctx, names_only: bool) -> Reply {
+    Reply::Protectors { profile: ctx.profile.name.clone(), protectors: infos(shared, ctx, names_only) }
+}
+
+/// `dybw unlock remove <protector>`: refused to any caller but a named invoker, audited.
 pub(super) fn remove(shared: &Shared, ctx: &Ctx, caller: &Caller, name: &str) -> Reply {
+    let kind = offered(name);
+    let shown = kind.map_or(PIN, Protector::name);
     if !matches!(caller, Caller::Invoker { .. }) {
-        audit(ctx, caller, "unlock-remove", Verdict::Denied);
+        audit_as(ctx, caller, shown, "unlock-remove", Verdict::Denied);
         return error(AgentError::Denied);
     }
-    if name != PIN || shared.state.borrow_mut().pin.take().is_none() {
+    let removed = match kind {
+        Some(Protector::Pin) => shared.state.borrow_mut().pin.take().is_some(),
+        Some(_) => login::delete(ctx),
+        None => false,
+    };
+    if !removed {
         return error(AgentError::NoSuchProtector(name.into()));
     }
-    audit(ctx, caller, "unlock-remove", Verdict::Confirmed);
+    audit_as(ctx, caller, shown, "unlock-remove", Verdict::Confirmed);
     Reply::Done
 }
 
@@ -91,37 +120,52 @@ pub(super) fn drop_pin(shared: &Shared, ctx: &Ctx, caller: &Caller, why: &str) {
     }
 }
 
-/// The caller of what the agent does on its own (a sync's rotation check): its own executable.
-fn the_agent() -> Caller {
+/// Drop every protector of the profile (a new login, a purge, a rotation), each logged and audited.
+pub(super) fn drop_all(shared: &Shared, ctx: &Ctx, caller: &Caller, why: &str) {
+    drop_pin(shared, ctx, caller, why);
+    login::drop_login(ctx, caller, why);
+}
+
+/// The caller of what the agent does on its own (a sync's rotation check, a login password handed over): its own
+/// executable.
+pub(crate) fn the_agent() -> Caller {
     let exe = std::env::current_exe().unwrap_or_default();
     Caller::Invoker { exe, script: None, hash: String::new(), relative: false, at: Default::default() }
 }
 
-/// Ask for the new PIN twice: the same both times and at least [`MIN_PIN`] characters, else asked again.
-async fn new_pin<H: Host>(host: &H, ctx: &Ctx) -> Result<Zeroizing<String>, AgentError> {
+/// Ask for the new secret twice: the same both times and, for a PIN, at least [`MIN_PIN`] characters, else asked
+/// again.
+async fn new_secret<H: Host>(host: &H, ctx: &Ctx, kind: Protector) -> Result<Zeroizing<String>, AgentError> {
     let name = &ctx.profile.name;
-    let first = format!(
-        "dybw profile {name}: choose a PIN of at least {MIN_PIN} characters to unlock this profile on this device. It \
-         stays in the agent's memory only; {MAX_ATTEMPTS} wrong PINs drop it."
-    );
-    let again = format!("dybw profile {name}: type the same PIN again.");
+    let (label, first, min, differ) = if kind == Protector::Pin {
+        let first = format!(
+            "dybw profile {name}: choose a PIN of at least {MIN_PIN} characters to unlock this profile on this device. \
+             It stays in the agent's memory only; {MAX_ATTEMPTS} wrong PINs drop it."
+        );
+        ("PIN", first, MIN_PIN, "The two PINs differ.")
+    } else {
+        ("Login password", login::enrol_text(name), 1, "The two passwords differ.")
+    };
+    let again = format!("dybw profile {name}: type the same {} again.", label.to_lowercase());
+    let (prompt, prompt_again) = (format!("{label}:"), format!("{label} again:"));
     let mut wrong = None;
     for _ in 0..TRIES {
-        let pin = session::ask(host, "PIN:", &first, wrong).await?;
-        if pin.chars().count() < MIN_PIN {
+        let secret = session::ask(host, &prompt, &first, wrong).await?;
+        if secret.chars().count() < min {
             wrong = Some("The PIN is too short.");
             continue;
         }
-        if *session::ask(host, "PIN again:", &again, None).await? == *pin {
-            return Ok(pin);
+        if *session::ask(host, &prompt_again, &again, None).await? == *secret {
+            return Ok(secret);
         }
-        wrong = Some("The two PINs differ.");
+        wrong = Some(differ);
     }
     Err(AgentError::Denied)
 }
 
-/// `dybw unlock add pin`: unlock with the master password when locked, else ask for it (enrolment needs it, ADR 0006),
-/// then the PIN twice; the blob replaces any earlier one. Refused to any caller but a named invoker. Audited.
+/// `dybw unlock add <protector>`: unlock with the master password when locked, else ask for it (enrolment needs it,
+/// ADR 0006), then the new secret twice; the blob replaces any earlier one. Refused to any caller but a named
+/// invoker. Audited.
 pub(super) async fn add<H: Host>(
     shared: &Shared,
     host: &H,
@@ -130,13 +174,12 @@ pub(super) async fn add<H: Host>(
     still: &Recheck,
     name: &str,
 ) -> Reply {
+    let kind = offered(name);
     if !matches!(caller, Caller::Invoker { .. }) {
-        audit(ctx, caller, "unlock-add", Verdict::Denied);
+        audit_as(ctx, caller, kind.map_or(PIN, Protector::name), "unlock-add", Verdict::Denied);
         return error(AgentError::Denied);
     }
-    if name != PIN {
-        return error(AgentError::NoSuchProtector(name.into()));
-    }
+    let Some(kind) = kind else { return error(AgentError::NoSuchProtector(name.into())) };
     // Only a master password typed for this very unlock counts: a profile another unlock (a PIN) opened meanwhile
     // asks for it again below.
     let (unlocked, typed) = open_profile(shared, host, ctx, caller, None, false).await;
@@ -144,8 +187,8 @@ pub(super) async fn add<H: Host>(
         return unlocked;
     }
     let _screen = shared.asking.lock().await;
-    let result = enrol(shared, host, ctx, still, typed).await;
-    audit(ctx, caller, "unlock-add", result.as_ref().map_or_else(|(_, v)| *v, |()| Verdict::Confirmed));
+    let result = enrol(shared, host, ctx, still, typed, kind).await;
+    audit_as(ctx, caller, kind.name(), "unlock-add", result.as_ref().map_or_else(|(_, v)| *v, |()| Verdict::Confirmed));
     result.map_or_else(|(e, _)| error(e), |()| Reply::Done)
 }
 
@@ -157,17 +200,18 @@ async fn enrol<H: Host>(
     ctx: &Ctx,
     still: &Recheck,
     typed: bool,
+    kind: Protector,
 ) -> Result<(), (AgentError, Verdict)> {
     let declined = |e| (e, Verdict::Declined);
     let failed = |e| (e, Verdict::Failed);
     if !typed {
-        match master_password(shared, host, ctx).await {
+        match master_password(shared, host, ctx, kind).await {
             Ok(true) => {}
             Ok(false) => return Err((AgentError::Denied, Verdict::Denied)),
             Err(e) => return Err(declined(e)),
         }
     }
-    let pin = new_pin(host, ctx).await.map_err(declined)?;
+    let secret = new_secret(host, ctx, kind).await.map_err(declined)?;
     if !still.holds() {
         return Err((AgentError::Denied, Verdict::Denied));
     }
@@ -175,29 +219,38 @@ async fn enrol<H: Host>(
     let user =
         with_vault(shared, |v| SymmetricKey::from_bytes(&v.keys.user().to_bytes()).map_err(|_| AgentError::Internal))
             .map_err(failed)?;
-    let source = KekSource::Secret { secret: Zeroizing::new(pin.as_bytes().to_vec()), params: PIN_KDF };
-    drop(pin);
+    let source = KekSource::Secret { secret: Zeroizing::new(secret.as_bytes().to_vec()), params: PIN_KDF };
+    drop(secret);
     let bound = Binding { device_id: &device, machine: &machine };
-    let blob =
-        protector::wrap(&user, Protector::Pin, source, bound, &BlockingArgon2, &OsRandom).await.map_err(|e| {
-            tracing::warn!(profile = %ctx.profile.name, "the PIN was not enrolled: {}", e.code());
-            failed(AgentError::Internal)
-        })?;
-    shared.state.borrow_mut().pin = Some(blob);
+    let blob = protector::wrap(&user, kind, source, bound, &BlockingArgon2, &OsRandom).await.map_err(|e| {
+        tracing::warn!(profile = %ctx.profile.name, kind = kind.name(), "not enrolled: {}", e.code());
+        failed(AgentError::Internal)
+    })?;
+    if kind == Protector::Pin {
+        shared.state.borrow_mut().pin = Some(blob);
+        return Ok(());
+    }
+    login::save(ctx, login::LOGIN, &blob).map_err(|e| {
+        tracing::warn!(profile = %ctx.profile.name, "the login protector was not saved: {}", e.kind());
+        failed(AgentError::Internal)
+    })?;
+    // A fresh enrolment replaces a re-wrap still waiting for a login.
+    login::forget_pending(ctx);
     Ok(())
 }
 
 /// The master password, checked against the unlocked user key and never sent anywhere (as a reprompt is): whether it
 /// was right.
-async fn master_password<H: Host>(shared: &Shared, host: &H, ctx: &Ctx) -> Result<bool, AgentError> {
+async fn master_password<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, kind: Protector) -> Result<bool, AgentError> {
     let account = |s: &Session| {
         let part = |k: &str| s.vault.sync.get(k).cloned().unwrap_or_default();
         (s.origin.clone(), serde_json::json!({ "profile": part("profile"), "userDecryption": part("userDecryption") }))
     };
     let target = shared.state.borrow().slot.as_ref().map(|s| (account(s), s.vault.user_key_id()));
     let Some(((origin, account), unlocked)) = target else { return Err(AgentError::Locked) };
+    let what = if kind == Protector::Pin { "a PIN" } else { "unlock at login" };
     let description =
-        format!("dybw profile {}: type the master password to set a PIN for this device", ctx.profile.name);
+        format!("dybw profile {}: type the master password to set {what} for this device", ctx.profile.name);
     let password = session::ask(host, "Master password:", &description, None).await?;
     Ok(session::key_id_of(ctx, &origin, account, password).await?.is_some_and(|id| id == unlocked))
 }
@@ -265,15 +318,15 @@ pub(super) async fn unlock<H: Host>(
     }
 }
 
-/// After a sync: drop the PIN when the user key no longer opens the account (a rotation).
+/// After a sync: drop every protector when the user key no longer opens the account (a rotation).
 pub(super) async fn after_sync(shared: &Shared, ctx: &Ctx, sync: &serde_json::Value) {
-    if shared.state.borrow().pin.is_none() {
+    if shared.state.borrow().pin.is_none() && !login::enrolled(ctx) {
         return;
     }
     let user =
         with_vault(shared, |v| SymmetricKey::from_bytes(&v.keys.user().to_bytes()).map_err(|_| AgentError::Internal));
     let Ok(user) = user else { return };
     if !session::key_still_opens(ctx, &user, sync).await {
-        drop_pin(shared, ctx, &the_agent(), "the user key no longer opens the account (rotated)");
+        drop_all(shared, ctx, &the_agent(), "the user key no longer opens the account (rotated)");
     }
 }

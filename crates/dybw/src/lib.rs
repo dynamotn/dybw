@@ -40,8 +40,8 @@ struct Cli {
 enum Cmd {
     /// Store the API key of the profile.
     Login,
-    /// Unlock the vault (asks for the PIN when one is set, else the master password); `add`, `remove` and `list`
-    /// manage the local unlock protectors.
+    /// Unlock the vault (asks for the PIN when one is set, else the master password; with a `login` protector, logging
+    /// in or unlocking the screen unlocks it); `add`, `remove` and `list` manage the local unlock protectors.
     Unlock {
         #[command(subcommand)]
         command: Option<UnlockCmd>,
@@ -210,10 +210,12 @@ enum Cmd {
 enum UnlockCmd {
     /// Enrol a protector: `pin` (asks for the master password, then the PIN twice, in the pinentry). The PIN stays in
     /// the agent's memory: it survives `dybw lock` and the idle lock, not `dybw agent stop`; five wrong PINs drop it.
+    /// `login` (Linux, with `pam_bwss`): the master password, then your login password twice; kept on disk, bound to
+    /// this device, it unlocks the profile when you log in or unlock the screen.
     Add { protector: String },
     /// Drop a protector.
     Remove { protector: String },
-    /// The profile's protectors and the wrong attempts each has left (no agent running: none).
+    /// The profile's protectors and the wrong attempts each has left (no agent running: the `login` one only).
     List,
 }
 
@@ -382,23 +384,36 @@ fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, er
         Cmd::Login => done(ask_started(env, Op::Login { profile })?),
         Cmd::Unlock { command: None } => done(ask_started(env, Op::Unlock { profile })?),
         Cmd::Unlock { command: Some(UnlockCmd::Add { protector }) } => {
-            done(ask_started(env, Op::UnlockAdd { profile, protector })?)
+            let login = protector == "login";
+            let code = done(ask_started(env, Op::UnlockAdd { profile, protector })?)?;
+            if login {
+                writeln!(err, "{LOGIN_WARNING}")?;
+            }
+            Ok(code)
         }
         Cmd::Unlock { command: Some(UnlockCmd::Remove { protector }) } => {
             done(ask_started(env, Op::UnlockRemove { profile, protector })?)
         }
-        // A PIN lives in the agent: with none running there is nothing to list, and none is started for it.
-        Cmd::Unlock { command: Some(UnlockCmd::List) } => match ask(env, Op::UnlockList { profile }, false)? {
-            None => Ok(0),
-            Some(Reply::Protectors { profile, protectors }) => {
-                for p in protectors {
-                    let left = p.attempts_left.map_or_else(|| "-".to_owned(), |n| format!("{n} tries left"));
-                    writeln!(out, "{}\t{}\t{left}", escape(&profile), escape(&p.name))?;
+        // A PIN lives in the agent: with none running only the `login` protector on disk is listed, and no agent is
+        // started for it.
+        Cmd::Unlock { command: Some(UnlockCmd::List) } => {
+            match ask(env, Op::UnlockList { profile: profile.clone() }, false)? {
+                None => {
+                    if let Some(name) = login_on_disk(env, profile.as_deref()) {
+                        writeln!(out, "{}\tlogin\t-", escape(&name))?;
+                    }
+                    Ok(0)
                 }
-                Ok(0)
+                Some(Reply::Protectors { profile, protectors }) => {
+                    for p in protectors {
+                        let left = p.attempts_left.map_or_else(|| "-".to_owned(), |n| format!("{n} tries left"));
+                        writeln!(out, "{}\t{}\t{left}", escape(&profile), escape(&p.name))?;
+                    }
+                    Ok(0)
+                }
+                Some(_) => Err(Fail::Unexpected),
             }
-            Some(_) => Err(Fail::Unexpected),
-        },
+        }
         Cmd::Unlocked => match ask(env, Op::Status { profile }, false)? {
             // No agent, nothing unlocked.
             None => Ok(1),
@@ -668,6 +683,17 @@ fn target(env: &Env, profile: Option<String>, all: bool, autostart: bool) -> Res
         return Ok(Some(Target::All));
     }
     Ok(default_profile(env, profile, autostart)?.map(Target::Profile))
+}
+
+/// Said once a `login` protector is enrolled (ADR 0006, Consequences).
+const LOGIN_WARNING: &str = "dybw: the login protector is kept on this disk, wrapped by your login password. Without a \
+    TPM2, someone who takes this disk can guess that password offline; a long login password slows them down.";
+
+/// The profile, when it has a `login` protector on this device.
+fn login_on_disk(env: &Env, profile: Option<&str>) -> Option<String> {
+    let home = env.home.as_ref()?;
+    let p = dybw_agent::config::Config::load(&dybw_agent::paths::config_path(home)).ok()?.profile(profile).ok()?;
+    dybw_agent::paths::ProfilePaths::with(home, &p).unlock.join("login").exists().then_some(p.name)
 }
 
 fn done(reply: Reply) -> Result<u8, Fail> {

@@ -18,6 +18,9 @@ pub struct ProfilePaths {
     pub policy: PathBuf,
     /// `<state>/devices/dybw`.
     pub device: PathBuf,
+    /// `<state>/unlock`: the local unlock protectors kept on disk, one file each, named after it (ADR 0006): device
+    /// state, never synced.
+    pub unlock: PathBuf,
     /// `<home>/.cache/dybw/profiles/<p>`.
     pub cache: PathBuf,
 }
@@ -37,6 +40,7 @@ impl ProfilePaths {
             credentials: state.join("credentials"),
             policy: state.join("policy.json"),
             device: state.join("devices/dybw"),
+            unlock: state.join("unlock"),
             cache: home.join(".cache/dybw/profiles").join(&profile.name),
             state,
         }
@@ -89,6 +93,7 @@ mod tests {
         assert_eq!(harnesses_path(Path::new("/h")), Path::new("/h/.local/state/dybw/harnesses.toml"));
         assert_eq!(audit_path(Path::new("/h")), Path::new("/h/.local/state/dybw/audit.log"));
         assert_eq!(p.device, Path::new("/h/.local/state/dybw/profiles/w/devices/dybw"));
+        assert_eq!(p.unlock, Path::new("/h/.local/state/dybw/profiles/w/unlock"));
         assert_eq!(p.cache, Path::new("/h/.cache/dybw/profiles/w"));
     }
 
