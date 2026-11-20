@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use dybw_core::api::{ApiError, ApiKey, Client, DeviceInfo, ServerUrls, origin_of, resolve_server_urls};
-use dybw_core::crypto::{AwsLcRsa, KdfParams};
+use dybw_core::crypto::{AwsLcRsa, KdfParams, SymmetricKey};
 use dybw_core::ports::{PortError, Storage};
 use dybw_core::profile::{self, CachedSync, ProfileError, UnlockedVault};
 use dybw_core::vault::Organizations;
@@ -414,6 +414,48 @@ async fn open<H: Host>(
         }
         Err(e) => Err(refused(e)),
     }
+}
+
+/// The account a protector's key is checked against (ADR 0006), and the server it is on: a fresh `/sync` when the
+/// server answers (`true`), the offline copy when it cannot be reached (`false`). `None` when there is neither, or the
+/// server refused: the master password path then asks, and reports why.
+pub(crate) async fn account<H: Host>(host: &H, ctx: &Ctx) -> Option<(Value, bool, String, ServerUrls)> {
+    api_auth(ctx).ok()?;
+    let (origin, urls) = urls_of(ctx).ok()?;
+    let (sync, fresh) = match fetch(host, ctx, &origin, &urls).await {
+        Ok(sync) => (sync, true),
+        Err(AgentError::Network) => (load_cache(ctx)?.sync, false),
+        Err(_) => return None,
+    };
+    Some((sync, fresh, origin, urls))
+}
+
+/// Unlock with a user key a protector gave, on the `sync` [`account`] read: the core checks it as it checks a master
+/// password (the private key, the security state); no KDF, so the KDF pin is untouched. A fresh `sync` is kept as the
+/// offline copy, as a master password unlock keeps it.
+pub(crate) async fn unlock_with_key(
+    ctx: &Ctx,
+    user: SymmetricKey,
+    (sync, fresh, origin, urls): (Value, bool, String, ServerUrls),
+) -> Result<Session, AgentError> {
+    let vault = profile::unlock_vault_with_key_cached(sync, &ctx.storage(), user, &AwsLcRsa, &Organizations::All)
+        .await
+        .map_err(|e| match refused(e) {
+            Refused::WrongPassword => AgentError::Denied,
+            Refused::Failed(e) => e,
+        })?;
+    if fresh {
+        save_cache(ctx, &vault.sync).await;
+    }
+    Ok(Session { vault, origin, urls })
+}
+
+/// Whether the user key still opens the account in `sync` (ADR 0006): a rotation, seen at a sync, makes it fail.
+/// Local only; nothing is saved but a higher security version, as any unlock saves it.
+pub(crate) async fn key_still_opens(ctx: &Ctx, user: &SymmetricKey, sync: &Value) -> bool {
+    let Ok(user) = SymmetricKey::from_bytes(&user.to_bytes()) else { return false };
+    let storage = ctx.storage();
+    profile::unlock_vault_with_key_cached(sync.clone(), &storage, user, &AwsLcRsa, &Organizations::None).await.is_ok()
 }
 
 /// A fresh `/sync` with the stored API key, for the server an unlock opened. The caller installs it, and keeps it

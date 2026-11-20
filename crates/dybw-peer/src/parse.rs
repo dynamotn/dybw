@@ -23,6 +23,20 @@ fn env_pairs<'a>(entries: impl Iterator<Item = &'a [u8]>) -> Env {
         .collect()
 }
 
+/// A machine fingerprint as read: trimmed, 1 to 64 ASCII letters, digits and dashes, else `Malformed`.
+pub(crate) fn machine_id(text: &str) -> Result<String, crate::Error> {
+    let id = text.trim();
+    let ok = (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if ok { Ok(id.to_owned()) } else { Err(crate::Error::Malformed) }
+}
+
+/// 16 bytes as an upper-case UUID (`8-4-4-4-12`), the way `ioreg` shows `IOPlatformUUID`.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn uuid_text(bytes: &[u8; 16]) -> String {
+    let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+    [0..8, 8..12, 12..16, 16..20, 20..32].map(|r| hex.get(r).unwrap_or_default()).join("-")
+}
+
 /// macOS `KERN_PROCARGS2`: native-endian `argc`, the exec path, NUL padding
 /// that rounds the path (with its terminator) up to a multiple of 8, `argc`
 /// argv strings, then the environment. Only that padding is skipped, so an
@@ -113,6 +127,17 @@ mod tests {
 
     fn s(v: &str) -> OsString {
         OsString::from(v)
+    }
+
+    #[test]
+    fn a_machine_id_is_trimmed_and_checked() {
+        assert_eq!(machine_id("0123abcd\n").unwrap(), "0123abcd");
+        assert_eq!(machine_id("A-B").unwrap(), "A-B");
+        for bad in ["", " \n", "a b", "x/y", &"a".repeat(65)] {
+            assert_eq!(machine_id(bad), Err(crate::Error::Malformed), "{bad:?}");
+        }
+        let uuid = uuid_text(&[0xab, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0xff]);
+        assert_eq!(uuid, "AB010203-0405-0607-0809-0A0B0C0D0EFF");
     }
 
     fn args2(argc: i32, tail: &[u8]) -> Vec<u8> {

@@ -24,6 +24,8 @@ pub mod worker;
 #[cfg(test)]
 mod flow_tests;
 #[cfg(test)]
+mod pin_tests;
+#[cfg(test)]
 mod policy_tests;
 #[cfg(test)]
 mod rbw_tests;

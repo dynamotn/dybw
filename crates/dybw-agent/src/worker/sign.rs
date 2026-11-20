@@ -154,7 +154,7 @@ pub(super) async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller
         tracing::info!(profile = %ctx.profile.name, "not asking again to unlock for an SSH client that cancelled");
         return error(AgentError::Denied);
     }
-    let reply = unlock_profile(shared, host, ctx, Some(why)).await;
+    let reply = unlock_profile(shared, host, ctx, caller, Some(why), true).await;
     if reply == error(AgentError::Denied) {
         let declined = &mut shared.state.borrow_mut().ssh_declined;
         if declined.len() >= MAX_HELD {

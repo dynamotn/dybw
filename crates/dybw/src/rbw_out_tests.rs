@@ -536,7 +536,13 @@ fn a_reply_that_does_not_fit_the_command_is_an_error() {
 fn logged(logged_in: bool) -> Reply {
     Reply::Status {
         agent_version: s("0.1.0"),
-        profiles: vec![ProfileStatus { profile: s("work"), logged_in, unlocked: false, last_sync: None }],
+        profiles: vec![ProfileStatus {
+            profile: s("work"),
+            logged_in,
+            unlocked: false,
+            last_sync: None,
+            protectors: vec![],
+        }],
     }
 }
 

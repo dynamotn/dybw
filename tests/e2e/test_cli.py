@@ -314,3 +314,55 @@ def test_offline_unlock_from_the_cache(world, account):
         assert world("sync").returncode == 1
     finally:
         world.proxy.start()
+
+
+PIN = "246813"
+
+
+def pins_asked():
+    log = Path("/tmp/fake-pinentry.log").read_text()
+    return [line for line in log.splitlines() if line.startswith("SETPROMPT")]
+
+
+def test_unlock_add_pin_then_a_lock_keeps_it(world, account):
+    ensure_unlocked(world, account)
+    Path("/tmp/fake-pinentry.log").unlink(missing_ok=True)
+    r = world("unlock", "add", "pin", pins=[account.password, PIN, PIN])
+    assert r.returncode == 0, (r.stderr, world.log.read_text())
+    assert world("unlock", "list").stdout == "e2e\tpin\t5 tries left\n"
+    assert world("status").stdout.split("\t")[4] == "pin\n"
+    assert world("lock").returncode == 0
+    assert world("unlock", "list").stdout == "e2e\tpin\t5 tries left\n", "a lock keeps the PIN"
+
+
+def test_unlock_with_the_pin(world, account):
+    world("lock")
+    Path("/tmp/fake-pinentry.log").unlink(missing_ok=True)
+    r = world("unlock", pins=[PIN])
+    assert r.returncode == 0, (r.stderr, world.log.read_text())
+    assert pins_asked() == ["SETPROMPT PIN:"]
+    assert world("unlocked").returncode == 0
+    assert get(world, "login-item") == "login-pw\n"
+
+
+def test_five_wrong_pins_fall_back_to_the_master_password(world, account):
+    world("lock")
+    Path("/tmp/fake-pinentry.log").unlink(missing_ok=True)
+    r = world("unlock", pins=["000000"] * 5 + [account.password])
+    assert r.returncode == 0, (r.stderr, world.log.read_text())
+    assert pins_asked() == ["SETPROMPT PIN:"] * 5 + ["SETPROMPT Master password:"]
+    assert world("unlock", "list").stdout == ""
+    audit = world("audit", "-n", "20").stdout
+    assert "unlock-pin-dropped" in audit, audit
+
+
+def test_a_new_login_drops_the_pin(world, account):
+    ensure_unlocked(world, account)
+    assert world("unlock", "add", "pin", pins=[account.password, PIN, PIN]).returncode == 0
+    r = world("login", pins=[account.client_id, account.client_secret])
+    assert r.returncode == 0, r.stderr
+    assert world("unlock", "list").stdout == ""
+    world("lock")
+    Path("/tmp/fake-pinentry.log").unlink(missing_ok=True)
+    assert world("unlock", pins=[account.password]).returncode == 0
+    assert pins_asked() == ["SETPROMPT Master password:"]

@@ -13,9 +13,9 @@ use dybw_proto::{Op, Reply};
 
 use crate::{Env, escape};
 
-struct Report<'a> {
-    out: &'a mut dyn Write,
-    failed: bool,
+pub(crate) struct Report<'a> {
+    pub(crate) out: &'a mut dyn Write,
+    pub(crate) failed: bool,
 }
 
 impl Report<'_> {
@@ -170,7 +170,21 @@ fn ssh_checks(env: &Env, config: &Config, r: &mut Report<'_>) -> std::io::Result
     }
 }
 
-/// The profile in use: its pinentry and its policy file.
+/// Local unlock (ADR 0006): a PIN is bound to the machine fingerprint, so one that cannot be read means no PIN.
+pub(crate) fn local_unlock(machine: Result<String, dybw_peer::Error>, r: &mut Report<'_>) -> std::io::Result<()> {
+    match machine {
+        Ok(_) => r.ok(
+            "local unlock",
+            "the machine fingerprint is readable; `dybw unlock add pin` sets a PIN, `dybw unlock list` shows it",
+        ),
+        Err(e) => {
+            let note = format!("the machine fingerprint cannot be read ({e}): no PIN can be set or used");
+            r.line("warning", "local unlock", &note)
+        }
+    }
+}
+
+/// The profile in use: its pinentry, local unlock and its policy file.
 fn profile_checks(
     env: &Env,
     config: &Config,
@@ -188,6 +202,7 @@ fn profile_checks(
         Ok(path) => r.ok("pinentry", &path)?,
         Err(e) => r.problem("pinentry", &format!("{}: {e}", profile.pinentry))?,
     }
+    local_unlock(dybw_peer::machine_id(), r)?;
     let file = ProfilePaths::with(home, &profile).policy;
     let shown = file.display();
     match Store::new(&file, env.uid).read() {

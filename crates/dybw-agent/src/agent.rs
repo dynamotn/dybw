@@ -59,6 +59,9 @@ fn kind(op: &Op) -> &'static str {
         Op::Purge { .. } => "purge",
         Op::Policy { .. } => "policy",
         Op::SshList => "ssh_list",
+        Op::UnlockAdd { .. } => "unlock-add",
+        Op::UnlockRemove { .. } => "unlock-remove",
+        Op::UnlockList { .. } => "unlock-list",
         Op::StopAgent => "stop_agent",
         _ => "other",
     }
@@ -219,8 +222,17 @@ impl Agent {
             Op::SshList => Some(("ssh-list", None, None)),
             _ => None,
         });
-        let write =
-            matches!(op, Op::Add { .. } | Op::Edit { .. } | Op::Generate { .. } | Op::Remove { .. } | Op::Purge { .. });
+        // Enrolling or dropping a protector changes how the profile unlocks: a write of the device's state.
+        let write = matches!(
+            op,
+            Op::Add { .. }
+                | Op::Edit { .. }
+                | Op::Generate { .. }
+                | Op::Remove { .. }
+                | Op::Purge { .. }
+                | Op::UnlockAdd { .. }
+                | Op::UnlockRemove { .. }
+        );
         // An AI-class caller reads names and status only: no value, no write, no unlock or login (no prompt is raised
         // on its behalf), no policy, no stop (it could restart the agent under its own environment). An unknown caller
         // writes nothing either. Refused before anything.
@@ -237,6 +249,9 @@ impl Agent {
             | Op::Purge { .. } => sensitive.clone(),
             Op::StopAgent => Some((kind(&op), None, None)),
             Op::Unlock { profile } | Op::Login { profile } => Some((kind(&op), None, profile.clone())),
+            Op::UnlockAdd { profile, .. } | Op::UnlockRemove { profile, .. } => {
+                Some((kind(&op), Some("pin"), profile.clone()))
+            }
             Op::Policy { profile, action } => Some((policy_op(action), None, profile.clone())),
             _ => None,
         };
@@ -341,8 +356,17 @@ impl Agent {
             Op::StopAgent => Reply::Done,
             Op::Status { profile } => self.on_profile(profile.as_deref(), Cmd::Status).await,
             Op::Login { profile } => self.on_profile(profile.as_deref(), Cmd::Login).await,
-            Op::Unlock { profile } => self.on_profile(profile.as_deref(), Cmd::Unlock).await,
-            Op::Sync { target: Target::Profile(name) } => self.on_unlocked(Some(&name), Cmd::Sync, ai).await,
+            Op::Unlock { profile } => self.on_profile(profile.as_deref(), Cmd::Unlock { caller: caller() }).await,
+            Op::UnlockAdd { profile, protector } => {
+                let cmd = Cmd::UnlockAdd { protector, caller: caller(), still: still() };
+                self.on_profile(profile.as_deref(), cmd).await
+            }
+            Op::UnlockRemove { profile, protector } => {
+                self.on_profile(profile.as_deref(), Cmd::UnlockRemove { protector, caller: caller() }).await
+            }
+            // Names and counts only, as `status` (ADR 0012): open to every class.
+            Op::UnlockList { profile } => self.on_profile(profile.as_deref(), Cmd::Protectors).await,
+            Op::Sync { target: Target::Profile(name) } => self.on_unlocked(Some(&name), Cmd::Sync, &who.caller).await,
             Op::Sync { target: Target::All } => self.sync_all().await,
             Op::Lock { target: Target::Profile(name) } => self.on_profile(Some(&name), Cmd::Lock).await,
             Op::Lock { target: Target::All } => {
@@ -352,45 +376,70 @@ impl Agent {
             // An AI-class caller sees names and ids only (ADR 0012): never a login's URIs.
             Op::List { profile, mut fields, folder } => {
                 fields.retain(|f| !ai || *f != Field::Uri);
-                self.on_unlocked(profile.as_deref(), Cmd::List { fields, folder }, ai).await
+                self.on_unlocked(profile.as_deref(), Cmd::List { fields, folder }, &who.caller).await
             }
             Op::Search { profile, term, folder, mut fields } => {
                 fields.retain(|f| !ai || *f != Field::Uri);
-                self.on_unlocked(profile.as_deref(), Cmd::Search { term, folder, fields }, ai).await
+                self.on_unlocked(profile.as_deref(), Cmd::Search { term, folder, fields }, &who.caller).await
             }
             Op::Get { profile, needle, user, folder, ignorecase, select, rbw } => {
                 let find = Lookup { needle, user, folder, ignorecase };
                 let rbw = rbw.then(|| Now(self.clock.clone()));
                 let cmd = Cmd::Get { find, select, rbw, caller: caller(), still: still() };
-                self.on_unlocked(profile.as_deref(), cmd, ai).await
+                self.on_unlocked(profile.as_deref(), cmd, &who.caller).await
             }
             Op::History { profile, needle, user, folder, ignorecase } => {
                 let find = Lookup { needle, user, folder, ignorecase };
-                self.on_unlocked(profile.as_deref(), Cmd::History { find, caller: caller(), still: still() }, ai).await
+                self.on_unlocked(
+                    profile.as_deref(),
+                    Cmd::History { find, caller: caller(), still: still() },
+                    &who.caller,
+                )
+                .await
             }
             Op::Code { profile, needle, user, folder, ignorecase, next } => {
                 let find = Lookup { needle, user, folder, ignorecase };
                 let cmd = Cmd::Code { find, next, now: Now(self.clock.clone()), caller: caller(), still: still() };
-                self.on_unlocked(profile.as_deref(), cmd, ai).await
+                self.on_unlocked(profile.as_deref(), cmd, &who.caller).await
             }
             Op::Add { profile, name, user, uris, folder, ask, password, notes } => {
                 let given = given(password, notes);
                 let write = Write::Add { name, user, uris, folder, ask, generate: None, given };
-                self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
+                self.on_unlocked(
+                    profile.as_deref(),
+                    Cmd::Write { write, caller: caller(), still: still() },
+                    &who.caller,
+                )
+                .await
             }
             Op::Generate { profile, name, user, uris, folder, length, charset } => {
                 let generate = Some((charset, length));
                 let write = Write::Add { name, user, uris, folder, ask: vec![], generate, given: vec![] };
-                self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
+                self.on_unlocked(
+                    profile.as_deref(),
+                    Cmd::Write { write, caller: caller(), still: still() },
+                    &who.caller,
+                )
+                .await
             }
             Op::Edit { profile, needle, user, folder, ask, ignorecase, password, notes, text } => {
                 let find = Lookup { needle, user, folder, ignorecase };
                 let write = Write::Edit { find, ask, given: given(password, notes), text };
-                self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
+                self.on_unlocked(
+                    profile.as_deref(),
+                    Cmd::Write { write, caller: caller(), still: still() },
+                    &who.caller,
+                )
+                .await
             }
             Op::Remove { profile, needle, user, folder, ignorecase } => {
                 let write = Write::Remove { find: Lookup { needle, user, folder, ignorecase } };
-                self.on_unlocked(profile.as_deref(), Cmd::Write { write, caller: caller(), still: still() }, ai).await
+                self.on_unlocked(
+                    profile.as_deref(),
+                    Cmd::Write { write, caller: caller(), still: still() },
+                    &who.caller,
+                )
+                .await
             }
             // No unlock: the copy is deleted whether or not the profile is unlocked.
             Op::Purge { profile } => {
@@ -451,11 +500,11 @@ impl Agent {
     /// Unlock on first need (profiles.md section 4): the same flow as `dybw unlock`, then `cmd`. A failed or cancelled
     /// unlock is the answer, so nothing after it (lookup, confirmation, opening) runs. Never for an AI-class caller
     /// (`ai`): no master-password prompt is raised on its behalf, a locked profile answers `Locked`.
-    async fn on_unlocked(&self, name: Option<&str>, cmd: Cmd, ai: bool) -> Reply {
-        if ai {
+    async fn on_unlocked(&self, name: Option<&str>, cmd: Cmd, caller: &Caller) -> Reply {
+        if !may_unlock(caller) {
             return self.on_profile(name, cmd).await;
         }
-        match self.on_profile(name, Cmd::Unlock).await {
+        match self.on_profile(name, Cmd::Unlock { caller: caller.clone() }).await {
             Reply::Done => self.on_profile(name, cmd).await,
             failed => failed,
         }
@@ -725,7 +774,8 @@ mod tests {
                     profile: "work".into(),
                     logged_in: false,
                     unlocked: false,
-                    last_sync: None
+                    last_sync: None,
+                    protectors: vec![],
                 }],
             }
         );

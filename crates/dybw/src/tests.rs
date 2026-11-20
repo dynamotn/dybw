@@ -147,7 +147,13 @@ fn item(id: &str, name: &str, user: Option<&str>) -> ItemSummary {
 pub(crate) fn status(unlocked: bool) -> Reply {
     Reply::Status {
         agent_version: s("0.1.0"),
-        profiles: vec![ProfileStatus { profile: s("work"), logged_in: true, unlocked, last_sync: Some(1_700_000_000) }],
+        profiles: vec![ProfileStatus {
+            profile: s("work"),
+            logged_in: true,
+            unlocked,
+            last_sync: Some(1_700_000_000),
+            protectors: vec![],
+        }],
     }
 }
 
@@ -191,6 +197,8 @@ fn every_command_maps_to_its_op() {
     let cases: Vec<(Vec<&str>, Reply, Op)> = vec![
         (vec!["login"], Reply::Done, Op::Login { profile: Some(s("p")) }),
         (vec!["unlock"], Reply::Done, Op::Unlock { profile: Some(s("p")) }),
+        (vec!["unlock", "add", "pin"], Reply::Done, Op::UnlockAdd { profile: Some(s("p")), protector: s("pin") }),
+        (vec!["unlock", "remove", "pin"], Reply::Done, Op::UnlockRemove { profile: Some(s("p")), protector: s("pin") }),
         (vec!["lock", "--all"], Reply::Done, Op::Lock { target: Target::All }),
         (vec!["lock"], Reply::Done, Op::Lock { target: Target::Profile(s("p")) }),
         (vec!["sync", "--all"], Reply::Done, Op::Sync { target: Target::All }),
@@ -455,12 +463,24 @@ fn status_prints_one_line_per_profile() {
     let two = Reply::Status {
         agent_version: s("1"),
         profiles: vec![
-            ProfileStatus { profile: s("work"), logged_in: true, unlocked: true, last_sync: Some(7) },
-            ProfileStatus { profile: s("home"), logged_in: false, unlocked: false, last_sync: None },
+            ProfileStatus {
+                profile: s("work"),
+                logged_in: true,
+                unlocked: true,
+                last_sync: Some(7),
+                protectors: vec![s("pin")],
+            },
+            ProfileStatus {
+                profile: s("home"),
+                logged_in: false,
+                unlocked: false,
+                last_sync: None,
+                protectors: vec![],
+            },
         ],
     };
     let (r, _) = one(&["status"], two);
-    assert_eq!(r.1, "work\tlogged in\tunlocked\t7\nhome\tnot logged in\tlocked\t-\n");
+    assert_eq!(r.1, "work\tlogged in\tunlocked\t7\tpin\nhome\tnot logged in\tlocked\t-\t-\n");
 }
 
 #[test]
@@ -1047,6 +1067,26 @@ fn audit_without_a_log_is_empty_and_an_untrusted_or_homeless_one_fails() {
     assert!(err.contains("password database"), "{err}");
 }
 
+#[test]
+fn unlock_list_prints_each_protector_and_needs_no_agent() {
+    let protectors = vec![dybw_proto::ProtectorInfo { name: s("pin"), attempts_left: 3 }];
+    let (r, op) = one(&["unlock", "list"], Reply::Protectors { profile: s("work"), protectors });
+    assert_eq!(r, (0, s("work\tpin\t3 tries left\n"), s("")));
+    assert_eq!(op, Op::UnlockList { profile: None });
+    let (r, _) = one(&["unlock", "list"], Reply::Done);
+    assert_eq!(r.0, 1);
+    // No agent: no PIN anywhere, and none is started to say so.
+    let env = env_in(base().path(), None, None);
+    assert_eq!(run_in(&env, &["unlock", "list"]), (0, s(""), s("")));
+}
+
+#[test]
+fn an_unknown_protector_is_named_in_the_error() {
+    let (r, _) = one(&["unlock", "add", "nfc"], Reply::Error { error: AgentError::NoSuchProtector(s("nfc")) });
+    assert_eq!(r.0, 1);
+    assert!(r.2.contains("no such protector: nfc (this device offers: pin)"), "{}", r.2);
+}
+
 // doctor
 
 const CONFIG: &str =
@@ -1078,6 +1118,7 @@ fn doctor_passes_a_healthy_machine_with_no_agent_running() {
         "[ok] config: ",
         "[ok] profile: work",
         "[ok] pinentry: /usr/bin/pinentry",
+        "[ok] local unlock: the machine fingerprint is readable",
         "[ok] policy: ",
         ", none yet",
         "[ok] audit log: ",
@@ -1099,6 +1140,16 @@ fn doctor_warns_under_an_ai_harness_but_a_healthy_machine_still_passes() {
     // Any other caller is not remarked on.
     let other = dybw_agent::caller::Caller::Unknown { why: s("x"), peer: None };
     assert!(!doctor_with(&env_in(base.path(), None, None), Some(other), true).1.contains("warning"));
+}
+
+#[test]
+fn doctor_warns_when_no_pin_can_be_bound_to_this_machine() {
+    let mut out = vec![];
+    let mut r = crate::doctor::Report { out: &mut out, failed: false };
+    crate::doctor::local_unlock(Err(dybw_peer::Error::Malformed), &mut r).unwrap();
+    assert!(!r.failed);
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.starts_with("[warning] local unlock: the machine fingerprint cannot be read"), "{out}");
 }
 
 #[test]

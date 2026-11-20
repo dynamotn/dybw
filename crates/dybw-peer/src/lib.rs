@@ -243,6 +243,12 @@ pub fn deny_attach() -> Result<(), Error> {
     sys::deny_attach()
 }
 
+/// The machine fingerprint a local unlock protector is bound to (ADR 0006): `IOPlatformUUID` on macOS, the content
+/// of `/etc/machine-id` on Linux. Not a secret.
+pub fn machine_id() -> Result<String, Error> {
+    sys::machine_id()
+}
+
 /// The three questions the agent asks, so a test can answer them itself.
 pub trait ProcessSource: Send + Sync {
     fn peer_of(&self, sock: BorrowedFd<'_>) -> Result<Peer, Error>;

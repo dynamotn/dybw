@@ -24,6 +24,9 @@ COPY --chmod=755 tests/e2e/fake_pinentry.py /usr/local/bin/fake-pinentry
 # runs need no network. The sources are bind-mounted for this step only.
 RUN --mount=type=bind,target=/fetch cargo fetch --locked --manifest-path /fetch/Cargo.toml
 
+# A PIN is bound to /etc/machine-id (ADR 0006); container images often ship none or an empty one.
+RUN test -s /etc/machine-id || tr -d '-' < /proc/sys/kernel/random/uuid > /etc/machine-id
+
 RUN useradd --create-home --uid 1000 tester
 
 ENV DYBW_E2E_CONTAINER=1 CARGO_TARGET_DIR=/target DYBW_BIN=/target/release/dybw DYBW_AGENT_BIN=/target/release/dybw-agent PYTHONDONTWRITEBYTECODE=1 RBW_BIN=/opt/rbw/bin/rbw

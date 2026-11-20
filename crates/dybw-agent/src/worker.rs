@@ -32,6 +32,7 @@ use crate::session::{self, Ctx, Session};
 use crate::ssh::{self, Key, SshError};
 use crate::ssh_agent::SignContext;
 
+mod pin;
 mod sign;
 mod write;
 pub use write::Write;
@@ -66,8 +67,24 @@ pub enum Cmd {
     Status,
     /// Ask for the API key and store it.
     Login,
-    /// Ask for the master password and unlock; answers `Done` at once when already unlocked.
-    Unlock,
+    /// Unlock (the PIN first when there is one, else or then the master password); answers `Done` at once when
+    /// already unlocked. `caller` is whose request it is, for the audit.
+    Unlock {
+        caller: Caller,
+    },
+    /// Enrol a local unlock protector (`dybw unlock add`).
+    UnlockAdd {
+        protector: String,
+        caller: Caller,
+        still: Recheck,
+    },
+    /// Drop a local unlock protector (`dybw unlock remove`).
+    UnlockRemove {
+        protector: String,
+        caller: Caller,
+    },
+    /// The profile's protectors (`dybw unlock list`).
+    Protectors,
     /// Fetch `/sync` now.
     Sync,
     /// Drop the keys now, and cancel whatever is in flight.
@@ -166,7 +183,8 @@ pub enum Cmd {
 /// The commands that wait on the user or the network.
 enum Long {
     Login,
-    Unlock,
+    Unlock(Caller),
+    UnlockAdd(String, Caller, Recheck),
     Sync,
     /// A value request, and whose request it is.
     Read(Lookup, Read, Caller, Recheck),
@@ -207,6 +225,8 @@ struct State {
     /// How many SSH signatures each client (a process; the class for a caller with no pid) was refused by the user:
     /// past [`sign::MAX_NOES`] it is asked nothing more until the profile locks or unlocks. At most [`MAX_HELD`].
     ssh_noes: Vec<(Caller, u8)>,
+    /// The `pin` protector (ADR 0006): memory only, kept across locks ([`pin`]).
+    pin: Option<dybw_core::profile::protector::ProtectorBlob>,
 }
 
 /// Most per-process grants kept; the oldest goes first.
@@ -319,6 +339,8 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
     }
     let long = match cmd {
         Cmd::Status => return quick(reply, status(shared, ctx)),
+        Cmd::Protectors => return quick(reply, pin::list(shared, ctx)),
+        Cmd::UnlockRemove { protector, caller } => return quick(reply, pin::remove(shared, ctx, &caller, &protector)),
         Cmd::IdleCheck => {
             idle_check(shared, ctx, now);
             return quick(reply, Reply::Done);
@@ -372,7 +394,8 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
             return true;
         }
         Cmd::Login => Long::Login,
-        Cmd::Unlock => Long::Unlock,
+        Cmd::Unlock { caller } => Long::Unlock(caller),
+        Cmd::UnlockAdd { protector, caller, still } => Long::UnlockAdd(protector, caller, still),
         Cmd::Sync => Long::Sync,
         #[cfg(test)]
         Cmd::Panic => Long::Panic,
@@ -396,6 +419,7 @@ fn status(shared: &Shared, ctx: &Ctx) -> Reply {
             logged_in: ctx.paths.credentials.exists(),
             unlocked: shared.state.borrow().slot.is_some(),
             last_sync: ctx.last_sync(),
+            protectors: shared.state.borrow().pin.iter().map(|_| pin::PIN.to_owned()).collect(),
         }],
     }
 }
@@ -457,9 +481,15 @@ async fn run_long<H: Host>(shared: Rc<Shared>, host: Rc<H>, ctx: Rc<Ctx>, long: 
         Long::Login => {
             // One pinentry at a time: a second login waits for the first.
             let _op = shared.op.lock().await;
-            outcome(session::login(&*host, &ctx).await)
+            let done = session::login(&*host, &ctx).await;
+            // A new login is a new account session: a PIN enrolled before it is not carried over (ADR 0006).
+            if done.is_ok() {
+                pin::drop_pin(&shared, &ctx, None, "a new login");
+            }
+            outcome(done)
         }
-        Long::Unlock => unlock(&shared, &*host, &ctx, None).await,
+        Long::Unlock(caller) => unlock(&shared, &*host, &ctx, &caller, None, true).await,
+        Long::UnlockAdd(name, caller, still) => pin::add(&shared, &*host, &ctx, &caller, &still, &name).await,
         Long::Sync => sync(&shared, &*host, &ctx, wait).await,
         Long::Read(find, read, caller, still) => get(&shared, &*host, &ctx, &caller, &still, find, read).await,
         Long::Write(change, caller, still) => write::write(&shared, &*host, &ctx, &caller, &still, change).await,
@@ -988,6 +1018,7 @@ async fn purge<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, s
         st.held.clear();
         st.ssh_held.clear();
     }
+    pin::drop_pin(shared, ctx, Some(caller), "the profile was purged");
     let removed = match std::fs::remove_dir_all(&ctx.paths.cache) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
@@ -1001,8 +1032,16 @@ async fn purge<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, s
     Reply::Done
 }
 
-/// `why`: what asks for the unlock, when not the user ([`session::unlock`]).
-async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, why: Option<&str>) -> Reply {
+/// `why`: what asks for the unlock, when not the user ([`session::unlock`]). With `use_pin`, a `pin` protector is
+/// tried first ([`pin::unlock`]); `caller` is whose request it is, for the audit.
+async fn unlock<H: Host>(
+    shared: &Shared,
+    host: &H,
+    ctx: &Ctx,
+    caller: &Caller,
+    why: Option<&str>,
+    use_pin: bool,
+) -> Reply {
     // Every read starts here: an unlocked profile must not wait behind a sync or another unlock.
     if shared.state.borrow().slot.is_some() {
         return Reply::Done;
@@ -1012,7 +1051,12 @@ async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, why: Option<&str>
     if shared.state.borrow().slot.is_some() {
         return Reply::Done;
     }
-    match session::unlock(host, ctx, why).await {
+    let by_pin = if use_pin { pin::unlock(shared, host, ctx, caller, why).await } else { None };
+    let opened = match by_pin {
+        Some(session) => Ok(session),
+        None => session::unlock(host, ctx, why).await,
+    };
+    match opened {
         Ok(session) => {
             let mut st = shared.state.borrow_mut();
             st.ssh_declined.clear();
@@ -1055,6 +1099,7 @@ async fn sync<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, wait: bool) -> Repl
 /// Keep a fresh `/sync` as the offline copy and show it to the vault.
 async fn install(shared: &Shared, ctx: &Ctx, sync: serde_json::Value) {
     session::save_cache(ctx, &sync).await;
+    pin::after_sync(shared, ctx, &sync).await;
     // A lock cancels the task that runs this, so the slot is there; if it is not, there is no vault to show it to.
     shared.state.borrow_mut().slot.as_mut().map(|session| session.vault.sync = sync).unwrap_or_default();
 }

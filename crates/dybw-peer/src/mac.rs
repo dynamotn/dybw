@@ -183,6 +183,15 @@ fn sysctl(mib: &mut [libc::c_int; 3], buf: Option<&mut Vec<u8>>, size: &mut usiz
     cvt(rc)
 }
 
+/// The hardware UUID, as `gethostuuid` gives it: the same value as IOKit's `IOPlatformUUID`.
+pub(crate) fn machine_id() -> Result<String, Error> {
+    let mut uuid = [0u8; 16];
+    let wait = libc::timespec { tv_sec: 1, tv_nsec: 0 };
+    // SAFETY: `uuid` is the 16 writable bytes of a `uuid_t`, `wait` a valid timespec; both outlive the call.
+    cvt(unsafe { libc::gethostuuid(uuid.as_mut_ptr(), &wait) })?;
+    parse::machine_id(&parse::uuid_text(&uuid))
+}
+
 pub(crate) fn deny_attach() -> Result<(), Error> {
     // SAFETY: PT_DENY_ATTACH takes no address and no data; it only flags the
     // calling process.
@@ -195,6 +204,14 @@ pub(crate) fn deny_attach() -> Result<(), Error> {
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn the_machine_id_is_the_platform_uuid_ioreg_shows() {
+        let id = crate::machine_id().unwrap();
+        let out = Command::new("/usr/sbin/ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"]).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains(&format!("\"IOPlatformUUID\" = \"{id}\"")), "{id} not in ioreg");
+    }
 
     #[test]
     fn another_users_process_has_no_visible_args() {

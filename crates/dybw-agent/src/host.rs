@@ -31,6 +31,8 @@ pub trait Host: Send + 'static {
     async fn confirm(&self, description: &str, offer_always: bool) -> Result<Confirm, PromptError>;
     /// The machine's name, for the device name the server shows.
     fn hostname(&self) -> String;
+    /// The machine fingerprint local unlock protectors are bound to (ADR 0006); `None` when it cannot be read.
+    fn machine(&self) -> Option<String>;
 }
 
 /// The real host: `HttpPort` and a trusted pinentry. A pinentry that fails the trust rule is kept as text and
@@ -74,6 +76,10 @@ impl Host for RealHost {
 
     fn hostname(&self) -> String {
         rustix::system::uname().nodename().to_string_lossy().chars().filter(|c| !c.is_control()).collect()
+    }
+
+    fn machine(&self) -> Option<String> {
+        dybw_peer::machine_id().map_err(|e| tracing::warn!("machine fingerprint: {e}")).ok()
     }
 }
 
@@ -157,6 +163,8 @@ pub(crate) mod fake {
         pub sync_fails_after_write: bool,
         /// What `POST /api/folders` answers instead of making the folder.
         pub folder_reply: Option<u16>,
+        /// The machine fingerprint; `None` cannot be read.
+        pub machine: Option<String>,
     }
 
     impl World {
@@ -230,6 +238,7 @@ pub(crate) mod fake {
                 bodies: Vec::new(),
                 sync_fails_after_write: false,
                 folder_reply: None,
+                machine: Some("fake-machine".into()),
             })))
         }
 
@@ -401,6 +410,11 @@ pub(crate) mod fake {
         fn hostname(&self) -> String {
             self.0.lock().unwrap().hostname.clone()
         }
+
+        #[expect(clippy::unwrap_used, reason = "tests")]
+        fn machine(&self) -> Option<String> {
+            self.0.lock().unwrap().machine.clone()
+        }
     }
 }
 
@@ -422,6 +436,7 @@ mod tests {
         let host = RealHost::new(trust(), "/nonexistent/pinentry");
         assert!(host.http().is_ok());
         assert!(!host.hostname().is_empty() && !host.hostname().chars().any(char::is_control));
+        assert!(host.machine().is_some_and(|m| !m.is_empty()));
         let e = host.password("p", "x", None).await.err().unwrap();
         assert!(matches!(e, PromptError::Untrusted(_)), "{e}");
         let e = host.confirm("x", false).await.err().unwrap();

@@ -184,6 +184,11 @@ fn cwd_of(link: std::io::Result<PathBuf>) -> Result<Option<PathBuf>, Error> {
     }
 }
 
+/// `/etc/machine-id` (systemd's, or the one dbus writes there).
+pub(crate) fn machine_id() -> Result<String, Error> {
+    parse::machine_id(&std::fs::read_to_string("/etc/machine-id").map_err(io_err)?)
+}
+
 /// `PR_SET_DUMPABLE` is part of the agent's hardening, not this crate.
 pub(crate) fn deny_attach() -> Result<(), Error> {
     Ok(())
@@ -195,6 +200,12 @@ mod tests {
 
     fn os(e: i32) -> std::io::Error {
         std::io::Error::from_raw_os_error(e)
+    }
+
+    #[test]
+    fn the_machine_id_is_etc_machine_id() {
+        let file = std::fs::read_to_string("/etc/machine-id");
+        assert_eq!(machine_id().ok(), file.ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()));
     }
 
     #[test]

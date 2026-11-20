@@ -330,6 +330,21 @@ pub enum Op {
     },
     /// The SSH agent's keys (profiles §8): names, fingerprints, types and profiles, no secret.
     SshList,
+    /// Enrol a local unlock protector (ADR 0006) on this device: the agent asks for the master password, then for
+    /// the factor (a PIN twice), in the pinentry. Only `pin` exists so far.
+    UnlockAdd {
+        profile: Option<String>,
+        protector: String,
+    },
+    /// Drop a local unlock protector of the profile.
+    UnlockRemove {
+        profile: Option<String>,
+        protector: String,
+    },
+    /// The profile's protectors: names and attempts left, never a secret.
+    UnlockList {
+        profile: Option<String>,
+    },
     StopAgent,
     /// Any op this build does not know; refused by `decode_request`, never sent.
     #[serde(other)]
@@ -344,6 +359,17 @@ pub struct ProfileStatus {
     /// Unix seconds of the last sync (or the offline copy the profile last wrote); `None` before the first.
     #[serde(default)]
     pub last_sync: Option<u64>,
+    /// The names of the local unlock protectors enrolled on this device (`pin`).
+    #[serde(default)]
+    pub protectors: Vec<String>,
+}
+
+/// One local unlock protector of a profile (`dybw unlock list`): no secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtectorInfo {
+    pub name: String,
+    /// Wrong attempts left before it is dropped.
+    pub attempts_left: u32,
 }
 
 /// One key the SSH agent offers (`dybw ssh list`).
@@ -543,6 +569,9 @@ pub enum AgentError {
     Config,
     #[error("internal agent error")]
     Internal,
+    /// `dybw unlock add/remove` named a protector this device does not offer, or the profile does not have.
+    #[error("no such protector: {0} (this device offers: pin)")]
+    NoSuchProtector(String),
 }
 
 /// What the agent answers.
@@ -598,6 +627,11 @@ pub enum Reply {
         keys: Vec<SshKey>,
         profiles: Vec<SshProfile>,
         lists: u64,
+    },
+    /// `UnlockList`: the profile's protectors.
+    Protectors {
+        profile: String,
+        protectors: Vec<ProtectorInfo>,
     },
     Error {
         error: AgentError,
@@ -943,6 +977,9 @@ mod tests {
             Op::Policy { profile: None, action: PolicyAction::Deny { invoker: s("/bin/sh"), script: None } },
             Op::Policy { profile: None, action: PolicyAction::Forget { invoker: s("/bin/sh") } },
             Op::SshList,
+            Op::UnlockAdd { profile: p(), protector: s("pin") },
+            Op::UnlockRemove { profile: None, protector: s("pin") },
+            Op::UnlockList { profile: p() },
             Op::StopAgent,
         ];
         for op in ops {
@@ -977,7 +1014,12 @@ mod tests {
                     logged_in: true,
                     unlocked: false,
                     last_sync: Some(1_700_000_000),
+                    protectors: vec![s("pin")],
                 }],
+            },
+            Reply::Protectors {
+                profile: s("work"),
+                protectors: vec![ProtectorInfo { name: s("pin"), attempts_left: 4 }],
             },
             Reply::Done,
             Reply::Items {

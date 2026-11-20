@@ -40,8 +40,12 @@ struct Cli {
 enum Cmd {
     /// Store the API key of the profile.
     Login,
-    /// Unlock the vault (asks for the master password).
-    Unlock,
+    /// Unlock the vault (asks for the PIN when one is set, else the master password); `add`, `remove` and `list`
+    /// manage the local unlock protectors.
+    Unlock {
+        #[command(subcommand)]
+        command: Option<UnlockCmd>,
+    },
     /// Exit 0 when the profile is unlocked, 1 when not.
     Unlocked,
     /// Lock the vault.
@@ -199,6 +203,18 @@ enum Cmd {
     /// The clipboard clearer `-c` starts: the job comes on stdin.
     #[command(name = clip::CLEAR_COMMAND, hide = true)]
     ClearClipboard,
+}
+
+/// Local unlock protectors (ADR 0006): kept on this device only, never in the config.
+#[derive(Subcommand, Debug)]
+enum UnlockCmd {
+    /// Enrol a protector: `pin` (asks for the master password, then the PIN twice, in the pinentry). The PIN stays in
+    /// the agent's memory: it survives `dybw lock` and the idle lock, not `dybw agent stop`; five wrong PINs drop it.
+    Add { protector: String },
+    /// Drop a protector.
+    Remove { protector: String },
+    /// The profile's protectors and the wrong attempts each has left (no agent running: none).
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -364,7 +380,24 @@ fn default_profile(env: &Env, profile: Option<String>, autostart: bool) -> Resul
 fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, Fail> {
     match cmd {
         Cmd::Login => done(ask_started(env, Op::Login { profile })?),
-        Cmd::Unlock => done(ask_started(env, Op::Unlock { profile })?),
+        Cmd::Unlock { command: None } => done(ask_started(env, Op::Unlock { profile })?),
+        Cmd::Unlock { command: Some(UnlockCmd::Add { protector }) } => {
+            done(ask_started(env, Op::UnlockAdd { profile, protector })?)
+        }
+        Cmd::Unlock { command: Some(UnlockCmd::Remove { protector }) } => {
+            done(ask_started(env, Op::UnlockRemove { profile, protector })?)
+        }
+        // A PIN lives in the agent: with none running there is nothing to list, and none is started for it.
+        Cmd::Unlock { command: Some(UnlockCmd::List) } => match ask(env, Op::UnlockList { profile }, false)? {
+            None => Ok(0),
+            Some(Reply::Protectors { profile, protectors }) => {
+                for p in protectors {
+                    writeln!(out, "{}\t{}\t{} tries left", escape(&profile), escape(&p.name), p.attempts_left)?;
+                }
+                Ok(0)
+            }
+            Some(_) => Err(Fail::Unexpected),
+        },
         Cmd::Unlocked => match ask(env, Op::Status { profile }, false)? {
             // No agent, nothing unlocked.
             None => Ok(1),
@@ -386,7 +419,8 @@ fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, er
                     let logged = if p.logged_in { "logged in" } else { "not logged in" };
                     let state = if p.unlocked { "unlocked" } else { "locked" };
                     let sync = p.last_sync.map_or("-".into(), |t| t.to_string());
-                    writeln!(out, "{}\t{logged}\t{state}\t{sync}", p.profile)?;
+                    let protectors = if p.protectors.is_empty() { "-".into() } else { p.protectors.join(",") };
+                    writeln!(out, "{}\t{logged}\t{state}\t{sync}\t{}", p.profile, escape(&protectors))?;
                 }
                 Ok(0)
             }
