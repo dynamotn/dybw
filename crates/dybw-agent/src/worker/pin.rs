@@ -93,7 +93,7 @@ pub(super) fn drop_pin(shared: &Shared, ctx: &Ctx, caller: &Caller, why: &str) {
 
 /// The caller of what the agent does on its own (a sync's rotation check): its own executable.
 fn the_agent() -> Caller {
-    let exe = std::env::current_exe().unwrap_or_else(|_| "dybw-agent".into());
+    let exe = std::env::current_exe().unwrap_or_default();
     Caller::Invoker { exe, script: None, hash: String::new(), relative: false, at: Default::default() }
 }
 

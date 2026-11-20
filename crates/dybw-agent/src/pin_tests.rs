@@ -120,7 +120,11 @@ async fn enrolment_when_unlocked_asks_for_the_master_password_and_refuses_a_wron
     assert_eq!(rig.agent.dispatch(add()).await, Reply::Done);
     assert_eq!(asked(&rig), ["Master password:", "PIN:", "PIN again:"]);
     // A wrong master password is a refusal, not the user's no.
-    assert_eq!(audited(&rig), [("unlock-add", Verdict::Denied), ("unlock-add", Verdict::Confirmed)]);
+    // A cancelled master password is the user's no.
+    assert_eq!(rig.agent.dispatch(add()).await, err(AgentError::Denied));
+    assert_eq!(asked(&rig), ["Master password:"]);
+    let verdicts = [Verdict::Denied, Verdict::Confirmed, Verdict::Declined];
+    assert_eq!(audited(&rig), verdicts.map(|v| ("unlock-add", v)));
 }
 
 #[tokio::test]
