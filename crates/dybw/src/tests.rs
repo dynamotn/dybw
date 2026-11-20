@@ -72,6 +72,10 @@ fn read_request(stream: &mut UnixStream) -> Request {
 
 /// Serve one connection per act; the thread returns the requests it saw.
 fn serve(listener: UnixListener, acts: Vec<Act>) -> JoinHandle<Vec<Op>> {
+    // No acts: close the listener now, not on the thread, or a connect racing it is accepted and then dropped.
+    if acts.is_empty() {
+        return std::thread::spawn(Vec::new);
+    }
     std::thread::spawn(move || {
         let mut seen = vec![];
         for act in acts {
