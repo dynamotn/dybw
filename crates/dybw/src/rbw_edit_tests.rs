@@ -373,8 +373,10 @@ fn scratch_directories_a_killed_run_left_are_wiped_and_removed_by_the_next() {
     std::fs::hard_link(stale.join("rbw"), w.path().join("kept")).unwrap();
     let alive = base.join(format!("rbw-edit.{}.1.0", std::process::id()));
     let odd = base.join("rbw-edit.x");
+    let negative = base.join("rbw-edit.-1.x");
+    let zero = base.join("rbw-edit.0.1.0");
     let file = base.join(format!("rbw-edit.{dead}.2.0"));
-    for d in [&alive, &odd] {
+    for d in [&alive, &odd, &negative, &zero] {
         std::fs::create_dir(d).unwrap();
     }
     std::fs::write(&file, "not a directory").unwrap();
@@ -384,4 +386,5 @@ fn scratch_directories_a_killed_run_left_are_wiped_and_removed_by_the_next() {
     assert!(!stale.exists(), "a dead run's directory is gone");
     assert_eq!(std::fs::read(w.path().join("kept")).unwrap(), [0; 6], "wiped first");
     assert!(alive.exists() && odd.exists() && file.exists(), "a live run's, an odd name and a file are kept");
+    assert!(negative.exists() && zero.exists(), "a pid that names no process is no run's");
 }

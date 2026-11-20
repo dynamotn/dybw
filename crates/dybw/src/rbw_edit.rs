@@ -59,7 +59,9 @@ fn sweep(base: &Path, uid: u32) {
     for entry in std::fs::read_dir(base).into_iter().flatten().flatten() {
         let name = entry.file_name();
         let pid = name.to_str().and_then(|n| n.strip_prefix("rbw-edit.")).and_then(|n| n.split('.').next());
-        let Some(pid) = pid.and_then(|p| p.parse().ok()).and_then(rustix::process::Pid::from_raw) else { continue };
+        // A positive pid only: a crafted name such as `rbw-edit.-1.x` names no process.
+        let pid = pid.and_then(|p| p.parse::<u32>().ok()).and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 0);
+        let Some(pid) = pid.and_then(rustix::process::Pid::from_raw) else { continue };
         let path = entry.path();
         let ours = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && m.uid() == uid);
         if ours && rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH) {
