@@ -288,9 +288,7 @@ pub(super) async fn unlock<H: Host>(
         let result = protector::unwrap(&mut blob, &kek, bound, &account.0, &BlockingArgon2).await;
         {
             let mut st = shared.state.borrow_mut();
-            if st.pin.is_some() {
-                st.pin = Some(blob.clone());
-            }
+            st.pin = st.pin.take().map(|_| blob.clone());
         }
         match result {
             Ok(user) => {

@@ -374,3 +374,13 @@ async fn a_lock_while_the_pin_is_typed_leaves_the_profile_locked() {
     assert_eq!(pending.await.unwrap(), err(AgentError::Locked));
     assert_eq!(protectors(&rig).await[0].attempts_left, Some(5));
 }
+
+#[tokio::test]
+async fn a_sync_that_finds_the_key_still_good_keeps_the_pin() {
+    let (_dir, rig) = enrolled().await;
+    answer(&rig, &[PIN]);
+    assert_eq!(rig.agent.dispatch(unlock_op()).await, Reply::Done);
+    assert_eq!(rig.agent.dispatch(Op::Sync { target: Target::Profile("org".into()) }).await, Reply::Done);
+    assert_eq!(protectors(&rig).await, [ProtectorInfo { name: "pin".into(), attempts_left: Some(5) }]);
+    assert!(!audited(&rig).iter().any(|(op, _)| *op == "unlock-pin-dropped"));
+}

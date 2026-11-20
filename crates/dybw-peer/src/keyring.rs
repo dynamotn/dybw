@@ -41,7 +41,8 @@ pub fn take(name: &str) -> Result<Option<Zeroizing<Vec<u8>>>, Error> {
     let read = keyctl(libc::KEYCTL_READ, id, buf.as_mut_ptr() as libc::c_long, MAX_PAYLOAD as libc::c_long, 0);
     // Invalidated whatever the read gave: an entry is read once.
     let gone = keyctl(libc::KEYCTL_INVALIDATE, id, 0, 0, 0);
-    let len = usize::try_from(read?).map_err(|_| Error::Malformed)?;
+    // `keyctl` answers a negative length as an error, so this never falls back.
+    let len = usize::try_from(read?).unwrap_or_default();
     gone?;
     buf.truncate(len.min(MAX_PAYLOAD));
     Ok(Some(buf))
@@ -57,7 +58,7 @@ pub fn readable() -> Result<(), Error> {
 /// both says it has no keyring (`DYBW_NO_KEYRING_TESTS=1`: GitLab's Docker runners, whose seccomp filter refuses
 /// keyctl) and refuses keyctl with `EPERM` or `ENOSYS`. Anywhere else a refused keyctl fails the test.
 pub fn tests_skipped() -> bool {
-    let declared = std::env::var_os("DYBW_NO_KEYRING_TESTS").is_some_and(|v| v == "1");
+    let declared = std::env::var_os("DYBW_NO_KEYRING_TESTS").as_deref() == Some(std::ffi::OsStr::new("1"));
     let skipped = declared && matches!(readable(), Err(Error::Os(libc::EPERM | libc::ENOSYS)));
     eprint!("{}", if skipped { "skipped: keyctl is refused here (DYBW_NO_KEYRING_TESTS=1)\n" } else { "" });
     skipped
