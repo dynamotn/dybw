@@ -49,6 +49,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       - run: cargo test --workspace --locked
+        env:
+          # The macOS runner is a VM: its Secure Enclave answers, but no key can be made in it.
+          DYBW_NO_ENCLAVE_TESTS: ${{ runner.os == 'macOS' && '1' || '' }}
       - name: no fake peer in a shipped binary
         run: |
           cargo tree -e features --edges normal -p dybw -p dybw-agent --target all > "$RUNNER_TEMP/features.txt"
