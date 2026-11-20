@@ -23,11 +23,11 @@ fake = []
 [dependencies]
 libc.workspace = true
 thiserror.workspace = true
-zeroize.workspace = true
 
-# The clipboard tools' content hash (Linux only; the tests run them everywhere).
+# The clipboard tools' content hash and wiped buffers (Linux only; the tests run them everywhere).
 [target.'cfg(target_os = "linux")'.dependencies]
 sha2.workspace = true
+zeroize.workspace = true
 
 # The pasteboard through typed bindings: no unsafe needed for the calls made.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -37,4 +37,5 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 
 [dev-dependencies]
 sha2.workspace = true
+zeroize.workspace = true
 tempfile.workspace = true
