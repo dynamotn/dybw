@@ -46,15 +46,12 @@ pub struct UserKeyring;
 impl Keyring for UserKeyring {
     fn take(&self, name: &str) -> Option<Zeroizing<Vec<u8>>> {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        match dybw_peer::keyring::take(name) {
-            Ok(entry) => entry,
-            Err(e) => {
-                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    tracing::warn!("the user keyring cannot be read ({e}): no login password is handed over");
-                }
-                None
+        dybw_peer::keyring::take(name).unwrap_or_else(|e| {
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!("the user keyring cannot be read ({e}): no login password is handed over");
             }
-        }
+            None
+        })
     }
 }
 

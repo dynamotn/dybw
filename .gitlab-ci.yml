@@ -14,6 +14,9 @@ variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo-home
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # The Docker runners' seccomp filter refuses keyctl: the keyring tests skip here only (pam_bwss's handover, ADR 0006).
+  # GitHub's native runners run them, and its coverage gate measures dybw-peer/src/keyring.rs.
+  DYBW_NO_KEYRING_TESTS: "1"
   VAULTWARDEN_IMAGE: vaultwarden/server:1.37.4@sha256:efb3cde962015fcc036b2ea625242248611943b27212ebf4392841fb30fad055
 
 default:
@@ -70,7 +73,8 @@ coverage:
     - rustup component add llvm-tools-preview
     - cargo install cargo-llvm-cov --locked --version '^0.9'
   script:
-    - cargo llvm-cov --workspace --locked --fail-under-lines 100
+    # keyring.rs runs only where keyctl is allowed: measured by GitHub's coverage job.
+    - cargo llvm-cov --workspace --locked --fail-under-lines 100 --ignore-filename-regex 'dybw-peer/src/keyring\.rs$'
 
 e2e:
   stage: test

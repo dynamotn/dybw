@@ -574,6 +574,7 @@ fn config_set_changes_one_line_and_keeps_the_rest() {
 
 #[test]
 fn config_set_maps_every_key() {
+    let false = crate::tests::as_root("config_set_maps_every_key") else { return };
     let cases: &[(&str, &str, &str)] = &[
         ("base_url", "https://x.example.org", "server_url = \"https://x.example.org\""),
         ("lock_timeout", "90", "lock_timeout_minutes = 2"),
@@ -715,6 +716,7 @@ fn config_set_refuses_a_file_it_cannot_parse() {
 
 #[test]
 fn config_set_reports_files_it_cannot_read_or_write() {
+    let false = crate::tests::as_root("config_set_reports_files_it_cannot_read_or_write") else { return };
     let f = new_base();
     std::fs::create_dir_all(home_file(f.path())).unwrap();
     let (code, _, err) = rbw_in(&renv(f.path(), &[]), &["config", "set", "email", "x"]);

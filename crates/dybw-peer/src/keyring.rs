@@ -53,6 +53,16 @@ pub fn readable() -> Result<(), Error> {
     search(c"dybw:doctor-probe").map(|_| ())
 }
 
+/// For the keyring tests of this crate and the agent: true, after saying so on stderr, only where the environment
+/// both says it has no keyring (`DYBW_NO_KEYRING_TESTS=1`: GitLab's Docker runners, whose seccomp filter refuses
+/// keyctl) and refuses keyctl with `EPERM` or `ENOSYS`. Anywhere else a refused keyctl fails the test.
+pub fn tests_skipped() -> bool {
+    let declared = std::env::var_os("DYBW_NO_KEYRING_TESTS").is_some_and(|v| v == "1");
+    let skipped = declared && matches!(readable(), Err(Error::Os(libc::EPERM | libc::ENOSYS)));
+    eprint!("{}", if skipped { "skipped: keyctl is refused here (DYBW_NO_KEYRING_TESTS=1)\n" } else { "" });
+    skipped
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
@@ -78,6 +88,7 @@ mod tests {
 
     #[test]
     fn an_entry_is_read_once_then_gone() {
+        let false = tests_skipped() else { return };
         let name = format!("dybw:test-{}", std::process::id());
         assert_eq!(take(&name).unwrap(), None);
         add(&name, b"pass word\x00\xff");

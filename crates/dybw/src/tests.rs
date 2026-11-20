@@ -53,6 +53,17 @@ fn euid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
+/// True under root, after saying why the test is skipped: root reads and opens what these tests need refused. CI
+/// never runs as root; a container run may.
+pub(crate) fn as_root(test: &str) -> bool {
+    let root = euid() == 0;
+    eprint!(
+        "{}",
+        if root { format!("skipped {test}: root bypasses the file permissions it checks\n") } else { String::new() }
+    );
+    root
+}
+
 /// A short base path: a socket path is limited to about 100 bytes.
 pub(crate) fn base() -> tempfile::TempDir {
     let base = tempfile::Builder::new().prefix("d").tempdir_in("/tmp").unwrap();
@@ -620,6 +631,7 @@ fn an_invalid_or_oversize_or_foreign_reply_is_refused_without_its_text() {
 
 #[test]
 fn a_socket_that_cannot_be_opened_is_not_taken_for_a_missing_agent() {
+    let false = as_root("a_socket_that_cannot_be_opened_is_not_taken_for_a_missing_agent") else { return };
     let base = base();
     let path = base.path().join("dybw/agent.sock");
     let _listener = UnixListener::bind(&path).unwrap();
