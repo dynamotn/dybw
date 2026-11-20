@@ -1069,9 +1069,12 @@ fn audit_without_a_log_is_empty_and_an_untrusted_or_homeless_one_fails() {
 
 #[test]
 fn unlock_list_prints_each_protector_and_needs_no_agent() {
-    let protectors = vec![dybw_proto::ProtectorInfo { name: s("pin"), attempts_left: 3 }];
+    let protectors = vec![
+        dybw_proto::ProtectorInfo { name: s("pin"), attempts_left: Some(3) },
+        dybw_proto::ProtectorInfo { name: s("pin"), attempts_left: None },
+    ];
     let (r, op) = one(&["unlock", "list"], Reply::Protectors { profile: s("work"), protectors });
-    assert_eq!(r, (0, s("work\tpin\t3 tries left\n"), s("")));
+    assert_eq!(r, (0, s("work\tpin\t3 tries left\nwork\tpin\t-\n"), s("")));
     assert_eq!(op, Op::UnlockList { profile: None });
     let (r, _) = one(&["unlock", "list"], Reply::Done);
     assert_eq!(r.0, 1);

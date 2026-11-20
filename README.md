@@ -19,9 +19,9 @@ trashes logins; the rbw shim and the SSH and git integrations come in later phas
 |---------|------|
 | `dybw login` | Store the profile's API key (client id and secret, asked through pinentry) |
 | `dybw unlock` | Unlock: the PIN first when one is set (cancel it to type the master password), else the master password |
-| `dybw unlock add pin` | Set a PIN for this profile on this device: the master password, then the PIN twice (at least 6 characters), in the agent's pinentry. The PIN lives in the agent's memory only: `dybw lock` and the idle lock keep it; `dybw agent stop`, `dybw login`, `rbw purge`, a user-key rotation and 5 wrong PINs drop it. Refused to AI-class callers |
+| `dybw unlock add pin` | Set a PIN for this profile on this device: the master password, then the PIN twice (at least 6 characters), in the agent's pinentry. The PIN lives in the agent's memory only: `dybw lock` and the idle lock keep it; `dybw agent stop`, `dybw login`, `rbw purge`, a user-key rotation and 5 wrong PINs drop it. Refused to AI-class callers. A PIN unlocks only: an item that asks for the master password again (reprompt) still needs the master password |
 | `dybw unlock remove pin` | Drop the PIN. Refused to AI-class callers |
-| `dybw unlock list` | `profile`, protector, wrong tries left; no agent running means none |
+| `dybw unlock list` | `profile`, protector, wrong tries left (`-` for an AI-class caller, which gets names only); no agent running means none |
 | `dybw unlocked` | Exit 0 when unlocked, 1 when not; never unlocks |
 | `dybw lock [--all]` | Lock now |
 | `dybw status` | `profile`, logged in, locked or unlocked, last sync (unix seconds), local unlock protectors (`pin` or `-`); never unlocks |

@@ -368,8 +368,9 @@ pub struct ProfileStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtectorInfo {
     pub name: String,
-    /// Wrong attempts left before it is dropped.
-    pub attempts_left: u32,
+    /// Wrong attempts left before it is dropped; `None` for an AI-class caller, which gets names only.
+    #[serde(default)]
+    pub attempts_left: Option<u32>,
 }
 
 /// One key the SSH agent offers (`dybw ssh list`).
@@ -1019,7 +1020,7 @@ mod tests {
             },
             Reply::Protectors {
                 profile: s("work"),
-                protectors: vec![ProtectorInfo { name: s("pin"), attempts_left: 4 }],
+                protectors: vec![ProtectorInfo { name: s("pin"), attempts_left: Some(4) }],
             },
             Reply::Done,
             Reply::Items {

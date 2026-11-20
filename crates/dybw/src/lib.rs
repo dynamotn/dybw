@@ -392,7 +392,8 @@ fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, er
             None => Ok(0),
             Some(Reply::Protectors { profile, protectors }) => {
                 for p in protectors {
-                    writeln!(out, "{}\t{}\t{} tries left", escape(&profile), escape(&p.name), p.attempts_left)?;
+                    let left = p.attempts_left.map_or_else(|| "-".to_owned(), |n| format!("{n} tries left"));
+                    writeln!(out, "{}\t{}\t{left}", escape(&profile), escape(&p.name))?;
                 }
                 Ok(0)
             }

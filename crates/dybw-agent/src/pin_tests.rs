@@ -87,7 +87,7 @@ async fn enrolled() -> (tempfile::TempDir, Rig) {
 #[tokio::test]
 async fn a_pin_is_enrolled_with_the_master_password_and_unlocks_after_a_lock() {
     let (_dir, rig) = enrolled().await;
-    assert_eq!(protectors(&rig).await, [ProtectorInfo { name: "pin".into(), attempts_left: 5 }]);
+    assert_eq!(protectors(&rig).await, [ProtectorInfo { name: "pin".into(), attempts_left: Some(5) }]);
     let status = rig.agent.dispatch(Op::Status { profile: org() }).await;
     assert!(format!("{status:?}").contains("protectors: [\"pin\"]"), "{status:?}");
     // The lock dropped the keys and kept the PIN: the PIN alone unlocks.
@@ -119,7 +119,8 @@ async fn enrolment_when_unlocked_asks_for_the_master_password_and_refuses_a_wron
     answer(&rig, &[PASSWORD, PIN, PIN]);
     assert_eq!(rig.agent.dispatch(add()).await, Reply::Done);
     assert_eq!(asked(&rig), ["Master password:", "PIN:", "PIN again:"]);
-    assert_eq!(audited(&rig), [("unlock-add", Verdict::Declined), ("unlock-add", Verdict::Confirmed)]);
+    // A wrong master password is a refusal, not the user's no.
+    assert_eq!(audited(&rig), [("unlock-add", Verdict::Denied), ("unlock-add", Verdict::Confirmed)]);
 }
 
 #[tokio::test]
@@ -158,10 +159,10 @@ async fn wrong_pins_count_across_unlocks_and_a_right_one_resets_the_count() {
     answer(&rig, &["000000", "000001"]);
     assert_eq!(rig.agent.dispatch(unlock_op()).await, err(AgentError::Denied));
     assert_eq!(asked(&rig), ["PIN:", "PIN:", "PIN:", "Master password:"]);
-    assert_eq!(protectors(&rig).await[0].attempts_left, 3);
+    assert_eq!(protectors(&rig).await[0].attempts_left, Some(3));
     answer(&rig, &[PIN]);
     assert_eq!(rig.agent.dispatch(unlock_op()).await, Reply::Done);
-    assert_eq!(protectors(&rig).await[0].attempts_left, 5);
+    assert_eq!(protectors(&rig).await[0].attempts_left, Some(5));
 }
 
 #[tokio::test]
@@ -173,6 +174,8 @@ async fn lock_and_idle_keep_the_pin_and_login_purge_and_exit_drop_it() {
     answer(&rig, &["user.0b3b6d1e-6f3a-4a52-9f54-2f1c8f0c9a11", "abcdefghij0123456789"]);
     assert_eq!(rig.agent.dispatch(Op::Login { profile: org() }).await, Reply::Done);
     assert!(protectors(&rig).await.is_empty());
+    let last = rig.audit.events().last().cloned().unwrap();
+    assert_eq!((last.op, last.caller), ("unlock-pin-dropped", crate::agent::testing::invoker()), "the login's caller");
 
     let (_dir, rig) = enrolled().await;
     rig.host.allow();
@@ -226,6 +229,14 @@ async fn a_rotation_seen_at_a_sync_or_at_an_unlock_drops_the_pin() {
     rig.host.world().profile = None;
     assert_eq!(rig.agent.dispatch(Op::Sync { target: Target::Profile("org".into()) }).await, Reply::Done);
     assert!(protectors(&rig).await.is_empty(), "dropped at the sync");
+    let last = rig.audit.events().last().cloned().unwrap();
+    let agent = std::env::current_exe().unwrap();
+    assert!(
+        matches!(&last.caller, Caller::Invoker { exe, .. } if *exe == agent),
+        "the agent itself: {:?}",
+        last.caller
+    );
+    assert_eq!((last.op, last.verdict), ("unlock-pin-dropped", Verdict::Failed));
 
     let (_dir, rig) = enrolled().await;
     rig.host.world().profile = None;
@@ -248,7 +259,8 @@ async fn an_ai_caller_may_list_but_not_add_remove_or_be_asked_for_a_pin() {
     assert_eq!(rig.agent.dispatch_as(list, ai()).await, err(AgentError::Locked));
     assert!(asked(&rig).is_empty(), "nothing was asked on an AI caller's behalf");
     let listed = rig.agent.dispatch_as(Op::UnlockList { profile: org() }, ai()).await;
-    assert!(matches!(listed, Reply::Protectors { protectors, .. } if protectors.len() == 1));
+    let names_only = vec![ProtectorInfo { name: "pin".into(), attempts_left: None }];
+    assert_eq!(listed, Reply::Protectors { profile: "org".into(), protectors: names_only }, "names only");
     let denied: Vec<_> = rig.audit.events().iter().filter(|e| e.verdict == Verdict::Denied).map(|e| e.op).collect();
     assert_eq!(denied, ["unlock-add", "unlock-remove", "unlock-remove", "unlock"]);
 }
@@ -319,6 +331,25 @@ async fn a_security_downgrade_after_the_pin_drops_it_and_refuses_the_unlock() {
 }
 
 #[tokio::test]
+async fn enrolment_asks_for_the_master_password_when_a_pin_unlock_opened_the_profile_meanwhile() {
+    let (_dir, rig) = enrolled().await;
+    // A read's unlock is at the PIN question, holding the profile's unlock turn.
+    rig.host.answer(Answer::HeldText(PIN));
+    let agent = rig.agent.clone();
+    let reading = tokio::spawn(async move { agent.dispatch(unlock_op()).await });
+    crate::read_tests::until(|| rig.host.world().prompts.len() == 1).await;
+    // `unlock add pin` on the locked profile waits for that turn; the PIN unlock fills the slot.
+    answer(&rig, &[PASSWORD, PIN, PIN]);
+    let agent = rig.agent.clone();
+    let adding = tokio::spawn(async move { agent.dispatch(add()).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    rig.host.world().release.notify_one();
+    assert_eq!(reading.await.unwrap(), Reply::Done);
+    assert_eq!(adding.await.unwrap(), Reply::Done);
+    assert_eq!(asked(&rig), ["PIN:", "Master password:", "PIN:", "PIN again:"], "the PIN did not stand in for it");
+}
+
+#[tokio::test]
 async fn an_ssh_unlock_takes_the_pin_too() {
     let (_dir, rig) = enrolled().await;
     answer(&rig, &[PIN]);
@@ -337,5 +368,5 @@ async fn a_lock_while_the_pin_is_typed_leaves_the_profile_locked() {
     crate::read_tests::until(|| rig.host.world().prompts.len() == 1).await;
     assert_eq!(rig.agent.dispatch(lock_op()).await, Reply::Done);
     assert_eq!(pending.await.unwrap(), err(AgentError::Locked));
-    assert_eq!(protectors(&rig).await[0].attempts_left, 5);
+    assert_eq!(protectors(&rig).await[0].attempts_left, Some(5));
 }

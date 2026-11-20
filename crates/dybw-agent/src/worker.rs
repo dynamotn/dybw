@@ -65,8 +65,10 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 #[non_exhaustive]
 pub enum Cmd {
     Status,
-    /// Ask for the API key and store it.
-    Login,
+    /// Ask for the API key and store it. `caller` is whose request it is, for the audit.
+    Login {
+        caller: Caller,
+    },
     /// Unlock (the PIN first when there is one, else or then the master password); answers `Done` at once when
     /// already unlocked. `caller` is whose request it is, for the audit.
     Unlock {
@@ -83,8 +85,10 @@ pub enum Cmd {
         protector: String,
         caller: Caller,
     },
-    /// The profile's protectors (`dybw unlock list`).
-    Protectors,
+    /// The profile's protectors (`dybw unlock list`); with `names_only`, no attempt counts (an AI-class caller).
+    Protectors {
+        names_only: bool,
+    },
     /// Fetch `/sync` now.
     Sync,
     /// Drop the keys now, and cancel whatever is in flight.
@@ -182,7 +186,7 @@ pub enum Cmd {
 
 /// The commands that wait on the user or the network.
 enum Long {
-    Login,
+    Login(Caller),
     Unlock(Caller),
     UnlockAdd(String, Caller, Recheck),
     Sync,
@@ -339,7 +343,7 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
     }
     let long = match cmd {
         Cmd::Status => return quick(reply, status(shared, ctx)),
-        Cmd::Protectors => return quick(reply, pin::list(shared, ctx)),
+        Cmd::Protectors { names_only } => return quick(reply, pin::list(shared, ctx, names_only)),
         Cmd::UnlockRemove { protector, caller } => return quick(reply, pin::remove(shared, ctx, &caller, &protector)),
         Cmd::IdleCheck => {
             idle_check(shared, ctx, now);
@@ -393,7 +397,7 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
             let _ = reply.send(Reply::Done);
             return true;
         }
-        Cmd::Login => Long::Login,
+        Cmd::Login { caller } => Long::Login(caller),
         Cmd::Unlock { caller } => Long::Unlock(caller),
         Cmd::UnlockAdd { protector, caller, still } => Long::UnlockAdd(protector, caller, still),
         Cmd::Sync => Long::Sync,
@@ -478,13 +482,13 @@ fn spawn<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, long: Long, 
 
 async fn run_long<H: Host>(shared: Rc<Shared>, host: Rc<H>, ctx: Rc<Ctx>, long: Long, wait: bool) -> Reply {
     match long {
-        Long::Login => {
+        Long::Login(caller) => {
             // One pinentry at a time: a second login waits for the first.
             let _op = shared.op.lock().await;
             let done = session::login(&*host, &ctx).await;
             // A new login is a new account session: a PIN enrolled before it is not carried over (ADR 0006).
             if done.is_ok() {
-                pin::drop_pin(&shared, &ctx, None, "a new login");
+                pin::drop_pin(&shared, &ctx, &caller, "a new login");
             }
             outcome(done)
         }
@@ -1018,7 +1022,7 @@ async fn purge<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, s
         st.held.clear();
         st.ssh_held.clear();
     }
-    pin::drop_pin(shared, ctx, Some(caller), "the profile was purged");
+    pin::drop_pin(shared, ctx, caller, "the profile was purged");
     let removed = match std::fs::remove_dir_all(&ctx.paths.cache) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
@@ -1042,21 +1046,35 @@ async fn unlock<H: Host>(
     why: Option<&str>,
     use_pin: bool,
 ) -> Reply {
+    open(shared, host, ctx, caller, why, use_pin).await.0
+}
+
+/// [`unlock`], and whether this very call opened the profile with the master password (`false` when it was open
+/// already, another unlock opened it meanwhile, or the PIN did): enrolment counts only that as the typed password.
+async fn open<H: Host>(
+    shared: &Shared,
+    host: &H,
+    ctx: &Ctx,
+    caller: &Caller,
+    why: Option<&str>,
+    use_pin: bool,
+) -> (Reply, bool) {
     // Every read starts here: an unlocked profile must not wait behind a sync or another unlock.
     if shared.state.borrow().slot.is_some() {
-        return Reply::Done;
+        return (Reply::Done, false);
     }
     let _op = shared.op.lock().await;
     // Another unlock may have finished while this one waited for its turn.
     if shared.state.borrow().slot.is_some() {
-        return Reply::Done;
+        return (Reply::Done, false);
     }
     let by_pin = if use_pin { pin::unlock(shared, host, ctx, caller, why).await } else { None };
+    let typed = by_pin.is_none();
     let opened = match by_pin {
         Some(session) => Ok(session),
         None => session::unlock(host, ctx, why).await,
     };
-    match opened {
+    let reply = match opened {
         Ok(session) => {
             let mut st = shared.state.borrow_mut();
             st.ssh_declined.clear();
@@ -1067,7 +1085,8 @@ async fn unlock<H: Host>(
             Reply::Done
         }
         Err(e) => error(e),
-    }
+    };
+    (reply, typed)
 }
 
 /// Fetch `/sync`, keep it as the offline copy and show it to the vault. `wait` is false for the periodic sync, which

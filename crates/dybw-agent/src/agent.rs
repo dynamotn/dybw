@@ -355,7 +355,7 @@ impl Agent {
         match op {
             Op::StopAgent => Reply::Done,
             Op::Status { profile } => self.on_profile(profile.as_deref(), Cmd::Status).await,
-            Op::Login { profile } => self.on_profile(profile.as_deref(), Cmd::Login).await,
+            Op::Login { profile } => self.on_profile(profile.as_deref(), Cmd::Login { caller: caller() }).await,
             Op::Unlock { profile } => self.on_profile(profile.as_deref(), Cmd::Unlock { caller: caller() }).await,
             Op::UnlockAdd { profile, protector } => {
                 let cmd = Cmd::UnlockAdd { protector, caller: caller(), still: still() };
@@ -365,7 +365,8 @@ impl Agent {
                 self.on_profile(profile.as_deref(), Cmd::UnlockRemove { protector, caller: caller() }).await
             }
             // Names and counts only, as `status` (ADR 0012): open to every class.
-            Op::UnlockList { profile } => self.on_profile(profile.as_deref(), Cmd::Protectors).await,
+            // An AI-class caller gets the names only, not how many tries are left.
+            Op::UnlockList { profile } => self.on_profile(profile.as_deref(), Cmd::Protectors { names_only: ai }).await,
             Op::Sync { target: Target::Profile(name) } => self.on_unlocked(Some(&name), Cmd::Sync, &who.caller).await,
             Op::Sync { target: Target::All } => self.sync_all().await,
             Op::Lock { target: Target::Profile(name) } => self.on_profile(Some(&name), Cmd::Lock).await,

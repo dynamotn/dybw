@@ -16,7 +16,7 @@ use dybw_native::ports::random::OsRandom;
 use dybw_proto::{AgentError, ProtectorInfo, Reply};
 use zeroize::Zeroizing;
 
-use super::{Recheck, Shared, error, unlock as unlock_profile, with_vault};
+use super::{Recheck, Shared, error, open as open_profile, with_vault};
 use crate::caller::Caller;
 use crate::device::device_id_for;
 use crate::host::Host;
@@ -62,14 +62,11 @@ fn binding<H: Host>(host: &H, ctx: &Ctx) -> Option<(String, String)> {
     Some((device, machine))
 }
 
-/// `dybw unlock list`: names and attempts left, never a secret.
-pub(super) fn list(shared: &Shared, ctx: &Ctx) -> Reply {
-    let protectors = shared
-        .state
-        .borrow()
-        .pin
-        .as_ref()
-        .map(|b| ProtectorInfo { name: PIN.into(), attempts_left: MAX_ATTEMPTS.saturating_sub(b.attempts()) });
+/// `dybw unlock list`: names and attempts left (none with `names_only`), never a secret.
+pub(super) fn list(shared: &Shared, ctx: &Ctx, names_only: bool) -> Reply {
+    let left = |b: &ProtectorBlob| (!names_only).then(|| MAX_ATTEMPTS.saturating_sub(b.attempts()));
+    let protectors =
+        shared.state.borrow().pin.as_ref().map(|b| ProtectorInfo { name: PIN.into(), attempts_left: left(b) });
     Reply::Protectors { profile: ctx.profile.name.clone(), protectors: protectors.into_iter().collect() }
 }
 
@@ -86,14 +83,18 @@ pub(super) fn remove(shared: &Shared, ctx: &Ctx, caller: &Caller, name: &str) ->
     Reply::Done
 }
 
-/// Drop the blob, saying why in the log, and in the audit (`unlock-pin-dropped`) when a caller's request did it.
-pub(super) fn drop_pin(shared: &Shared, ctx: &Ctx, caller: Option<&Caller>, why: &str) {
+/// Drop the blob, saying why in the log and the audit (`unlock-pin-dropped`), under the caller whose request did it.
+pub(super) fn drop_pin(shared: &Shared, ctx: &Ctx, caller: &Caller, why: &str) {
     if shared.state.borrow_mut().pin.take().is_some() {
         tracing::warn!(profile = %ctx.profile.name, "the PIN was dropped: {why}");
-        if let Some(caller) = caller {
-            audit(ctx, caller, "unlock-pin-dropped", Verdict::Failed);
-        }
+        audit(ctx, caller, "unlock-pin-dropped", Verdict::Failed);
     }
+}
+
+/// The caller of what the agent does on its own (a sync's rotation check): its own executable.
+fn the_agent() -> Caller {
+    let exe = std::env::current_exe().unwrap_or_else(|_| "dybw-agent".into());
+    Caller::Invoker { exe, script: None, hash: String::new(), relative: false, at: Default::default() }
 }
 
 /// Ask for the new PIN twice: the same both times and at least [`MIN_PIN`] characters, else asked again.
@@ -136,44 +137,59 @@ pub(super) async fn add<H: Host>(
     if name != PIN {
         return error(AgentError::NoSuchProtector(name.into()));
     }
-    let typed = shared.state.borrow().slot.is_none();
-    if typed {
-        let unlocked = unlock_profile(shared, host, ctx, caller, None, false).await;
-        if unlocked != Reply::Done {
-            return unlocked;
-        }
+    // Only a master password typed for this very unlock counts: a profile another unlock (a PIN) opened meanwhile
+    // asks for it again below.
+    let (unlocked, typed) = open_profile(shared, host, ctx, caller, None, false).await;
+    if unlocked != Reply::Done {
+        return unlocked;
     }
     let _screen = shared.asking.lock().await;
     let result = enrol(shared, host, ctx, still, typed).await;
-    audit(ctx, caller, "unlock-add", if result.is_ok() { Verdict::Confirmed } else { Verdict::Declined });
-    result.map_or_else(error, |()| Reply::Done)
+    audit(ctx, caller, "unlock-add", result.as_ref().map_or_else(|(_, v)| *v, |()| Verdict::Confirmed));
+    result.map_or_else(|(e, _)| error(e), |()| Reply::Done)
 }
 
-async fn enrol<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, still: &Recheck, typed: bool) -> Result<(), AgentError> {
+/// The enrolment after the unlock; a failure says how to audit it: `Denied` for a wrong master password or a caller
+/// that changed, `Declined` for a cancelled question, `Failed` for the rest.
+async fn enrol<H: Host>(
+    shared: &Shared,
+    host: &H,
+    ctx: &Ctx,
+    still: &Recheck,
+    typed: bool,
+) -> Result<(), (AgentError, Verdict)> {
+    let declined = |e| (e, Verdict::Declined);
+    let failed = |e| (e, Verdict::Failed);
     if !typed {
-        master_password(shared, host, ctx).await?;
+        match master_password(shared, host, ctx).await {
+            Ok(true) => {}
+            Ok(false) => return Err((AgentError::Denied, Verdict::Denied)),
+            Err(e) => return Err(declined(e)),
+        }
     }
-    let pin = new_pin(host, ctx).await?;
+    let pin = new_pin(host, ctx).await.map_err(declined)?;
     if !still.holds() {
-        return Err(AgentError::Denied);
+        return Err((AgentError::Denied, Verdict::Denied));
     }
-    let (device, machine) = binding(host, ctx).ok_or(AgentError::Internal)?;
+    let (device, machine) = binding(host, ctx).ok_or(failed(AgentError::Internal))?;
     let user =
-        with_vault(shared, |v| SymmetricKey::from_bytes(&v.keys.user().to_bytes()).map_err(|_| AgentError::Internal))?;
+        with_vault(shared, |v| SymmetricKey::from_bytes(&v.keys.user().to_bytes()).map_err(|_| AgentError::Internal))
+            .map_err(failed)?;
     let source = KekSource::Secret { secret: Zeroizing::new(pin.as_bytes().to_vec()), params: PIN_KDF };
     drop(pin);
     let bound = Binding { device_id: &device, machine: &machine };
     let blob =
         protector::wrap(&user, Protector::Pin, source, bound, &BlockingArgon2, &OsRandom).await.map_err(|e| {
             tracing::warn!(profile = %ctx.profile.name, "the PIN was not enrolled: {}", e.code());
-            AgentError::Internal
+            failed(AgentError::Internal)
         })?;
     shared.state.borrow_mut().pin = Some(blob);
     Ok(())
 }
 
-/// The master password, checked against the unlocked user key and never sent anywhere (as a reprompt is).
-async fn master_password<H: Host>(shared: &Shared, host: &H, ctx: &Ctx) -> Result<(), AgentError> {
+/// The master password, checked against the unlocked user key and never sent anywhere (as a reprompt is): whether it
+/// was right.
+async fn master_password<H: Host>(shared: &Shared, host: &H, ctx: &Ctx) -> Result<bool, AgentError> {
     let account = |s: &Session| {
         let part = |k: &str| s.vault.sync.get(k).cloned().unwrap_or_default();
         (s.origin.clone(), serde_json::json!({ "profile": part("profile"), "userDecryption": part("userDecryption") }))
@@ -183,10 +199,7 @@ async fn master_password<H: Host>(shared: &Shared, host: &H, ctx: &Ctx) -> Resul
     let description =
         format!("dybw profile {}: type the master password to set a PIN for this device", ctx.profile.name);
     let password = session::ask(host, "Master password:", &description, None).await?;
-    match session::key_id_of(ctx, &origin, account, password).await? {
-        Some(id) if id == unlocked => Ok(()),
-        _ => Err(AgentError::Denied),
-    }
+    Ok(session::key_id_of(ctx, &origin, account, password).await?.is_some_and(|id| id == unlocked))
 }
 
 /// Try the PIN, when there is one: `Some` session on success; `None` to go on to the master password (no PIN, a
@@ -232,7 +245,7 @@ pub(super) async fn unlock<H: Host>(
                     }
                     Err(e) => {
                         tracing::warn!(profile = %ctx.profile.name, "the PIN's key was refused: {e}");
-                        drop_pin(shared, ctx, Some(caller), "the account refused its key");
+                        drop_pin(shared, ctx, caller, "the account refused its key");
                         None
                     }
                 };
@@ -245,7 +258,7 @@ pub(super) async fn unlock<H: Host>(
                 audit(ctx, caller, "unlock-pin", Verdict::Denied);
                 // Binding, Stale (a rotation), Invalidated, Format: the core's text names which, never a secret.
                 let why = if e == ProtectorError::Wrong { "five wrong PINs".to_owned() } else { e.to_string() };
-                drop_pin(shared, ctx, Some(caller), &why);
+                drop_pin(shared, ctx, caller, &why);
                 return None;
             }
         }
@@ -261,6 +274,6 @@ pub(super) async fn after_sync(shared: &Shared, ctx: &Ctx, sync: &serde_json::Va
         with_vault(shared, |v| SymmetricKey::from_bytes(&v.keys.user().to_bytes()).map_err(|_| AgentError::Internal));
     let Ok(user) = user else { return };
     if !session::key_still_opens(ctx, &user, sync).await {
-        drop_pin(shared, ctx, None, "the user key no longer opens the account (rotated)");
+        drop_pin(shared, ctx, &the_agent(), "the user key no longer opens the account (rotated)");
     }
 }

@@ -113,6 +113,8 @@ pub(crate) mod fake {
         Always,
         /// `Held`, then "always".
         HeldAlways,
+        /// A secret typed once `World::release` is notified.
+        HeldText(&'static str),
     }
 
     pub struct World {
@@ -372,6 +374,10 @@ pub(crate) mod fake {
                 Answer::Fail => Err(PromptError::Protocol("scripted".into())),
                 Answer::Timeout => Err(PromptError::Timeout),
                 Answer::Hang => std::future::pending().await,
+                Answer::HeldText(t) => {
+                    release.notified().await;
+                    Ok(Some(Zeroizing::new(t.to_owned())))
+                }
                 // The user types the right password once the test lets them.
                 Answer::Held | Answer::Always | Answer::HeldAlways => {
                     release.notified().await;
@@ -396,7 +402,7 @@ pub(crate) mod fake {
                 Answer::Fail => Err(PromptError::Protocol("scripted".into())),
                 Answer::Timeout => Err(PromptError::Timeout),
                 Answer::Hang => std::future::pending().await,
-                Answer::Held | Answer::HeldAlways => {
+                Answer::Held | Answer::HeldAlways | Answer::HeldText(_) => {
                     release.notified().await;
                     Ok(if matches!(answer, Answer::HeldAlways) && offer_always {
                         Confirm::Always
