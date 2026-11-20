@@ -59,10 +59,15 @@ pub struct Created {
 }
 
 /// The wrapping side's result: keep `ephemeral` with the blob, use `secret` as the KEK input.
-#[derive(Debug)]
 pub struct Wrapped {
     pub ephemeral: PublicKey,
     pub secret: Zeroizing<[u8; 32]>,
+}
+
+impl std::fmt::Debug for Wrapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Wrapped").field("ephemeral", &self.ephemeral).field("secret", &"<redacted>").finish()
+    }
 }
 
 /// The answer to a Touch ID confirmation.
@@ -102,8 +107,47 @@ pub fn confirm(reason: &str) -> Confirm {
     confirmation(sys::confirm(&c_reason(reason)))
 }
 
+/// What the Touch ID sheet says when the caller's reason has nothing printable left.
+const DEFAULT_REASON: &str = "use your dybw vault";
+/// Longest reason shown, in characters.
+const REASON_MAX: usize = 120;
+
+/// The reason as the sheet shows it: one line, no control or format characters (no bidi overrides that could make
+/// a caller's name read as something else), at most [`REASON_MAX`] characters, never empty.
 fn c_reason(reason: &str) -> std::ffi::CString {
-    std::ffi::CString::new(reason.replace('\0', "")).unwrap_or_default()
+    let cleaned: String =
+        reason.chars().filter(|&c| !is_format(c)).map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let line: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(REASON_MAX).collect();
+    let text = if line.is_empty() { DEFAULT_REASON.to_owned() } else { line };
+    // No NUL is left: it is a control character.
+    std::ffi::CString::new(text).unwrap_or_default()
+}
+
+/// Unicode general category Cf (format), as of Unicode 16.
+fn is_format(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0xAD | 0x600..=0x605
+            | 0x61C
+            | 0x6DD
+            | 0x70F
+            | 0x890..=0x891
+            | 0x8E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
 }
 
 /// Touch ID decides only a match; anything that is not a match or a cancel goes to pinentry (ADR 0006).
@@ -188,8 +232,39 @@ mod tests {
     }
 
     #[test]
-    fn a_reason_with_a_nul_still_reaches_the_sheet() {
-        assert_eq!(c_reason("Unlock\0 dybw").to_bytes(), b"Unlock dybw");
+    fn the_reason_is_one_clean_bounded_line() {
+        let shown = |reason: &str| c_reason(reason).into_string().unwrap_or_default();
+        assert_eq!(shown("Unlock\0 dybw"), "Unlock dybw");
+        assert_eq!(shown("  Unlock dybw\n\r\n profile\tpersonal "), "Unlock dybw profile personal");
+        // Bidi overrides and isolates, zero-width and other format characters are dropped, not replaced.
+        assert_eq!(shown("ssh\u{202E}lmth.exe\u{2066}x\u{2069}\u{200B}\u{FEFF}\u{AD}"), "sshlmth.exex");
+        assert_eq!(shown("a\u{1B}[31mb\u{7F}c"), "a [31mb c");
+        assert_eq!(shown(&"é".repeat(200)), "é".repeat(REASON_MAX));
+        for empty in ["", " \n\t", "\u{202E}\u{200B}", "\0"] {
+            assert_eq!(shown(empty), DEFAULT_REASON, "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn every_format_range_is_known_and_its_neighbours_are_not() {
+        let format = [
+            0xAD, 0x600, 0x605, 0x61C, 0x6DD, 0x70F, 0x890, 0x891, 0x8E2, 0x180E, 0x200B, 0x200F, 0x202A, 0x202E,
+            0x2060, 0x2064, 0x2066, 0x206F, 0xFEFF, 0xFFF9, 0xFFFB, 0x110BD, 0x110CD, 0x13430, 0x1343F, 0x1BCA0,
+            0x1BCA3, 0x1D173, 0x1D17A, 0xE0001, 0xE0020, 0xE007F,
+        ];
+        let printable = [0x41, 0xAC, 0x606, 0x2010, 0x2065, 0xFFFC, 0x1D17B, 0xE0080];
+        for (code, expected) in format.iter().map(|&c| (c, true)).chain(printable.iter().map(|&c| (c, false))) {
+            let c = char::from_u32(code).unwrap_or_default();
+            assert_eq!(is_format(c), expected, "U+{code:04X}");
+        }
+    }
+
+    #[test]
+    fn a_wrapped_secret_never_reaches_debug_output() {
+        let wrapped = Wrapped { ephemeral: [4; 65], secret: Zeroizing::new([0xa7; 32]) };
+        let text = format!("{wrapped:?}");
+        assert!(text.contains("<redacted>") && text.contains("ephemeral"), "{text}");
+        assert!(!text.contains("167") && !text.contains("a7"), "{text}");
     }
 
     /// No test asks for Touch ID or needs an enclave: CI's macOS runner has none.
@@ -203,9 +278,11 @@ mod tests {
     #[test]
     fn creating_a_key_works_or_says_why() {
         // An enclave key held only by its handle is not stored anywhere: nothing to clean up.
+        // Where an enclave answers, creating a key must work: an unsigned build that cannot (-34018, a missing
+        // entitlement) fails here rather than at enrolment.
         let here = available();
         let created = create(Policy::CurrentSet, false);
-        assert!(created.as_ref().map_or_else(|e| !here || matches!(e, Error::Other(_)), |c| here && c.public[0] == 4));
+        assert!(created.as_ref().map_or_else(|e| !here && *e == Error::Unavailable, |c| here && c.public[0] == 4));
     }
 
     #[cfg(not(target_os = "macos"))]

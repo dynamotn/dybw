@@ -9,11 +9,14 @@ const SOURCE: &str = "src/enclave/secure_enclave.swift";
 
 fn main() {
     println!("cargo:rerun-if-changed={SOURCE}");
-    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    for var in ["MACOSX_DEPLOYMENT_TARGET", "DEVELOPER_DIR", "SDKROOT"] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
-    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap_or_default());
+    #[expect(clippy::expect_used, reason = "a build script with no OUT_DIR cannot do anything useful")]
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR for build scripts"));
     let arch = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
         Ok("aarch64") => "arm64",
         _ => "x86_64",

@@ -23,6 +23,17 @@ private let STATUS_OTHER: Int32 = 6
 
 private let INFO = Data("dybw-unlock:biometric-se".utf8)
 private let PUBLIC_LEN = 65
+/// How long a Touch ID sheet may wait for a finger before it is withdrawn.
+private let PROMPT_SECONDS = 60.0
+
+/// Withdraw the sheet after the deadline: `invalidate` makes the pending call fail with `appCancel` (cancelled).
+/// The caller still waits for that answer, so nothing returns while the shim may write into its buffers.
+/// Cancel the returned item once the call is over.
+private func deadline(_ context: LAContext) -> DispatchWorkItem {
+    let timer = DispatchWorkItem { [weak context] in context?.invalidate() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + PROMPT_SECONDS, execute: timer)
+    return timer
+}
 
 /// Map an error to a status. LAError covers the prompt; CryptoTokenKit (the Secure Enclave token) reports a key whose
 /// biometry set changed as corrupted data or a missing object.
@@ -96,8 +107,9 @@ public func seCreate(
     }
     do {
         let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: access)
-        guard copy(key.dataRepresentation, data, dataCap) else { return STATUS_OTHER }
-        dataLen.pointee = key.dataRepresentation.count
+        let handle = key.dataRepresentation
+        guard copy(handle, data, dataCap) else { return STATUS_OTHER }
+        dataLen.pointee = handle.count
         _ = copy(key.publicKey.x963Representation, publicOut, PUBLIC_LEN)
         return STATUS_OK
     } catch {
@@ -134,10 +146,14 @@ public func seDerive(
     _ reason: UnsafePointer<CChar>, _ out: UnsafeMutablePointer<UInt8>, _ detail: UnsafeMutablePointer<Int64>
 ) -> Int32 {
     detail.pointee = 0
+    let text = String(cString: reason)
+    guard !text.isEmpty else { return STATUS_OTHER }  // the sheet must say what it is for
     guard SecureEnclave.isAvailable else { return STATUS_UNAVAILABLE }
     let context = LAContext()
-    context.localizedReason = String(cString: reason)
+    context.localizedReason = text
     context.localizedFallbackTitle = ""
+    let timer = deadline(context)
+    defer { timer.cancel() }
     do {
         let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(
             dataRepresentation: Data(bytes: data, count: dataLen), authenticationContext: context)
@@ -154,6 +170,8 @@ public func seDerive(
 @_cdecl("dybw_la_confirm")
 public func laConfirm(_ reason: UnsafePointer<CChar>, _ detail: UnsafeMutablePointer<Int64>) -> Int32 {
     detail.pointee = 0
+    let text = String(cString: reason)
+    guard !text.isEmpty else { return STATUS_OTHER }  // the sheet must say what it is for
     let context = LAContext()
     context.localizedFallbackTitle = ""
     var canError: NSError?
@@ -162,12 +180,14 @@ public func laConfirm(_ reason: UnsafePointer<CChar>, _ detail: UnsafeMutablePoi
     }
     let done = DispatchSemaphore(value: 0)
     var result = STATUS_OTHER
-    context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: String(cString: reason)) {
+    let timer = deadline(context)
+    defer { timer.cancel() }
+    context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: text) {
         ok, error in
         result = ok ? STATUS_OK : error.map { status($0, detail) } ?? STATUS_OTHER
         done.signal()
     }
-    done.wait()
+    done.wait()  // bounded by the deadline: invalidate answers the callback
     return result
 }
 
