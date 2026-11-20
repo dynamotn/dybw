@@ -83,6 +83,19 @@ pub struct AuditEvent {
     /// The cipher id, for a value request.
     pub item: Option<String>,
     pub verdict: Verdict,
+    /// For an SSH signature (`ssh-sign`): the key and where the connection goes.
+    pub ssh: Option<SignAudit>,
+}
+
+/// What an SSH signature's audit line adds: never the data signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignAudit {
+    /// The key's `SHA256:` fingerprint.
+    pub key: String,
+    /// The fingerprint of the host key the connection was bound to with `session-bind@openssh.com`, if any.
+    pub dest: Option<String>,
+    /// Some hop of the connection was forwarded (`ssh -A`).
+    pub forwarded: bool,
 }
 
 /// Where decisions are recorded.

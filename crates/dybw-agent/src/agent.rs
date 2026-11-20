@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use dybw_native::fsutil::User;
@@ -58,6 +58,7 @@ fn kind(op: &Op) -> &'static str {
         Op::Remove { .. } => "remove",
         Op::Purge { .. } => "purge",
         Op::Policy { .. } => "policy",
+        Op::SshList => "ssh_list",
         Op::StopAgent => "stop_agent",
         _ => "other",
     }
@@ -101,7 +102,9 @@ pub struct Agent {
     spawn: Spawn,
     /// Who is asking: the peer's invoker, an AI class or nobody we can name.
     pub(crate) resolver: Arc<Resolver>,
-    audit: Arc<dyn Audit>,
+    pub(crate) audit: Arc<dyn Audit>,
+    /// The SSH agent served next to this one, for `dybw ssh list` and `dybw doctor`.
+    pub(crate) ssh: OnceLock<Weak<crate::ssh_agent::SshAgent>>,
     /// Test hook: the guard announces on `.0` that it reached the post-suspend lock, and waits for `.1` first.
     #[cfg(test)]
     pub(crate) lock_gate: Option<(Arc<Notify>, Arc<Notify>)>,
@@ -135,6 +138,7 @@ impl Agent {
             spawn,
             resolver,
             audit,
+            ssh: OnceLock::new(),
             #[cfg(test)]
             lock_gate: None,
             workers: Mutex::default(),
@@ -206,6 +210,7 @@ impl Agent {
         };
         let logged = sensitive.clone().filter(|_| !matches!(op, Op::Policy { .. })).or_else(|| match &op {
             Op::List { profile, .. } | Op::Search { profile, .. } => Some((kind(&op), None, profile.clone())),
+            Op::SshList => Some(("ssh-list", None, None)),
             _ => None,
         });
         let write =
@@ -284,6 +289,7 @@ impl Agent {
             kind: what,
             item: None,
             verdict: Verdict::Denied,
+            ssh: None,
         });
         Reply::Error { error: AgentError::Denied }
     }
@@ -302,7 +308,7 @@ impl Agent {
             return;
         }
         let verdict = match reply {
-            Reply::Items { .. } => Verdict::Listed,
+            Reply::Items { .. } | Reply::SshKeys { .. } => Verdict::Listed,
             Reply::Error { error } if !matches!(error, AgentError::Denied | AgentError::Prompt) => Verdict::Failed,
             _ => return,
         };
@@ -315,6 +321,7 @@ impl Agent {
             kind,
             item: None,
             verdict,
+            ssh: None,
         });
     }
 
@@ -391,6 +398,11 @@ impl Agent {
             Op::Policy { profile, action } => {
                 self.on_profile(profile.as_deref(), Cmd::Policy { action, caller: caller(), still: still() }).await
             }
+            // Names and fingerprints only, as `list` (ADR 0012): open to every class, and no unlock.
+            Op::SshList => match self.ssh.get().and_then(Weak::upgrade) {
+                Some(ssh) => ssh.listing().await,
+                None => Reply::Error { error: AgentError::Internal },
+            },
             _ => Reply::Error { error: AgentError::Internal },
         }
     }
@@ -426,6 +438,12 @@ impl Agent {
                 Reply::Error { error: AgentError::Config }
             }
         }
+    }
+
+    /// Unlock profile `name` for an SSH signature asked by `caller` (profiles §8): the worker starts if it must, and
+    /// its question names the client (`why`). Whether it is unlocked now.
+    pub(crate) async fn ssh_unlock(&self, name: &str, caller: Caller, why: String) -> bool {
+        self.on_profile(Some(name), Cmd::SshUnlock { caller, why }).await == Reply::Done
     }
 
     /// Unlock on first need (profiles.md section 4): the same flow as `dybw unlock`, then `cmd`. A failed or cancelled
@@ -781,6 +799,7 @@ mod tests {
             },
             Op::Remove { profile: None, needle: "n".into(), user: None, folder: None, ignorecase: false },
             Op::Purge { profile: None },
+            Op::SshList,
             Op::StopAgent,
             Op::Unknown,
         ];
@@ -803,6 +822,7 @@ mod tests {
                 "generate",
                 "remove",
                 "purge",
+                "ssh_list",
                 "stop_agent",
                 "other"
             ]

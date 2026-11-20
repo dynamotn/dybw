@@ -30,7 +30,9 @@ use crate::policy::{self, Access, AuditEvent, Decision, Store, Verdict};
 use crate::read::{self, Found, Lookup};
 use crate::session::{self, Ctx, Session};
 use crate::ssh::{self, Key, SshError};
+use crate::ssh_agent::SignContext;
 
+mod sign;
 mod write;
 pub use write::Write;
 
@@ -135,6 +137,19 @@ pub enum Cmd {
         flags: u32,
         out: oneshot::Sender<Result<Vec<u8>, SshError>>,
     },
+    /// The user's decision on one SSH signature (profiles §8): `Done` allows it. Asked through the pinentry unless
+    /// this very client process holds an "always" for this key.
+    SshConfirm {
+        caller: Caller,
+        key: Key,
+        ctx: SignContext,
+    },
+    /// Unlock for an SSH signature, the question naming its client (`why`). A client that cancelled such an unlock
+    /// is refused without a question until the profile unlocks.
+    SshUnlock {
+        caller: Caller,
+        why: String,
+    },
     /// Lock and end the thread.
     Exit,
     /// Test only: how many items this worker has opened.
@@ -158,6 +173,8 @@ enum Long {
     Write(Write, Caller, Recheck),
     Policy(PolicyAction, Caller, Recheck),
     Purge(Caller, Recheck),
+    SshConfirm(Caller, Key, SignContext),
+    SshUnlock(Caller, String),
     #[cfg(test)]
     Panic,
 }
@@ -182,6 +199,11 @@ struct State {
     /// Memory only, dropped by a lock. A grant whose process exited can never match again (a new process has
     /// another start time or image); shortcut: it stays until the lock, at most [`MAX_HELD`] of them.
     held: Vec<Caller>,
+    /// SSH "always" answers: a client process (its caller, with pid, start and image) and a key's blob. Memory only,
+    /// dropped by a lock; at most [`MAX_HELD`].
+    ssh_held: Vec<(Caller, Vec<u8>)>,
+    /// SSH clients that cancelled an unlock this profile asked for them: not asked again until it unlocks.
+    ssh_declined: Vec<Caller>,
 }
 
 /// Most per-process grants kept; the oldest goes first.
@@ -335,6 +357,8 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
         Cmd::Write { write, caller, still } => Long::Write(write, caller, still),
         Cmd::Policy { action, caller, still } => Long::Policy(action, caller, still),
         Cmd::Purge { caller, still } => Long::Purge(caller, still),
+        Cmd::SshConfirm { caller, key, ctx } => Long::SshConfirm(caller, key, ctx),
+        Cmd::SshUnlock { caller, why } => Long::SshUnlock(caller, why),
         #[cfg(test)]
         Cmd::Opens => {
             return quick(reply, Reply::Value { value: dybw_proto::Secret::new(read::OPENS.get().to_string()) });
@@ -393,6 +417,7 @@ fn lock(shared: &Shared) {
     }
     st.slot = None;
     st.held.clear();
+    st.ssh_held.clear();
 }
 
 /// Run a long command in a task of its own, and answer from a second one. `reply` is `None` for the periodic
@@ -430,12 +455,14 @@ async fn run_long<H: Host>(shared: Rc<Shared>, host: Rc<H>, ctx: Rc<Ctx>, long: 
             let _op = shared.op.lock().await;
             outcome(session::login(&*host, &ctx).await)
         }
-        Long::Unlock => unlock(&shared, &*host, &ctx).await,
+        Long::Unlock => unlock(&shared, &*host, &ctx, None).await,
         Long::Sync => sync(&shared, &*host, &ctx, wait).await,
         Long::Read(find, read, caller, still) => get(&shared, &*host, &ctx, &caller, &still, find, read).await,
         Long::Write(change, caller, still) => write::write(&shared, &*host, &ctx, &caller, &still, change).await,
         Long::Policy(action, caller, still) => change_policy(&shared, &*host, &ctx, &caller, &still, action).await,
         Long::Purge(caller, still) => purge(&shared, &*host, &ctx, &caller, &still).await,
+        Long::SshConfirm(caller, key, sign) => sign::confirm(&shared, &*host, &ctx, &caller, &key, &sign).await,
+        Long::SshUnlock(caller, why) => sign::unlock(&shared, &*host, &ctx, &caller, &why).await,
         #[cfg(test)]
         Long::Panic => panic!("task panic for a test"),
     }
@@ -483,7 +510,7 @@ pub(crate) fn item_text(found: &Found) -> String {
 
 /// `s` [`tidy`] in double quotes, with its own quotes and backslashes escaped: a name cannot close the quote and
 /// fake what follows it.
-fn quoted(s: &str) -> String {
+pub(crate) fn quoted(s: &str) -> String {
     format!("\"{}\"", tidy(s).replace('\\', "\\\\").replace('"', "\\\""))
 }
 
@@ -572,6 +599,7 @@ fn audit(
         kind,
         item: item.map(str::to_owned),
         verdict,
+        ssh: None,
     });
 }
 
@@ -954,6 +982,7 @@ async fn purge<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, s
         let mut st = shared.state.borrow_mut();
         st.slot = None;
         st.held.clear();
+        st.ssh_held.clear();
     }
     let removed = match std::fs::remove_dir_all(&ctx.paths.cache) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -968,7 +997,8 @@ async fn purge<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, s
     Reply::Done
 }
 
-async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx) -> Reply {
+/// `why`: what asks for the unlock, when not the user ([`session::unlock`]).
+async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, why: Option<&str>) -> Reply {
     // Every read starts here: an unlocked profile must not wait behind a sync or another unlock.
     if shared.state.borrow().slot.is_some() {
         return Reply::Done;
@@ -978,9 +1008,10 @@ async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx) -> Reply {
     if shared.state.borrow().slot.is_some() {
         return Reply::Done;
     }
-    match session::unlock(host, ctx).await {
+    match session::unlock(host, ctx, why).await {
         Ok(session) => {
             let mut st = shared.state.borrow_mut();
+            st.ssh_declined.clear();
             // The idle timeout runs from the answer, not from a request that waited on the user.
             st.last_used = st.seen;
             st.slot = Some(session);

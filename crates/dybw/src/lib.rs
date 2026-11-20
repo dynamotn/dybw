@@ -175,6 +175,11 @@ enum Cmd {
         #[command(subcommand)]
         command: PolicyCmd,
     },
+    /// The SSH agent (`$XDG_RUNTIME_DIR/dybw/ssh-agent.sock`).
+    Ssh {
+        #[command(subcommand)]
+        command: SshCmd,
+    },
     /// Show the audit log: who asked for which item, and what was decided (never a value).
     Audit {
         /// Only requests from AI-class and unknown callers (an unknown one may be an AI agent too).
@@ -200,6 +205,13 @@ enum Cmd {
 enum AgentCmd {
     /// Stop the agent (locks every profile).
     Stop,
+}
+
+#[derive(Subcommand, Debug)]
+enum SshCmd {
+    /// The keys the SSH agent offers: name, fingerprint, type and profile. A locked profile offers none, and is named
+    /// on stderr.
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -505,6 +517,22 @@ fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, er
                 reply if !shown => done(reply),
                 _ => Err(Fail::Unexpected),
             }
+        }
+        Cmd::Ssh { command: SshCmd::List } => {
+            let Reply::SshKeys { keys, profiles, .. } = ask_started(env, Op::SshList)? else {
+                return Err(Fail::Unexpected);
+            };
+            for k in keys {
+                let cells = [k.name, k.fingerprint, k.kind, k.profile];
+                writeln!(out, "{}", cells.iter().map(|c| escape(c)).collect::<Vec<_>>().join("\t"))?;
+            }
+            if profiles.is_empty() {
+                writeln!(err, "dybw: [ssh_agent] lists no profiles: the SSH agent offers no keys")?;
+            }
+            for p in profiles.iter().filter(|p| !p.unlocked) {
+                writeln!(err, "dybw: profile {} is locked: its SSH keys are not offered", escape(&p.name))?;
+            }
+            Ok(0)
         }
         Cmd::Audit { ai, n } => audit(env, ai, n, out),
         Cmd::Doctor => {

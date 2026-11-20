@@ -46,6 +46,18 @@ pub struct Entry {
     /// The peer's executable, for an unknown caller and for a `dybw` that is not the agent's companion.
     #[serde(default)]
     pub peer: Option<String>,
+    /// For an SSH client: the executable of the process that ran it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// For an SSH signature: the key's fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// For an SSH signature on a bound connection: the destination host key's fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest: Option<String>,
+    /// For an SSH signature: whether the request came through agent forwarding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded: Option<bool>,
 }
 
 fn verdict_name(v: Verdict) -> &'static str {
@@ -72,6 +84,11 @@ fn entry_of(event: &AuditEvent) -> Entry {
             ("invoker", Some(path(exe)), script.as_deref().map(path), None, None, at.peer.as_deref().map(path))
         }
     };
+    let parent = match &event.caller {
+        Caller::Invoker { at, .. } => at.parent.as_deref().map(path),
+        _ => None,
+    };
+    let ssh = event.ssh.as_ref();
     Entry {
         time: rfc3339(event.time),
         profile: text(&event.profile),
@@ -85,6 +102,10 @@ fn entry_of(event: &AuditEvent) -> Entry {
         verdict: verdict_name(event.verdict).to_owned(),
         why,
         peer,
+        parent,
+        key: ssh.map(|s| text(&s.key)),
+        dest: ssh.and_then(|s| s.dest.as_deref()).map(text),
+        forwarded: ssh.map(|s| s.forwarded),
     }
 }
 

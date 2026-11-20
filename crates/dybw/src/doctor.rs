@@ -77,6 +77,7 @@ pub fn run(
         Ok(config) => {
             r.ok("config", &config_path(&home).display().to_string())?;
             profile_checks(env, &config, profile, &home, pinentry, &mut r)?;
+            ssh_checks(env, &config, &mut r)?;
         }
     }
     let path = audit_path(&home);
@@ -118,6 +119,54 @@ fn sockets(env: &Env, r: &mut Report<'_>) -> std::io::Result<()> {
         Ok(Some(Reply::Error { error })) => r.problem("agent", &format!("running, but answers with an error: {error}")),
         Ok(Some(_)) => r.problem("agent", "running, but the reply does not fit the request"),
         Err(e) => r.problem("agent", &e.to_string()),
+    }
+}
+
+/// The SSH agent: its socket, and, when `[ssh_agent]` lists profiles, which are unlocked, how many keys are offered,
+/// how many listings were asked for, and whether `SSH_AUTH_SOCK` points at it.
+fn ssh_checks(env: &Env, config: &Config, r: &mut Report<'_>) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let path = socket::socket_dir(&env.var, env.uid).join("ssh-agent.sock");
+    let shown = path.display().to_string();
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            r.ok("ssh agent socket", &format!("{shown}, made when the agent starts"))?;
+        }
+        Ok(m) if m.file_type().is_socket() && m.uid() == env.uid && m.mode() & 0o777 == 0o600 => {
+            let listening = std::os::unix::net::UnixStream::connect(&path).is_ok();
+            let state = if listening { "listening" } else { "not listening (the agent is not running)" };
+            r.ok("ssh agent socket", &format!("{shown}, mode 0600, {state}"))?;
+        }
+        _ => r.problem("ssh agent socket", &format!("{shown} is not a socket of yours with mode 0600"))?,
+    }
+    // Checked when the config was loaded.
+    let names = config.ssh_agent_profiles().unwrap_or_default();
+    if names.is_empty() {
+        return r.ok("ssh agent", "[ssh_agent] lists no profiles: it offers no keys");
+    }
+    match crate::client::call(env, Op::SshList, false) {
+        Ok(None) => r.ok("ssh agent", &format!("profiles {}; the agent is not running", names.join(", ")))?,
+        Ok(Some(Reply::SshKeys { keys, profiles, lists })) => {
+            let state = |unlocked| if unlocked { "unlocked" } else { "locked" };
+            let profiles: Vec<String> =
+                profiles.iter().map(|p| format!("{} ({})", p.name, state(p.unlocked))).collect();
+            let note = format!(
+                "profiles {}; {} keys offered; {lists} key listings since the agent started",
+                profiles.join(", "),
+                keys.len()
+            );
+            r.ok("ssh agent", &note)?;
+        }
+        Ok(Some(Reply::Error { error })) => r.problem("ssh agent", &format!("answers with an error: {error}"))?,
+        Ok(Some(_)) => r.problem("ssh agent", "the reply does not fit the request")?,
+        Err(e) => r.problem("ssh agent", &e.to_string())?,
+    }
+    match (env.var)("SSH_AUTH_SOCK") {
+        Some(sock) if std::path::Path::new(&sock) == path => r.ok("SSH_AUTH_SOCK", &shown),
+        other => {
+            let now = other.map_or_else(|| "unset".to_owned(), |s| s.to_string_lossy().into_owned());
+            r.line("warning", "SSH_AUTH_SOCK", &format!("is {now}; set it to {shown} to use dybw's SSH agent"))
+        }
     }
 }
 

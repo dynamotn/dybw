@@ -103,6 +103,9 @@ pub struct At {
     pub detached: bool,
     /// The peer's executable when it is a `dybw` or `rbw` other than the agent's companion (kept for the audit).
     pub peer: Option<PathBuf>,
+    /// For an SSH client (the peer is the caller itself): the executable of the process that ran it, as the question
+    /// and the audit show it (`git` for `git` → `ssh`).
+    pub parent: Option<PathBuf>,
 }
 
 /// How long a grant for a caller may last.
@@ -332,9 +335,25 @@ impl Resolver {
         Some(self.resolve(self.source.peer_of(end.as_fd()).ok()?).caller)
     }
 
+    /// [`Resolver::resolve_client`] on a blocking thread: an SSH client on `ssh-agent.sock`.
+    pub async fn resolve_client_async(self: Arc<Self>, peer: Peer) -> Resolved {
+        let (me, p) = (self.clone(), peer.clone());
+        let joined = tokio::task::spawn_blocking(move || me.resolve_client(p)).await;
+        joined.unwrap_or(Resolved::unknown(peer, "the resolver failed"))
+    }
+
     /// Resolve the peer on this thread.
     pub fn resolve(&self, peer: Peer) -> Resolved {
-        let (caller, chain) = self.classify(&peer);
+        let (caller, chain) = self.classify(&peer, false);
+        Resolved { caller, peer, chain }
+    }
+
+    /// Resolve an SSH client (profiles §8): the peer itself is the caller, named by its own executable, with the
+    /// process that ran it as its `parent`. The same rules otherwise: an AI harness anywhere above it or a marker in
+    /// its or its parent's environment makes it AI-class; an ancestry that cannot be read, a privilege wrapper or a
+    /// file that cannot be hashed make it unknown.
+    pub fn resolve_client(&self, peer: Peer) -> Resolved {
+        let (caller, chain) = self.classify(&peer, true);
         Resolved { caller, peer, chain }
     }
 
@@ -349,7 +368,8 @@ impl Resolver {
             })
     }
 
-    fn classify(&self, peer: &Peer) -> (Caller, Vec<Seen>) {
+    /// `client`: the peer is the caller (an SSH client), not a `dybw` whose invoker is.
+    fn classify(&self, peer: &Peer, client: bool) -> (Caller, Vec<Seen>) {
         if !self.source.still_same(peer) {
             return (Caller::Unknown { why: "the peer is gone or was replaced".into(), peer: None }, Vec::new());
         }
@@ -376,8 +396,9 @@ impl Resolver {
             .zip(&chain)
             .map(|(&pid, p)| Seen { pid, ppid: p.ppid, start: p.start, image: p.image.clone() })
             .collect();
-        let invoker = invoker_index(&chain);
-        if let Some(ai) = self.ai(&chain, invoker.map(|(_, p)| p)) {
+        let invoker = if client { chain.first().map(|p| (0, p)) } else { invoker_index(&chain) };
+        let marked = if client { chain.get(1) } else { invoker.map(|(_, p)| p) };
+        if let Some(ai) = self.ai(&chain, marked) {
             return (ai, seen);
         }
         let peer_exe = chain.first().map(|p| p.exe.clone());
@@ -390,7 +411,7 @@ impl Resolver {
         if chain.iter().any(|p| p.args == dybw_peer::Args::Unreadable) {
             return (unknown("an ancestor's arguments could not be read"), seen);
         }
-        if !chain.first().is_some_and(is_cli) {
+        if !client && !chain.first().is_some_and(is_cli) {
             return (unknown("the peer is not dybw"), seen);
         }
         let Some((index, process)) = invoker else {
@@ -408,11 +429,12 @@ impl Resolver {
             image: process.image.clone(),
             // The walk stops below pid 1, so an invoker with nothing above it in the chain was reparented to it.
             detached: process.ppid <= 1 || chain.get(index + 1).is_some_and(adopts_orphans),
-            peer: peer_exe.clone().filter(|exe| self.companion.as_ref() != Some(exe)),
+            peer: peer_exe.clone().filter(|exe| !client && self.companion.as_ref() != Some(exe)),
+            parent: chain.get(1).filter(|_| client).map(|p| p.exe.clone()),
         };
         match self.identify(process, at) {
-            // A reparented invoker fails the re-check on its ppid.
-            Ok(caller) => (caller, seen.into_iter().take(index + 1).collect()),
+            // A reparented invoker fails the re-check on its ppid; an SSH client's parent is held to it too.
+            Ok(caller) => (caller, seen.into_iter().take(index + 1 + usize::from(client)).collect()),
             Err(why) => (unknown(&why), seen),
         }
     }

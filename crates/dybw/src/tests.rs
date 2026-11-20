@@ -972,6 +972,7 @@ fn audit_event(
         kind: Some("password"),
         item: Some(s("id-1")),
         verdict,
+        ssh: None,
     }
 }
 
@@ -1499,4 +1500,112 @@ fn generate_and_save_sends_the_charset_and_never_a_password() {
 #[test]
 fn the_uri_field_is_no_column_of_a_text_list() {
     assert_eq!(cell(&item("1", "n", None), Field::Uri), None);
+}
+
+// ssh
+
+fn ssh_keys(unlocked: &[(&str, bool)]) -> Reply {
+    let keys = vec![dybw_proto::SshKey {
+        name: s("git\nhub"),
+        fingerprint: s("SHA256:abc"),
+        kind: s("ssh-ed25519"),
+        profile: s("work"),
+    }];
+    let profiles = unlocked.iter().map(|(n, u)| dybw_proto::SshProfile { name: s(n), unlocked: *u }).collect();
+    Reply::SshKeys { keys, profiles, lists: 3 }
+}
+
+#[test]
+fn ssh_list_prints_the_keys_and_names_the_locked_profiles() {
+    let ((code, out, err), op) = one(&["ssh", "list"], ssh_keys(&[("work", true), ("home", false)]));
+    assert_eq!(op, Op::SshList);
+    assert_eq!((code, out.as_str()), (0, "git\\x0ahub\tSHA256:abc\tssh-ed25519\twork\n"));
+    assert_eq!(err, "dybw: profile home is locked: its SSH keys are not offered\n");
+    let ((code, _, err), _) = one(&["ssh", "list"], ssh_keys(&[]));
+    assert!(code == 0 && err.contains("[ssh_agent] lists no profiles"), "{err}");
+    let ((code, _, err), _) = one(&["ssh", "list"], Reply::Done);
+    assert_eq!((code, err.contains("does not fit")), (1, true));
+}
+
+fn write_ssh_config(base: &Path) {
+    let file = base.join(".config/dybw/config.toml");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, format!("{CONFIG}[ssh_agent]\nprofiles = [\"work\"]\n")).unwrap();
+}
+
+/// `env_in` with `SSH_AUTH_SOCK` set to `sock`.
+fn env_with_sock(base: &Path, sock: Option<PathBuf>) -> Env {
+    let mut env = env_in(base, None, None);
+    let home = base.to_owned();
+    env.var = Box::new(move |name| match name {
+        "XDG_RUNTIME_DIR" | "HOME" => Some(home.clone().into()),
+        "SSH_AUTH_SOCK" => sock.clone().map(Into::into),
+        _ => None,
+    });
+    env
+}
+
+#[test]
+fn doctor_reports_the_ssh_agent_when_profiles_are_configured() {
+    let version = env!("CARGO_PKG_VERSION");
+    let status = Act::Reply(Reply::Status { agent_version: s(version), profiles: vec![] });
+    let cases = [
+        (
+            Act::Reply(ssh_keys(&[("work", true)])),
+            true,
+            "[ok] ssh agent: profiles work (unlocked); 1 keys offered; 3 key listings",
+        ),
+        (Act::Reply(Reply::Error { error: AgentError::Internal }), false, "[problem] ssh agent: answers with an error"),
+        (Act::Reply(Reply::Done), false, "[problem] ssh agent: the reply does not fit"),
+        (Act::Close, false, "[problem] ssh agent: the agent closed the connection"),
+    ];
+    for (act, healthy, want) in cases {
+        let f = fake(vec![
+            Act::Reply(match &status {
+                Act::Reply(r) => r.clone(),
+                _ => unreachable!(),
+            }),
+            act,
+        ]);
+        write_ssh_config(f.base.path());
+        let sock = f.base.path().join("dybw/ssh-agent.sock");
+        let (code, out) = doctor_with(&env_with_sock(f.base.path(), Some(sock)), None, true);
+        assert_eq!((code == 0, out.contains(want)), (healthy, true), "{want}: {out}");
+        assert!(out.contains("[ok] SSH_AUTH_SOCK: "), "{out}");
+        assert_eq!(f.ops()[1], Op::SshList);
+    }
+    // No agent: said so, and the variable is pointed at the socket.
+    let base = base();
+    write_ssh_config(base.path());
+    let (code, out) = doctor_with(&env_with_sock(base.path(), None), None, true);
+    assert_eq!(code, 0, "{out}");
+    for want in [
+        "[ok] ssh agent socket: ",
+        "ssh-agent.sock, made when the agent starts",
+        "[ok] ssh agent: profiles work; the agent is not running",
+        "[warning] SSH_AUTH_SOCK: is unset; set it to ",
+    ] {
+        assert!(out.contains(want), "{want:?} in {out}");
+    }
+    let (_, out) = doctor_with(&env_with_sock(base.path(), Some("/tmp/other".into())), None, true);
+    assert!(out.contains("[warning] SSH_AUTH_SOCK: is /tmp/other; set it to "), "{out}");
+}
+
+#[test]
+fn doctor_checks_the_ssh_socket_itself() {
+    let base = base();
+    write_config(base.path());
+    let env = env_in(base.path(), None, None);
+    let sock = base.path().join("dybw/ssh-agent.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    std::fs::set_permissions(&sock, PermissionsExt::from_mode(0o600)).unwrap();
+    let (code, out) = doctor_with(&env, None, true);
+    assert!(code == 0 && out.contains("ssh-agent.sock, mode 0600, listening"), "{out}");
+    assert!(out.contains("[ok] ssh agent: [ssh_agent] lists no profiles"), "{out}");
+    drop(listener);
+    let (_, out) = doctor_with(&env, None, true);
+    assert!(out.contains("mode 0600, not listening (the agent is not running)"), "{out}");
+    std::fs::set_permissions(&sock, PermissionsExt::from_mode(0o644)).unwrap();
+    let (code, out) = doctor_with(&env, None, true);
+    assert!(code == 1 && out.contains("[problem] ssh agent socket: ") && out.contains("mode 0600"), "{out}");
 }

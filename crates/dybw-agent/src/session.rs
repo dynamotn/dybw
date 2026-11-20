@@ -369,12 +369,14 @@ fn refused(e: ProfileError) -> Refused {
 }
 
 /// Unlock with the master password from the pinentry: online (login, `/sync`, then the core's checks), and from the
-/// offline copy only when the server cannot be reached. A refusal by the server is not "offline".
-pub async fn unlock<H: Host>(host: &H, ctx: &Ctx) -> Result<Session, AgentError> {
+/// offline copy only when the server cannot be reached. A refusal by the server is not "offline". `why`: what asks
+/// for the unlock, when it is not the user's own command (an SSH signature names its client).
+pub async fn unlock<H: Host>(host: &H, ctx: &Ctx, why: Option<&str>) -> Result<Session, AgentError> {
     api_auth(ctx)?;
     let (origin, urls) = urls_of(ctx)?;
     let key = stored_key(ctx, &origin)?;
-    let description = format!("Unlock dybw profile {} ({})", ctx.profile.name, one_line(&ctx.profile.email));
+    let why = why.map(|w| format!(": {w}")).unwrap_or_default();
+    let description = format!("Unlock dybw profile {} ({}){why}", ctx.profile.name, one_line(&ctx.profile.email));
     let mut wrong = None;
     for _ in 0..ATTEMPTS {
         let password = ask(host, "Master password:", &description, wrong).await?;

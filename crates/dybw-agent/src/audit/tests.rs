@@ -19,6 +19,7 @@ fn event(caller: Caller, verdict: Verdict) -> AuditEvent {
         kind: Some("field"),
         item: Some("5f0c-id".into()),
         verdict,
+        ssh: None,
     }
 }
 
@@ -83,8 +84,13 @@ fn a_decision_is_one_json_line_without_a_value_or_a_name() {
             verdict: "remembered".into(),
             why: None,
             peer: None,
+            parent: None,
+            key: None,
+            dest: None,
+            forwarded: None,
         }
     );
+    assert!(!text.contains("\"key\"") && !text.contains("\"forwarded\""), "no SSH fields on other lines: {text}");
     assert_eq!((log.entries[1].class.as_str(), log.entries[1].harness.as_deref()), ("ai", Some("claude")));
     assert_eq!((log.entries[2].class.as_str(), log.entries[2].exe.as_deref()), ("unknown", None));
     // An unknown caller's line says why, and which program was on the socket.
@@ -96,6 +102,25 @@ fn a_decision_is_one_json_line_without_a_value_or_a_name() {
     audit.record(event(Caller::Invoker { exe, script, hash, relative, at: elsewhere }, Verdict::Granted));
     let log = read(&path, me()).unwrap();
     assert_eq!(log.entries.last().unwrap().peer.as_deref(), Some("/opt/other/dybw"));
+    // An SSH signature's line names the key, the destination, whether it was forwarded, and the client's parent.
+    let ssh = At { parent: Some("/usr/bin/git".into()), ..At::default() };
+    let Caller::Invoker { exe, hash, relative, .. } = tool() else { unreachable!() };
+    let mut sign = event(Caller::Invoker { exe, script: None, hash, relative, at: ssh }, Verdict::Confirmed);
+    sign.op = "ssh-sign";
+    sign.kind = Some("login");
+    let dest = Some("SHA256:host".to_owned());
+    sign.ssh = Some(crate::policy::SignAudit { key: "SHA256:key".into(), dest, forwarded: true });
+    audit.record(sign);
+    let log = read(&path, me()).unwrap();
+    let e = log.entries.last().unwrap();
+    assert_eq!(
+        (e.op.as_str(), e.kind.as_deref(), e.parent.as_deref()),
+        ("ssh-sign", Some("login"), Some("/usr/bin/git"))
+    );
+    assert_eq!(
+        (e.key.as_deref(), e.dest.as_deref(), e.forwarded),
+        (Some("SHA256:key"), Some("SHA256:host"), Some(true))
+    );
     // A line written before these fields existed still reads.
     let old = r#"{"time":"t","profile":"p","class":"ai","exe":null,"script":null,"harness":"h","op":"get","kind":null,"item":null,"verdict":"denied"}"#;
     assert!(serde_json::from_str::<Entry>(old).unwrap().why.is_none());

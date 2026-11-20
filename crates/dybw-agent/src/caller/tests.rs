@@ -15,7 +15,7 @@ const DYBW: &str = "/usr/local/bin/dybw";
 
 /// Where the invoker `pid` (start time `pid`, as [`Tree::add`] makes it) was found.
 fn at(pid: u32, detached: bool) -> At {
-    At { pid, start: u64::from(pid), image: Vec::new(), detached, peer: None }
+    At { pid, start: u64::from(pid), image: Vec::new(), detached, peer: None, parent: None }
 }
 
 fn os(s: &str) -> OsString {
@@ -865,4 +865,67 @@ fn an_ancestor_whose_arguments_cannot_be_read_makes_the_caller_unknown_but_withh
     // An AI match still wins.
     t.fake.add(10, Process { exe: "/opt/claude".into(), ..with(dybw_peer::Args::Unreadable) });
     assert!(matches!(t.caller(), Caller::Ai { .. }));
+}
+
+/// An SSH client (pid 100, the peer itself) under `ppid`.
+fn ssh(t: &Tree, ppid: u32, env: &[&str]) -> PathBuf {
+    let ssh = t.file("ssh", "ssh binary");
+    t.add(PEER, &ssh, ppid, Some(&["ssh", "host"]), Some(env));
+    ssh
+}
+
+fn client(t: &Tree) -> Resolved {
+    let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+    t.resolver().resolve_client(t.fake.peer_of(a.as_fd()).unwrap())
+}
+
+#[test]
+fn an_ssh_client_is_the_peer_itself_with_the_process_that_ran_it() {
+    let t = Tree::new();
+    let git = t.file("git", "git binary");
+    let ssh = ssh(&t, 50, &[]);
+    t.add(50, &git, 10, Some(&["git", "push"]), Some(&[]));
+    t.add(10, Path::new("/usr/bin/login"), 1, Some(&["login"]), Some(&[]));
+    let resolved = client(&t);
+    let at = At { parent: Some(git.clone()), ..at(PEER, false) };
+    assert_eq!(
+        resolved.caller,
+        Caller::Invoker { exe: ssh, script: None, hash: sha("ssh binary"), relative: false, at }
+    );
+    // As a `dybw` peer it would be no one: it is not dybw.
+    assert_eq!(unknown(&t.caller()), "the peer is not dybw");
+    // Held to the client and the process that ran it.
+    assert!(t.resolver().recheck(&resolved));
+    t.add(50, &git, 1, Some(&["git", "push"]), Some(&[]));
+    assert!(!t.resolver().recheck(&resolved), "its parent was reparented");
+}
+
+#[test]
+fn an_ssh_client_of_an_ai_agent_is_ai_and_one_that_cannot_be_named_is_unknown() {
+    let t = Tree::new();
+    ssh(&t, 50, &[]);
+    t.add(50, Path::new("/usr/bin/git"), 10, Some(&["git"]), Some(&["CLAUDECODE"]));
+    t.add(10, Path::new("/usr/bin/login"), 1, Some(&["login"]), Some(&[]));
+    assert_eq!(client(&t).caller, Caller::Ai { harness: "claude".into(), via: Via::Marker }, "its parent's marker");
+    let t = Tree::new();
+    ssh(&t, 50, &[]);
+    t.add(50, Path::new("/usr/bin/sudo"), 1, Some(&["sudo"]), Some(&[]));
+    assert_eq!(unknown(&client(&t).caller), "run through a privilege wrapper");
+    let t = Tree::new();
+    ssh(&t, 50, &[]);
+    assert_eq!(unknown(&client(&t).caller), "the ancestry could not be read to the top");
+}
+
+#[tokio::test]
+async fn an_ssh_client_left_by_its_parent_is_detached() {
+    let t = Tree::new();
+    let ssh = ssh(&t, 1, &[]);
+    let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+    let peer = t.fake.peer_of(a.as_fd()).unwrap();
+    let resolved = Arc::new(t.resolver()).resolve_client_async(peer).await;
+    let at = at(PEER, true);
+    assert_eq!(
+        resolved.caller,
+        Caller::Invoker { exe: ssh, script: None, hash: sha("ssh binary"), relative: false, at }
+    );
 }

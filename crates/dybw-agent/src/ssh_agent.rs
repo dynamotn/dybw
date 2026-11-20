@@ -10,19 +10,23 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use dybw_native::prompter::one_line;
+use dybw_proto::{Reply, SshKey, SshProfile};
 use signature::Verifier;
 use ssh_key::encoding::Decode;
-use ssh_key::{Algorithm, PublicKey, Signature};
+use ssh_key::{Algorithm, HashAlg, PublicKey, Signature};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
 use crate::agent::Agent;
-use crate::caller::Resolved;
+use crate::caller::{At, Caller, Resolved};
+use crate::policy::{AuditEvent, SignAudit, Verdict, shown};
 use crate::ssh::{Key, RSA_SHA2_256, RSA_SHA2_512};
 use crate::worker::Cmd;
 
@@ -102,7 +106,7 @@ pub trait Authorize: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Decision> + Send + 'a>>;
 }
 
-/// Refuses every signature: nothing is signed unconfirmed until confirmation is in place.
+/// Refuses every signature.
 pub struct RefuseAll;
 
 impl Authorize for RefuseAll {
@@ -112,8 +116,69 @@ impl Authorize for RefuseAll {
         _: &'a Key,
         _: &'a SignContext,
     ) -> Pin<Box<dyn Future<Output = Decision> + Send + 'a>> {
-        tracing::warn!("SSH signatures cannot be confirmed yet: refused");
+        tracing::warn!("SSH signatures are refused");
         Box::pin(std::future::ready(Decision::Refuse))
+    }
+}
+
+/// The agent's decision (profiles §8, ADR 0012): the key's profile worker asks the user through its trusted
+/// pinentry, unless this client process holds an "always" for this key, and audits the answer. AI-class and
+/// unknown clients are asked every time. A profile that locked meanwhile refuses.
+pub struct Confirm(pub Arc<Agent>);
+
+impl Authorize for Confirm {
+    fn authorize_sign<'a>(
+        &'a self,
+        who: &'a Resolved,
+        key: &'a Key,
+        ctx: &'a SignContext,
+    ) -> Pin<Box<dyn Future<Output = Decision> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(worker) = self.0.running(&ctx.profile) else { return Decision::Refuse };
+            let cmd = Cmd::SshConfirm { caller: who.caller.clone(), key: key.clone(), ctx: ctx.clone() };
+            if worker.call(cmd, self.0.clock.mono()).await == Reply::Done { Decision::Allow } else { Decision::Refuse }
+        })
+    }
+}
+
+/// The SSH client a question or a log line names, with its class: the program and the one that ran it, an AI
+/// agent's client, or one that cannot be named.
+pub(crate) fn client(caller: &Caller) -> String {
+    let path = |p: &std::path::Path| shown(&p.to_string_lossy(), 120);
+    match caller {
+        Caller::Invoker { exe, at: At { parent, detached, .. }, .. } => {
+            let parent = parent.as_deref().map(|p| format!(" (run by {})", path(p))).unwrap_or_default();
+            let detached = if *detached { format!(", {}", crate::policy::DETACHED) } else { String::new() };
+            format!("the SSH client {}{parent}{detached}", path(exe))
+        }
+        Caller::Ai { harness, .. } => format!("an SSH client of the AI agent {}", one_line(harness)),
+        Caller::Unknown { why, peer } => {
+            let exe = peer.as_deref().map(|p| format!(" {}", path(p))).unwrap_or_default();
+            format!("an SSH client{exe} that cannot be identified ({}), possibly an AI agent", one_line(why))
+        }
+    }
+}
+
+/// The `SHA256:` fingerprint of the host key a connection is bound to.
+pub(crate) fn host_key(bound: &Binding) -> String {
+    bound.host_key.fingerprint(HashAlg::Sha256).to_string()
+}
+
+/// The audit line of one decision on a signature: never the data signed.
+pub(crate) fn sign_event(caller: &Caller, key: &Key, ctx: &SignContext, verdict: Verdict) -> AuditEvent {
+    AuditEvent {
+        time: std::time::SystemTime::now(),
+        profile: ctx.profile.clone(),
+        caller: caller.clone(),
+        op: "ssh-sign",
+        kind: Some(if matches!(ctx.data, Data::Login { .. }) { "login" } else { "data" }),
+        item: Some(key.id.clone()),
+        verdict,
+        ssh: Some(SignAudit {
+            key: key.fingerprint.clone(),
+            dest: ctx.bound.as_ref().map(host_key),
+            forwarded: ctx.bound.as_ref().is_some_and(|b| b.forwarded),
+        }),
     }
 }
 
@@ -129,6 +194,10 @@ pub struct SshAgent {
     pub(crate) idle_timeout: Duration,
     /// One permit per connection served, [`MAX_CONNECTIONS`] in all.
     pub(crate) slots: Arc<tokio::sync::Semaphore>,
+    /// Key listings answered since the agent started (`dybw doctor`): listings are not audited one by one.
+    lists: AtomicU64,
+    /// One unlock question for a signature at a time.
+    unlocking: tokio::sync::Mutex<()>,
 }
 
 impl SshAgent {
@@ -140,28 +209,82 @@ impl SshAgent {
             removed: Mutex::default(),
             idle_timeout: IDLE_TIMEOUT,
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            lists: AtomicU64::new(0),
+            unlocking: tokio::sync::Mutex::new(()),
         }
     }
 
-    /// The keys offered now, each once, with its profile: those of the unlocked profiles, less the removed ones.
-    /// Read afresh for every message and never kept by a connection, so a key whose profile has locked is gone
-    /// from the next answer.
-    async fn keys(&self) -> Vec<(String, Key)> {
+    /// Each profile of `[ssh_agent] profiles` in order, with its keys, or `None` while it is locked.
+    async fn by_profile(&self) -> Vec<(String, Option<Vec<Key>>)> {
         self.agent.guard().await;
-        let mut keys: Vec<(String, Key)> = Vec::new();
+        let mut out = Vec::new();
         for name in &self.profiles {
-            let Some(worker) = self.agent.running(name) else { continue };
-            let (out, listed) = oneshot::channel();
-            worker.call(Cmd::SshKeys(out), self.agent.clock.mono()).await;
-            for key in listed.await.unwrap_or_default() {
+            let keys = match self.agent.running(name) {
+                Some(worker) => {
+                    let (tx, listed) = oneshot::channel();
+                    worker.call(Cmd::SshKeys(tx), self.agent.clock.mono()).await;
+                    listed.await.ok()
+                }
+                None => None,
+            };
+            out.push((name.clone(), keys));
+        }
+        out
+    }
+
+    /// The keys offered of `by_profile`, each once, with its profile: those of the unlocked profiles, less the removed
+    /// ones.
+    fn offered(&self, by_profile: &[(String, Option<Vec<Key>>)]) -> Vec<(String, Key)> {
+        let mut keys: Vec<(String, Key)> = Vec::new();
+        for (name, listed) in by_profile {
+            for key in listed.iter().flatten() {
                 if !keys.iter().any(|(_, k)| k.blob == key.blob) {
-                    keys.push((name.clone(), key));
+                    keys.push((name.clone(), key.clone()));
                 }
             }
         }
         let removed = self.removed.lock().unwrap_or_else(PoisonError::into_inner);
         keys.retain(|(_, k)| !removed.contains(&k.blob));
         keys
+    }
+
+    /// The keys offered now ([`SshAgent::offered`]). Read afresh for every message and never kept by a connection,
+    /// so a key whose profile has locked is gone from the next answer.
+    async fn keys(&self) -> Vec<(String, Key)> {
+        self.offered(&self.by_profile().await)
+    }
+
+    /// The offered key `blob`, with its profile.
+    async fn find(&self, blob: &[u8]) -> Option<(String, Key)> {
+        self.keys().await.into_iter().find(|(_, k)| k.blob == blob)
+    }
+
+    /// `dybw ssh list` and `dybw doctor`: the keys offered now, which profiles are unlocked, and how many listings
+    /// SSH clients asked for. Names and fingerprints only.
+    pub(crate) async fn listing(&self) -> Reply {
+        let by_profile = self.by_profile().await;
+        let kind = |blob: &[u8]| String::from_utf8_lossy(Reader(blob).string().unwrap_or_default()).into_owned();
+        let keys = self.offered(&by_profile).into_iter();
+        let keys =
+            keys.map(|(profile, k)| SshKey { kind: kind(&k.blob), name: k.name, fingerprint: k.fingerprint, profile });
+        let profiles = by_profile.into_iter().map(|(name, keys)| SshProfile { name, unlocked: keys.is_some() });
+        Reply::SshKeys { keys: keys.collect(), profiles: profiles.collect(), lists: self.lists.load(Ordering::Relaxed) }
+    }
+
+    /// The key `blob` once the locked profiles are unlocked one by one, in config order, until one holds it: while a
+    /// profile is locked nothing of its keys is known (ADR 0025 keeps no index). One unlock question at a time; an
+    /// unlocked profile asks nothing, and one whose unlock this client cancelled asks it nothing more until it
+    /// unlocks.
+    async fn unlock_for(&self, who: &Resolved, blob: &[u8]) -> Option<(String, Key)> {
+        let _one = self.unlocking.lock().await;
+        let why = format!("an SSH signature asked by {}", client(&who.caller));
+        for name in &self.profiles {
+            if let Some(found) = self.find(blob).await {
+                return Some(found);
+            }
+            self.agent.ssh_unlock(name, who.caller.clone(), why.clone()).await;
+        }
+        self.find(blob).await
     }
 
     /// Take `blob`, or every key offered now (`None`), out of the view; false when `blob` is not offered.
@@ -177,45 +300,54 @@ impl SshAgent {
         }
     }
 
+    /// A signature with `blob` over `data`: found among the offered keys (or once a locked profile is unlocked for
+    /// it), checked, decided by [`Authorize`], and made by the key's worker. A refusal without asking, and anything
+    /// that stops the signature after a yes, is audited here; the decision itself by [`Authorize`].
     async fn sign(&self, who: &Resolved, conn: &Conn, blob: &[u8], data: &[u8], flags: u32) -> Option<Vec<u8>> {
-        let Some((profile, key)) = self.keys().await.into_iter().find(|(_, k)| k.blob == blob) else {
+        let found = match self.find(blob).await {
+            Some(found) => Some(found),
+            None => self.unlock_for(who, blob).await,
+        };
+        let Some((profile, key)) = found else {
             tracing::info!("refused to sign with a key that is not offered");
             return None;
+        };
+        let ctx = conn.context(profile, data, blob);
+        let refuse = |verdict: Verdict, why: &str| {
+            tracing::warn!(profile = %ctx.profile, "refused an SSH signature: {why}");
+            self.agent.audit.record(sign_event(&who.caller, &key, &ctx, verdict));
+            None
         };
         // As OpenSSH's process_sign_request: a connection whose session-bind failed, and that has no bind, signs
         // nothing.
         if conn.bind_refused && conn.binds.is_empty() {
-            tracing::warn!("refused to sign on a connection whose session-bind failed");
-            return None;
+            return refuse(Verdict::Denied, "the connection's session-bind failed");
         }
         // Certain to fail in `ssh::sign`: refused before anyone is asked.
         if Reader(blob).string() == Some(b"ssh-rsa") && flags & (RSA_SHA2_256 | RSA_SHA2_512) == 0 {
-            tracing::info!("refused an RSA signature with SHA-1 (no rsa-sha2 flag)");
-            return None;
+            return refuse(Verdict::Denied, "RSA with SHA-1 (no rsa-sha2 flag)");
         }
-        let ctx = conn.context(profile, data, blob);
         if self.authorize.authorize_sign(who, &key, &ctx).await != Decision::Allow {
             return None;
         }
         if !self.agent.resolver.recheck(who) {
-            tracing::warn!("the SSH client changed while it was being served: refused");
-            return None;
+            return refuse(Verdict::Denied, "the SSH client changed while it was being served");
         }
         // `ssh-add -d` may have taken the key out of the view while the user was being asked.
         if self.removed.lock().unwrap_or_else(PoisonError::into_inner).contains(blob) {
-            return None;
+            return refuse(Verdict::Denied, "the key was removed while the user was asked");
         }
-        let worker = self.agent.running(&ctx.profile)?;
+        let Some(worker) = self.agent.running(&ctx.profile) else {
+            return refuse(Verdict::Failed, "the profile locked");
+        };
         let (out, signed) = oneshot::channel();
-        let cmd = Cmd::SshSign { id: key.id, blob: blob.to_vec(), data: data.to_vec(), flags, out };
+        let cmd = Cmd::SshSign { id: key.id.clone(), blob: blob.to_vec(), data: data.to_vec(), flags, out };
         worker.call(cmd, self.agent.clock.mono()).await;
         // Nothing comes back when the profile locked meanwhile.
-        match signed.await.ok()? {
-            Ok(signature) => Some(signature),
-            Err(e) => {
-                tracing::warn!(%e, "refused an SSH signature");
-                None
-            }
+        match signed.await {
+            Ok(Ok(signature)) => Some(signature),
+            Ok(Err(e)) => refuse(Verdict::Failed, &e.to_string()),
+            Err(_) => refuse(Verdict::Failed, "the profile locked"),
         }
     }
 
@@ -225,6 +357,7 @@ impl SshAgent {
         let status = |ok: bool| vec![if ok { SUCCESS } else { FAILURE }];
         Some(match msg.u8()? {
             REQUEST_IDENTITIES => {
+                self.lists.fetch_add(1, Ordering::Relaxed);
                 let keys = self.keys().await;
                 let mut out = vec![IDENTITIES_ANSWER];
                 out.extend_from_slice(&u32::try_from(keys.len()).unwrap_or(u32::MAX).to_be_bytes());
@@ -261,7 +394,7 @@ pub async fn handle(ssh: Arc<SshAgent>, mut stream: UnixStream) {
         tracing::warn!("too many SSH agent connections: closed a new one");
         return;
     };
-    let Some(who) = crate::server::identify(&ssh.agent, &stream).await else { return };
+    let Some(who) = crate::server::identify(&ssh.agent, &stream, true).await else { return };
     let limit = ssh.agent.read_timeout;
     let mut conn = Conn::default();
     while let Some(message) = read_message(&mut stream, ssh.idle_timeout, limit).await {

@@ -241,6 +241,7 @@ fn the_audit_that_records_nothing_records_nothing() {
         kind: None,
         item: None,
         verdict: Verdict::Denied,
+        ssh: None,
     });
 }
 

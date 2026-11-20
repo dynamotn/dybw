@@ -116,14 +116,15 @@ async fn accept_loop(accept: &mut Accept<'_>, on: &On<'_>, handlers: &mut JoinSe
 }
 
 /// The caller on a new connection, worked out while the peer is still what it was at connect. A peer that cannot
-/// be identified, or is another user, is refused: `None`.
-pub(crate) async fn identify(agent: &Agent, stream: &UnixStream) -> Option<Resolved> {
+/// be identified, or is another user, is refused: `None`. `client`: the peer is an SSH client, itself the caller.
+pub(crate) async fn identify(agent: &Agent, stream: &UnixStream, client: bool) -> Option<Resolved> {
     let peer = dybw_peer::peer_of_stream(stream).ok().filter(|p| p.uid == agent.uid);
     let Some(peer) = peer else {
         tracing::warn!("refused a connection from another user or an unidentifiable peer");
         return None;
     };
-    Some(agent.resolver.clone().resolve_async(peer).await)
+    let resolver = agent.resolver.clone();
+    Some(if client { resolver.resolve_client_async(peer).await } else { resolver.resolve_async(peer).await })
 }
 
 /// One connection. A peer of another uid, a slow or oversize or malformed or wrong-version request is dropped
@@ -132,7 +133,7 @@ pub(crate) async fn identify(agent: &Agent, stream: &UnixStream) -> Option<Resol
 pub async fn handle(agent: Arc<Agent>, mut stream: UnixStream) -> bool {
     // The peer is captured before anything is read, while its pid still names it; the policy re-checks it before a
     // reply.
-    let Some(who) = identify(&agent, &stream).await else { return false };
+    let Some(who) = identify(&agent, &stream, false).await else { return false };
     let Some(request) = read_request(&mut stream, agent.read_timeout).await else { return false };
     let stop = request.op == Op::StopAgent;
     let reply = agent.dispatch_for(request.op, &who).await;

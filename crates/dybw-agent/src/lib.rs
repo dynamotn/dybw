@@ -98,8 +98,9 @@ fn run_on(passwd: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     let resolver = Arc::new(caller::Resolver::new(Arc::new(dybw_peer::Os), harnesses).with_companion(companion));
     let audit = Arc::new(audit::FileAudit::new(&paths::audit_path(&home), user.uid));
     let agent = Arc::new(agent::Agent::new(config, home, user, real_spawn(trust), resolver, audit));
-    // Nothing signs until confirmation is in place.
-    let ssh = Arc::new(ssh_agent::SshAgent::new(agent.clone(), ssh_profiles, Arc::new(ssh_agent::RefuseAll)));
+    let confirm = Arc::new(ssh_agent::Confirm(agent.clone()));
+    let ssh = Arc::new(ssh_agent::SshAgent::new(agent.clone(), ssh_profiles, confirm));
+    let _ = agent.ssh.set(Arc::downgrade(&ssh));
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let served = runtime.block_on(server::serve(agent, listener, Some((ssh_listener, ssh)), stop_signal()));
     drop(lock);
