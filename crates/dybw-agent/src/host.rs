@@ -79,7 +79,8 @@ impl Host for RealHost {
     }
 
     fn machine(&self) -> Option<String> {
-        dybw_peer::machine_id().map_err(|e| tracing::warn!("machine fingerprint: {e}")).ok()
+        // Why it cannot be read is `dybw doctor`'s to say.
+        dybw_peer::machine_id().ok()
     }
 }
 

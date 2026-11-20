@@ -440,10 +440,8 @@ pub(crate) async fn unlock_with_key(
 ) -> Result<Session, AgentError> {
     let vault = profile::unlock_vault_with_key_cached(sync, &ctx.storage(), user, &AwsLcRsa, &Organizations::All)
         .await
-        .map_err(|e| match refused(e) {
-            Refused::WrongPassword => AgentError::Denied,
-            Refused::Failed(e) => e,
-        })?;
+        // `WrongPassword` cannot come here: the protector's unwrap checked the same private key.
+        .map_err(|e| if let Refused::Failed(e) = refused(e) { e } else { AgentError::Denied })?;
     if fresh {
         save_cache(ctx, &vault.sync).await;
     }

@@ -852,6 +852,9 @@ mod tests {
             Op::Remove { profile: None, needle: "n".into(), user: None, folder: None, ignorecase: false },
             Op::Purge { profile: None },
             Op::SshList,
+            Op::UnlockAdd { profile: None, protector: "pin".into() },
+            Op::UnlockRemove { profile: None, protector: "pin".into() },
+            Op::UnlockList { profile: None },
             Op::StopAgent,
             Op::Unknown,
         ];
@@ -875,6 +878,9 @@ mod tests {
                 "remove",
                 "purge",
                 "ssh_list",
+                "unlock-add",
+                "unlock-remove",
+                "unlock-list",
                 "stop_agent",
                 "other"
             ]

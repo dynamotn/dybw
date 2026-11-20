@@ -276,6 +276,49 @@ async fn an_unknown_or_absent_protector_is_named() {
 }
 
 #[tokio::test]
+async fn enrolment_stops_at_a_cancelled_unlock_a_changed_caller_or_an_empty_fingerprint() {
+    let (_dir, rig) = world();
+    assert_eq!(rig.agent.dispatch(add()).await, err(AgentError::Denied), "the master password was cancelled");
+    assert_eq!(asked(&rig), ["Master password:"]);
+    answer(&rig, &[PASSWORD]);
+    assert_eq!(rig.agent.dispatch(unlock_op()).await, Reply::Done);
+    let w = rig.agent.running("org").unwrap();
+    let gone = crate::worker::Recheck::new(|| false);
+    let cmd = crate::worker::Cmd::UnlockAdd {
+        protector: "pin".into(),
+        caller: crate::agent::testing::invoker(),
+        still: gone,
+    };
+    answer(&rig, &[PASSWORD, PIN, PIN]);
+    assert_eq!(w.call(cmd, Instant::now()).await, err(AgentError::Denied), "the caller changed while asked");
+    rig.host.world().machine = Some(String::new());
+    answer(&rig, &[PASSWORD, PIN, PIN]);
+    assert_eq!(rig.agent.dispatch(add()).await, err(AgentError::Internal), "the core refuses an empty binding");
+    assert!(protectors(&rig).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_server_that_refuses_the_api_key_asks_no_pin() {
+    let (_dir, rig) = enrolled().await;
+    rig.host.world().token_status = 400;
+    answer(&rig, &[PASSWORD]);
+    assert_eq!(rig.agent.dispatch(unlock_op()).await, err(AgentError::Server));
+    assert_eq!(asked(&rig), ["Master password:"]);
+    assert_eq!(protectors(&rig).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_security_downgrade_after_the_pin_drops_it_and_refuses_the_unlock() {
+    let (dir, rig) = enrolled().await;
+    let state = dir.path().join(".local/state/dybw/profiles/org/core/security-version");
+    assert!(state.parent().unwrap().is_dir(), "{state:?}");
+    std::fs::write(&state, "9").unwrap();
+    answer(&rig, &[PIN, PASSWORD]);
+    assert_eq!(rig.agent.dispatch(unlock_op()).await, err(AgentError::Refused("security-downgrade".into())));
+    assert!(protectors(&rig).await.is_empty());
+}
+
+#[tokio::test]
 async fn an_ssh_unlock_takes_the_pin_too() {
     let (_dir, rig) = enrolled().await;
     answer(&rig, &[PIN]);

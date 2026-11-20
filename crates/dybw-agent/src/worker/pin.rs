@@ -169,10 +169,6 @@ async fn enrol<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, still: &Recheck, t
             tracing::warn!(profile = %ctx.profile.name, "the PIN was not enrolled: {}", e.code());
             AgentError::Internal
         })?;
-    // Locked while the PIN was typed: the key above was the unlocked one, but the user is gone.
-    if shared.state.borrow().slot.is_none() {
-        return Err(AgentError::Locked);
-    }
     shared.state.borrow_mut().pin = Some(blob);
     Ok(())
 }
@@ -248,13 +244,9 @@ pub(super) async fn unlock<H: Host>(
             }
             Err(e) => {
                 audit(ctx, caller, "unlock-pin", Verdict::Denied);
-                let why = match e {
-                    ProtectorError::Wrong | ProtectorError::Invalidated => "too many wrong PINs",
-                    ProtectorError::Binding => "it belongs to another device or machine",
-                    ProtectorError::Stale => "the user key no longer opens the account (rotated)",
-                    _ => "it is unreadable",
-                };
-                drop_pin(shared, ctx, Some(caller), why);
+                // Binding, Stale (a rotation), Invalidated, Format: the core's text names which, never a secret.
+                let why = if e == ProtectorError::Wrong { "five wrong PINs".to_owned() } else { e.to_string() };
+                drop_pin(shared, ctx, Some(caller), &why);
                 return None;
             }
         }
