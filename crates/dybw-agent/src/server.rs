@@ -12,25 +12,49 @@ use tokio::task::JoinSet;
 use zeroize::Zeroizing;
 
 use crate::agent::{Agent, TICK};
+use crate::caller::Resolved;
+use crate::ssh_agent::SshAgent;
 
 /// Serve until `shutdown` resolves (or fails) or a `StopAgent` reply has been delivered, ticking the idle and sleep
-/// checks. Connections in flight are given `drain_timeout` to finish, then cancelled; then every worker is stopped
-/// and its keys wiped before this returns.
+/// checks; with `ssh`, also serve the SSH agent on its listener. Connections in flight are given `drain_timeout` to
+/// finish, then cancelled; SSH connections, which stay open between requests, are cut at once. Then every worker is
+/// stopped and its keys wiped before this returns.
 pub async fn serve(
     agent: Arc<Agent>,
     listener: std::os::unix::net::UnixListener,
+    ssh: Option<(std::os::unix::net::UnixListener, Arc<SshAgent>)>,
     shutdown: impl Future<Output = std::io::Result<()>>,
 ) -> std::io::Result<()> {
     let listener = UnixListener::from_std(listener)?;
+    let ssh = match ssh {
+        Some((listener, state)) => Some((UnixListener::from_std(listener)?, state)),
+        None => None,
+    };
     let ticker = tokio::spawn(ticker(agent.clone()));
-    let mut handlers = JoinSet::new();
+    let (mut handlers, mut ssh_handlers) = (JoinSet::new(), JoinSet::new());
     let mut accept = || -> Accepting<'_> { Box::pin(async { listener.accept().await.map(|(stream, _)| stream) }) };
+    let on = |stream| -> Handling {
+        let agent = agent.clone();
+        Box::pin(async move {
+            if handle(agent.clone(), stream).await {
+                agent.stop.notify_one();
+            }
+        })
+    };
+    let ssh_loop = async {
+        let Some((listener, state)) = &ssh else { return std::future::pending().await };
+        let mut accept = || -> Accepting<'_> { Box::pin(async { listener.accept().await.map(|(stream, _)| stream) }) };
+        let on = |stream| -> Handling { Box::pin(crate::ssh_agent::handle(state.clone(), stream)) };
+        accept_loop(&mut accept, &on, &mut ssh_handlers).await
+    };
     let out = tokio::select! {
         out = shutdown => out,
         () = agent.stop.notified() => Ok(()),
-        out = accept_loop(&agent, &mut accept, &mut handlers) => out,
+        out = accept_loop(&mut accept, &on, &mut handlers) => out,
+        out = ssh_loop => out,
     };
     ticker.abort();
+    ssh_handlers.shutdown().await;
     wind_down(&agent, handlers).await;
     out
 }
@@ -59,20 +83,18 @@ async fn ticker(agent: Arc<Agent>) {
 
 type Accepting<'a> = Pin<Box<dyn Future<Output = std::io::Result<UnixStream>> + Send + 'a>>;
 type Accept<'a> = dyn FnMut() -> Accepting<'a> + Send + 'a;
+type Handling = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type On<'a> = dyn Fn(UnixStream) -> Handling + Sync + 'a;
 
-/// Ends only on an accept error (out of descriptors, a dead socket): better to stop than to spin.
-/// `accept` is a trait object, not a generic, so the real loop and the test's share one body.
-async fn accept_loop(agent: &Arc<Agent>, accept: &mut Accept<'_>, handlers: &mut JoinSet<()>) -> std::io::Result<()> {
+/// Ends only on an accept error (out of descriptors, a dead socket): better to stop than to spin. Each connection
+/// is served by `on` in a task of `handlers`. Trait objects, not generics, so both sockets and the test share one
+/// body.
+async fn accept_loop(accept: &mut Accept<'_>, on: &On<'_>, handlers: &mut JoinSet<()>) -> std::io::Result<()> {
     let err = loop {
         while handlers.try_join_next().is_some() {}
         match accept().await {
             Ok(stream) => {
-                let agent = agent.clone();
-                handlers.spawn(async move {
-                    if handle(agent.clone(), stream).await {
-                        agent.stop.notify_one();
-                    }
-                });
+                handlers.spawn(on(stream));
             }
             Err(e) => break e,
         }
@@ -80,19 +102,24 @@ async fn accept_loop(agent: &Arc<Agent>, accept: &mut Accept<'_>, handlers: &mut
     Err(err)
 }
 
+/// The caller on a new connection, worked out while the peer is still what it was at connect. A peer that cannot
+/// be identified, or is another user, is refused: `None`.
+pub(crate) async fn identify(agent: &Agent, stream: &UnixStream) -> Option<Resolved> {
+    let peer = dybw_peer::peer_of_stream(stream).ok().filter(|p| p.uid == agent.uid);
+    let Some(peer) = peer else {
+        tracing::warn!("refused a connection from another user or an unidentifiable peer");
+        return None;
+    };
+    Some(agent.resolver.clone().resolve_async(peer).await)
+}
+
 /// One connection. A peer of another uid, a slow or oversize or malformed or wrong-version request is dropped
 /// without a reply and before any worker is touched. Returns true when the request was `StopAgent`, whose `Done`
 /// has by then been written and the connection closed: only then may the agent stop.
 pub async fn handle(agent: Arc<Agent>, mut stream: UnixStream) -> bool {
     // The peer is captured before anything is read, while its pid still names it; the policy re-checks it before a
-    // reply. One that cannot be identified, or is another user, is refused.
-    let peer = dybw_peer::peer_of_stream(&stream).ok().filter(|p| p.uid == agent.uid);
-    let Some(peer) = peer else {
-        tracing::warn!("refused a connection from another user or an unidentifiable peer");
-        return false;
-    };
-    // Who is on the other end is worked out now, while the peer is what it was at connect.
-    let who = agent.resolver.clone().resolve_async(peer).await;
+    // reply.
+    let Some(who) = identify(&agent, &stream).await else { return false };
     let Some(request) = read_request(&mut stream, agent.read_timeout).await else { return false };
     let stop = request.op == Op::StopAgent;
     let reply = agent.dispatch_for(request.op, &who).await;
@@ -179,12 +206,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_accept_loop_ends_with_the_accept_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let (agent, _) = agent(dir.path());
-        let mut accept = || -> Accepting<'_> { Box::pin(async { Err(std::io::Error::other("out of descriptors")) }) };
-        let e = accept_loop(&agent, &mut accept, &mut JoinSet::new()).await.unwrap_err();
+    async fn the_accept_loop_serves_each_connection_and_ends_with_the_accept_error() {
+        let mut first = Some(Tokio::pair().unwrap().0);
+        let mut accept = || -> Accepting<'_> {
+            let next = first.take().ok_or_else(|| std::io::Error::other("out of descriptors"));
+            Box::pin(async { next })
+        };
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let on = |_| -> Handling {
+            let served = served.clone();
+            Box::pin(async move {
+                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let mut handlers = JoinSet::new();
+        let e = accept_loop(&mut accept, &on, &mut handlers).await.unwrap_err();
         assert_eq!(e.to_string(), "out of descriptors");
+        while handlers.join_next().await.is_some() {}
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -257,7 +296,7 @@ mod tests {
         let (agent, _) = agent(dir.path());
         let sock_dir = dir.path().join("run");
         let (listener, _lock) = crate::socket::bind(&sock_dir, me()).unwrap();
-        let served = tokio::spawn(serve(agent.clone(), listener, std::future::pending::<std::io::Result<()>>()));
+        let served = tokio::spawn(serve(agent.clone(), listener, None, std::future::pending::<std::io::Result<()>>()));
         let path = sock_dir.join("agent.sock");
 
         assert!(crate::socket::bind(&sock_dir, me()).is_err(), "the live socket is not replaced");
@@ -278,7 +317,23 @@ mod tests {
         let dir = tempfile::Builder::new().prefix("d").tempdir_in("/tmp").unwrap();
         let (agent, _) = agent(dir.path());
         let (listener, _lock) = crate::socket::bind(&dir.path().join("run"), me()).unwrap();
-        serve(agent, listener, async { Ok(()) }).await.unwrap();
+        serve(agent, listener, None, async { Ok(()) }).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accept_error_on_the_ssh_socket_ends_serve_too() {
+        let dir = tempfile::Builder::new().prefix("d").tempdir_in("/tmp").unwrap();
+        let (agent, _) = agent(dir.path());
+        let (listener, _lock) = crate::socket::bind(&dir.path().join("run"), me()).unwrap();
+        // A connected stream posing as a listener: once readable, accept(2) on it fails.
+        let (fake, mut other) = std::os::unix::net::UnixStream::pair().unwrap();
+        fake.set_nonblocking(true).unwrap();
+        std::io::Write::write_all(&mut other, b"x").unwrap();
+        let ssh_listener = std::os::unix::net::UnixListener::from(std::os::fd::OwnedFd::from(fake));
+        let ssh =
+            Arc::new(crate::ssh_agent::SshAgent::new(agent.clone(), vec![], Arc::new(crate::ssh_agent::RefuseAll)));
+        let served = serve(agent, listener, Some((ssh_listener, ssh)), std::future::pending::<std::io::Result<()>>());
+        assert!(tokio::time::timeout(Duration::from_secs(5), served).await.unwrap().is_err());
     }
 
     #[tokio::test]
@@ -318,7 +373,7 @@ mod tests {
         Arc::get_mut(&mut agent).unwrap().read_timeout = Duration::from_secs(5);
         let (listener, _lock) = crate::socket::bind(&dir.path().join("run"), me()).unwrap();
         let path = dir.path().join("run/agent.sock");
-        let served = tokio::spawn(serve(agent.clone(), listener, std::future::pending::<std::io::Result<()>>()));
+        let served = tokio::spawn(serve(agent.clone(), listener, None, std::future::pending::<std::io::Result<()>>()));
         // A connects first and is slow; B stops the agent meanwhile.
         let slow = {
             let (path, ready) = (path.clone(), tokio::sync::oneshot::channel::<()>());
@@ -358,7 +413,12 @@ mod tests {
         let path = dir.path().join("run/agent.sock");
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let served =
-            tokio::spawn(serve(agent.clone(), listener, async move { stopped.await.map_err(std::io::Error::other) }));
+            tokio::spawn(serve(
+                agent.clone(),
+                listener,
+                None,
+                async move { stopped.await.map_err(std::io::Error::other) },
+            ));
         // An unlock that waits on a pinentry nobody answers.
         let waiting = tokio::task::spawn_blocking(move || {
             use std::io::{Read, Write};

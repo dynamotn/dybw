@@ -171,6 +171,12 @@ impl Agent {
         Some(w)
     }
 
+    /// The live worker of profile `name`, never started for the asking: a profile without one is locked.
+    pub(crate) fn running(&self, name: &str) -> Option<Arc<Worker>> {
+        let workers = self.workers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        workers.get(name).filter(|w| w.is_alive()).cloned()
+    }
+
     #[cfg(test)]
     pub(crate) fn worker_count(&self) -> usize {
         self.workers.lock().map(|w| w.len()).unwrap_or_default()
@@ -461,7 +467,7 @@ impl Agent {
 
     /// Lock everything after a suspend (wall time ran ahead of monotonic time since the last check), else lock
     /// the profiles that have been idle past their timeout. Runs on every tick and before every request.
-    async fn guard(&self) {
+    pub(crate) async fn guard(&self) {
         let mut last = self.last_tick.lock().await;
         let (wall, mono) = (self.clock.wall(), self.clock.mono());
         let (last_wall, last_mono) = std::mem::replace(&mut *last, (wall, mono));

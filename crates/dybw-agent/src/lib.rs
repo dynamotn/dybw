@@ -17,6 +17,7 @@ pub mod server;
 pub mod session;
 pub mod socket;
 pub mod ssh;
+pub mod ssh_agent;
 pub mod trust;
 pub mod worker;
 
@@ -85,17 +86,24 @@ fn run_on(passwd: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     let home = trust.home.clone().expect("trust() sets the home");
     let var = |name: &str| std::env::var_os(name);
     let config = config::Config::load(&paths::config_path(&home))?;
+    let ssh_profiles = config.ssh_agent_profiles()?;
     let user = trust.user.clone();
+    let dir = socket::socket_dir(&var, user.uid);
     // The lock file stays held until the process ends.
-    let (listener, _lock) = socket::bind(&socket::socket_dir(&var, user.uid), user.uid)?;
+    let (listener, lock) = socket::bind(&dir, user.uid)?;
+    let ssh_listener = socket::bind_ssh(&dir, user.uid, &lock)?;
     let harnesses = caller::Harnesses::load(&paths::harnesses_path(&home));
     // The companion CLI: the `dybw` next to this executable.
     let companion = trust.exe.as_deref().and_then(|exe| std::fs::canonicalize(exe.with_file_name("dybw")).ok());
     let resolver = Arc::new(caller::Resolver::new(Arc::new(dybw_peer::Os), harnesses).with_companion(companion));
     let audit = Arc::new(audit::FileAudit::new(&paths::audit_path(&home), user.uid));
     let agent = Arc::new(agent::Agent::new(config, home, user, real_spawn(trust), resolver, audit));
+    // Nothing signs until confirmation is in place.
+    let ssh = Arc::new(ssh_agent::SshAgent::new(agent.clone(), ssh_profiles, Arc::new(ssh_agent::RefuseAll)));
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    runtime.block_on(server::serve(agent, listener, stop_signal())).map_err(anyhow::Error::from)
+    let served = runtime.block_on(server::serve(agent, listener, Some((ssh_listener, ssh)), stop_signal()));
+    drop(lock);
+    served.map_err(anyhow::Error::from)
 }
 
 /// Workers with the real host: the HTTP port and the trusted pinentry of their profile.

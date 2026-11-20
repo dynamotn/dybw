@@ -55,7 +55,28 @@ impl Config {
         for name in names {
             config.profile(Some(&name))?;
         }
+        config.ssh_agent_profiles()?;
         Ok(config)
+    }
+
+    /// `[ssh_agent] profiles` (profiles §1 and §8): the profiles whose SSH keys the agent offers, in order; none
+    /// without the table. The agent owns the table, so it is checked strictly: no other key, and only defined
+    /// profiles.
+    pub fn ssh_agent_profiles(&self) -> anyhow::Result<Vec<String>> {
+        let shown = &self.shown;
+        let Some(table) = self.doc.get("ssh_agent") else { return Ok(Vec::new()) };
+        let table = table.as_table().with_context(|| format!("`ssh_agent` in {shown} must be a table"))?;
+        if let Some(key) = table.keys().find(|k| *k != "profiles") {
+            bail!("unknown key `{key}` in [ssh_agent] in {shown}");
+        }
+        let Some(list) = table.get("profiles") else { return Ok(Vec::new()) };
+        let names = list.as_array().and_then(|a| a.iter().map(|n| n.as_str().map(str::to_owned)).collect());
+        let names: Vec<String> =
+            names.with_context(|| format!("`profiles` in [ssh_agent] in {shown} must be a list of profile names"))?;
+        for name in &names {
+            self.profile(Some(name)).context("in [ssh_agent] profiles")?;
+        }
+        Ok(names)
     }
 
     /// The profile `name`, else the file's `default`. The file is validated as a whole, and the profile strictly;
@@ -254,6 +275,26 @@ mod tests {
         assert!(err("lock_timeout_minutes = -1\n", None).contains("negative"));
         assert!(err("pinentry = \"\"\n", None).contains("empty"));
         assert!(err("[profiles.p]\nemail = \"e\"\n", Some("p")).contains("`server_url` is required"));
+    }
+
+    #[test]
+    fn ssh_agent_profiles_are_defined_profiles_and_the_table_is_checked_strictly() {
+        assert!(config(TWO).ssh_agent_profiles().unwrap().is_empty());
+        assert!(config(&format!("{TWO}[ssh_agent]\n")).ssh_agent_profiles().unwrap().is_empty());
+        let both = config(&format!("{TWO}[ssh_agent]\nprofiles = [\"home\", \"work\"]\n"));
+        assert_eq!(both.ssh_agent_profiles().unwrap(), ["home", "work"]);
+        let e = |extra: &str| format!("{:#}", config(&format!("{TWO}{extra}")).ssh_agent_profiles().unwrap_err());
+        let not_table = format!("{:#}", config(&format!("ssh_agent = 1\n{TWO}")).ssh_agent_profiles().unwrap_err());
+        assert!(not_table.contains("must be a table"), "{not_table}");
+        assert!(e("[ssh_agent]\nprofile = [\"work\"]\n").contains("unknown key `profile` in [ssh_agent]"));
+        assert!(e("[ssh_agent]\nprofiles = \"work\"\n").contains("list of profile names"));
+        assert!(e("[ssh_agent]\nprofiles = [1]\n").contains("list of profile names"));
+        let undefined = e("[ssh_agent]\nprofiles = [\"nope\"]\n");
+        assert!(undefined.contains("[ssh_agent] profiles") && undefined.contains("not defined"), "{undefined}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("{TWO}[ssh_agent]\nprofiles = [\"nope\"]\n")).unwrap();
+        assert!(Config::load(&path).is_err(), "checked at load");
     }
 
     #[test]

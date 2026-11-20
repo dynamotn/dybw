@@ -67,15 +67,21 @@ pub fn keys(sync: &Value, user: &SymmetricKey) -> Vec<Key> {
         })
     };
     let all: Vec<&Value> = personal_ssh(sync).collect();
+    let usable: Vec<Key> = all.iter().copied().filter_map(read).collect();
+    let (items, readable) = (all.len(), usable.len());
     let mut keys: Vec<Key> = Vec::new();
     // One key held by several items is listed once, as the first, so a blob names one item.
-    for key in all.iter().copied().filter_map(read) {
+    for key in usable {
         if find(&keys, &key.blob).is_none() {
             keys.push(key);
         }
     }
-    if keys.len() < all.len() {
-        tracing::info!(skipped = all.len() - keys.len(), "SSH key items that cannot be used are left out");
+    // Debug, not info: the SSH agent lists the keys on every connection.
+    if readable < items {
+        tracing::debug!(skipped = items - readable, "SSH key items that cannot be used are left out");
+    }
+    if keys.len() < readable {
+        tracing::debug!(skipped = readable - keys.len(), "SSH key items repeating an earlier item's key are left out");
     }
     keys
 }
@@ -136,7 +142,7 @@ fn personal_ssh(sync: &Value) -> impl Iterator<Item = &Value> {
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
-mod tests {
+pub(crate) mod tests {
     use std::convert::Infallible;
 
     use dybw_core::crypto::SymmetricKey;
@@ -152,7 +158,7 @@ mod tests {
     use crate::read::OPENS;
 
     /// The OS random source, as the RNG ssh-key generates keys with.
-    struct Os;
+    pub(crate) struct Os;
 
     impl TryRng for Os {
         type Error = Infallible;
@@ -174,7 +180,7 @@ mod tests {
 
     impl TryCryptoRng for Os {}
 
-    fn generate(algorithm: Algorithm) -> PrivateKey {
+    pub(crate) fn generate(algorithm: Algorithm) -> PrivateKey {
         match algorithm {
             // ssh-key's default is 4096 bits: slow to generate, and 2048 says the same.
             Algorithm::Rsa { .. } => {

@@ -29,6 +29,7 @@ use crate::host::Host;
 use crate::policy::{self, Access, AuditEvent, Decision, Store, Verdict};
 use crate::read::{self, Found, Lookup};
 use crate::session::{self, Ctx, Session};
+use crate::ssh::{self, Key, SshError};
 
 mod write;
 pub use write::Write;
@@ -121,6 +122,18 @@ pub enum Cmd {
     Purge {
         caller: Caller,
         still: Recheck,
+    },
+    /// The SSH keys of the unlocked vault ([`ssh::keys`]), sent on the channel; a locked profile sends nothing. Not a
+    /// use of the profile: SSH clients list the keys on every connection.
+    SshKeys(oneshot::Sender<Vec<Key>>),
+    /// [`ssh::sign`] in the unlocked vault, its result sent on `out`; a locked profile sends nothing. The caller has
+    /// authorized it.
+    SshSign {
+        id: String,
+        blob: Vec<u8>,
+        data: Vec<u8>,
+        flags: u32,
+        out: oneshot::Sender<Result<Vec<u8>, SshError>>,
     },
     /// Lock and end the thread.
     Exit,
@@ -275,7 +288,7 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
     {
         let mut st = shared.state.borrow_mut();
         st.seen = Some(now);
-        if !matches!(cmd, Cmd::Status | Cmd::IdleCheck) {
+        if !matches!(cmd, Cmd::Status | Cmd::IdleCheck | Cmd::SshKeys(_)) {
             st.last_used = Some(now);
         }
     }
@@ -296,6 +309,19 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
         Cmd::Search { term, folder, fields } => {
             let search = |v: &UnlockedVault| Ok(read::list(v, &fields, folder.as_deref(), Some(&term)));
             return quick(reply, with_vault(shared, search).unwrap_or_else(error));
+        }
+        Cmd::SshKeys(out) => {
+            if let Ok(keys) = with_vault(shared, |v| Ok(ssh::keys(&v.sync, v.keys.user()))) {
+                let _ = out.send(keys);
+            }
+            return quick(reply, Reply::Done);
+        }
+        Cmd::SshSign { id, blob, data, flags, out } => {
+            let sign = |v: &UnlockedVault| Ok(ssh::sign(&v.sync, v.keys.user(), &id, &blob, &data, flags));
+            if let Ok(signed) = with_vault(shared, sign) {
+                let _ = out.send(signed);
+            }
+            return quick(reply, Reply::Done);
         }
         Cmd::Get { find, select, rbw, caller, still } => {
             let read = match rbw {

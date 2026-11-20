@@ -54,11 +54,22 @@ pub fn bind(dir: &Path, uid: u32) -> anyhow::Result<(UnixListener, File)> {
         "dybw-agent is already running (the lock {} is held)",
         lock_path.display()
     );
-    let path = dir.join("agent.sock");
+    let listener = listen(&dir.join("agent.sock"), uid)?;
+    Ok((listener, lock))
+}
+
+/// Bind `dir/ssh-agent.sock` (the SSH agent, profiles §8) as [`bind`] binds `agent.sock`, under the lock `bind`
+/// returned: only the agent holding it may replace a stale SSH socket.
+pub fn bind_ssh(dir: &Path, uid: u32, _lock: &File) -> anyhow::Result<UnixListener> {
+    listen(&dir.join("ssh-agent.sock"), uid)
+}
+
+/// Bind `path` 0600, replacing a stale socket of `uid` there; the caller holds the lock.
+fn listen(path: &Path, uid: u32) -> anyhow::Result<UnixListener> {
     // A stat error other than "missing" falls through to the bind, which then fails on its own.
-    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
         ensure!(meta.file_type().is_socket() && meta.uid() == uid, "{} is not this user's socket", path.display());
-        match UnixStream::connect(&path) {
+        match UnixStream::connect(path) {
             Ok(_) => bail!("dybw-agent is already running on {}", path.display()),
             Err(e) => ensure!(
                 matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound),
@@ -66,12 +77,12 @@ pub fn bind(dir: &Path, uid: u32) -> anyhow::Result<(UnixListener, File)> {
                 path.display()
             ),
         }
-        std::fs::remove_file(&path).context(format!("remove stale {}", path.display()))?;
+        std::fs::remove_file(path).context(format!("remove stale {}", path.display()))?;
     }
-    let listener = UnixListener::bind(&path).context(format!("bind {}", path.display()))?;
-    std::fs::set_permissions(&path, PermissionsExt::from_mode(0o600))?;
+    let listener = UnixListener::bind(path).context(format!("bind {}", path.display()))?;
+    std::fs::set_permissions(path, PermissionsExt::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    Ok((listener, lock))
+    Ok(listener)
 }
 
 #[cfg(test)]
@@ -180,6 +191,18 @@ mod tests {
         let _foreign = UnixListener::bind(dir.join("agent.sock")).unwrap();
         assert!(err(bind(&dir, me())).contains("already running on"));
         assert!(dir.join("agent.sock").exists());
+    }
+
+    #[test]
+    fn the_ssh_socket_is_0600_next_to_the_agent_socket_and_follows_the_same_stale_rule() {
+        let base = base();
+        let dir = base.path().join("dybw");
+        let (_agent, lock) = bind(&dir, me()).unwrap();
+        let ssh = bind_ssh(&dir, me(), &lock).unwrap();
+        assert_eq!(std::fs::metadata(dir.join("ssh-agent.sock")).unwrap().mode() & 0o777, 0o600);
+        assert!(format!("{:#}", bind_ssh(&dir, me(), &lock).unwrap_err()).contains("already running on"));
+        drop(ssh);
+        let _fresh = bind_ssh(&dir, me(), &lock).unwrap();
     }
 
     #[test]
