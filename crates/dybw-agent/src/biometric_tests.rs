@@ -198,6 +198,17 @@ async fn a_protector_that_does_not_fit_this_mac_device_or_kind_is_dropped() {
 }
 
 #[tokio::test]
+async fn a_server_that_refuses_the_api_key_shows_no_sheet_and_keeps_it() {
+    let (dir, rig) = enrolled().await;
+    rig.host.world().token_status = 400;
+    touch(&rig, &[Ok(())]);
+    answer(&rig, &[PASSWORD]);
+    assert_eq!(rig.agent.dispatch(unlock_op()).await, err(AgentError::Server));
+    assert_eq!(asked(&rig), ["Master password:"]);
+    assert!(sheets(&rig).is_empty() && file(&dir).exists());
+}
+
+#[tokio::test]
 async fn an_account_that_refuses_the_key_drops_it_and_refuses_the_unlock() {
     let (dir, rig) = enrolled().await;
     std::fs::write(dir.path().join(".local/state/dybw/profiles/org/core/security-version"), "9").unwrap();

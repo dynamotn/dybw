@@ -415,7 +415,7 @@ fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, er
         Cmd::Unlock { command: Some(UnlockCmd::List) } => {
             match ask(env, Op::UnlockList { profile: profile.clone() }, false)? {
                 None => {
-                    for (name, protector) in on_disk(env, profile.as_deref()) {
+                    for (name, protector) in on_disk(env, profile.as_deref()).into_iter().flatten() {
                         writeln!(out, "{}\t{protector}\t-", escape(&name))?;
                     }
                     Ok(0)
@@ -710,12 +710,11 @@ const LOGIN_WARNING: &str = "dybw: the login protector is kept on this disk, wra
     TPM2, someone who takes this disk can guess that password offline; a long login password slows them down.";
 
 /// The profile and each protector it has on this device's disk (`login`, `biometric`).
-fn on_disk(env: &Env, profile: Option<&str>) -> Vec<(String, &'static str)> {
-    let Some(home) = env.home.as_ref() else { return Vec::new() };
-    let config = dybw_agent::config::Config::load(&dybw_agent::paths::config_path(home));
-    let Some(p) = config.ok().and_then(|c| c.profile(profile).ok()) else { return Vec::new() };
+fn on_disk(env: &Env, profile: Option<&str>) -> Option<Vec<(String, &'static str)>> {
+    let home = env.home.as_ref()?;
+    let p = dybw_agent::config::Config::load(&dybw_agent::paths::config_path(home)).ok()?.profile(profile).ok()?;
     let dir = dybw_agent::paths::ProfilePaths::with(home, &p).unlock;
-    ["login", "biometric"].into_iter().filter(|f| dir.join(f).exists()).map(|f| (p.name.clone(), f)).collect()
+    Some(["login", "biometric"].into_iter().filter(|f| dir.join(f).exists()).map(|f| (p.name.clone(), f)).collect())
 }
 
 fn done(reply: Reply) -> Result<u8, Fail> {
