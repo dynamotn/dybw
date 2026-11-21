@@ -20,6 +20,7 @@ fn event(caller: Caller, verdict: Verdict) -> AuditEvent {
         item: Some("5f0c-id".into()),
         verdict,
         ssh: None,
+        channel: None,
     }
 }
 
@@ -35,6 +36,15 @@ fn tool() -> Caller {
 
 fn log_in(dir: &Path) -> FileAudit {
     FileAudit::new(&dir.join("state/dybw/audit.log"), me())
+}
+
+#[test]
+fn a_confirmation_line_names_where_it_was_answered() {
+    let line = entry_of(&AuditEvent { channel: Some("touch-id"), ..event(tool(), Verdict::Confirmed) });
+    assert_eq!(line.channel.as_deref(), Some("touch-id"));
+    let text = serde_json::to_string(&line).unwrap();
+    assert!(text.contains("\"channel\":\"touch-id\""), "{text}");
+    assert_eq!(entry_of(&event(tool(), Verdict::Granted)).channel, None);
 }
 
 #[test]
@@ -88,6 +98,7 @@ fn a_decision_is_one_json_line_without_a_value_or_a_name() {
             key: None,
             dest: None,
             forwarded: None,
+            channel: None,
         }
     );
     assert!(!text.contains("\"key\"") && !text.contains("\"forwarded\""), "no SSH fields on other lines: {text}");

@@ -373,18 +373,20 @@ pub(super) async fn write<H: Host>(
         Err(e) => return error(e),
     };
     let item = planned.found.as_ref().map(|f| f.id.clone());
+    let screen = shared.asking.lock().await;
+    // A removal that takes an item from other tools says so in the pinentry only.
+    let touch = planned.markers.is_empty().then(|| {
+        let name = planned.found.as_ref().map_or(&planned.name, |f| &f.name);
+        super::touch_reason(&ctx.profile.name, caller, &format!("{} {}", write.op(), super::touch_name(name)))
+    });
+    let (answer, via) = session::confirm(host, &question(ctx, caller, &write, &planned), touch.flatten(), false).await;
     let end = |verdict, e| {
-        audit(ctx, caller, op, item.as_deref(), verdict);
+        audit_via(ctx, caller, op, item.as_deref(), verdict, Some(via));
         error(e)
     };
     let values = {
-        let _screen = shared.asking.lock().await;
-        // A removal that takes an item from other tools says so in the pinentry only.
-        let touch = planned.markers.is_empty().then(|| {
-            let name = planned.found.as_ref().map_or(&planned.name, |f| &f.name);
-            super::touch_reason(&ctx.profile.name, caller, &format!("{} {}", write.op(), super::touch_name(name)))
-        });
-        if let Err(e) = session::confirm(host, &question(ctx, caller, &write, &planned), touch, false).await {
+        let _screen = screen;
+        if let Err(e) = answer {
             return end(Verdict::Declined, e);
         }
         if let Some(found) = planned.found.as_ref().filter(|f| f.reprompt)
@@ -409,7 +411,7 @@ pub(super) async fn write<H: Host>(
     }
     match send(shared, host, ctx, &write, &planned, &values, still).await {
         Ok(id) => {
-            audit(ctx, caller, op, id.as_deref(), Verdict::Confirmed);
+            audit_via(ctx, caller, op, id.as_deref(), Verdict::Confirmed, Some(via));
             Reply::Done
         }
         Err(AgentError::Denied) => end(Verdict::Denied, AgentError::Denied),

@@ -1010,6 +1010,9 @@ async fn always_holds_for_this_client_process_and_this_key_only() {
     assert_eq!(confirmed(&w.rig).len(), 3, "another key, then another ssh process of the same program");
     let want = [Verdict::Remembered, Verdict::Granted, Verdict::Confirmed, Verdict::Confirmed];
     assert_eq!(verdicts(&w.rig), want);
+    // Where each was answered: a held grant asks nobody.
+    let channels: Vec<_> = w.rig.audit.events().iter().map(|e| e.channel).collect();
+    assert_eq!(channels, [Some("pinentry"), None, Some("pinentry"), Some("pinentry")]);
 }
 
 #[tokio::test]

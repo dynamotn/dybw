@@ -308,6 +308,7 @@ impl Agent {
             item: None,
             verdict: Verdict::Denied,
             ssh: None,
+            channel: None,
         });
         Reply::Error { error: AgentError::Denied }
     }
@@ -340,6 +341,7 @@ impl Agent {
             item: None,
             verdict,
             ssh: None,
+            channel: None,
         });
     }
 

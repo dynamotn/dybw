@@ -1031,6 +1031,7 @@ fn audit_event(
         item: Some(s("id-1")),
         verdict,
         ssh: None,
+        channel: None,
     }
 }
 

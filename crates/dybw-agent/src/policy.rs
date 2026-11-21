@@ -85,6 +85,8 @@ pub struct AuditEvent {
     pub verdict: Verdict,
     /// For an SSH signature (`ssh-sign`): the key and where the connection goes.
     pub ssh: Option<SignAudit>,
+    /// Where the user answered a confirmation: `touch-id` or `pinentry`; `None` when nobody was asked.
+    pub channel: Option<&'static str>,
 }
 
 /// What an SSH signature's audit line adds: never the data signed.

@@ -58,6 +58,9 @@ pub struct Entry {
     /// For an SSH signature: whether the request came through agent forwarding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarded: Option<bool>,
+    /// For a confirmation: where the user answered it (`touch-id` or `pinentry`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 fn verdict_name(v: Verdict) -> &'static str {
@@ -109,6 +112,7 @@ fn entry_of(event: &AuditEvent) -> Entry {
         key: ssh.map(|s| text(&s.key)),
         dest: ssh.and_then(|s| s.dest.as_deref()).map(text),
         forwarded: ssh.map(|s| s.forwarded),
+        channel: event.channel.map(str::to_owned),
     }
 }
 

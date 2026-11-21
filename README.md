@@ -124,8 +124,9 @@ only says "see the agent log" is explained there.
   signature with no "always") shows the Touch ID sheet instead of the pinentry, naming who asks, what and which item
   (cut at 120 characters; the pinentry has the whole question). A finger that does not match is a no; a cancel, no
   sensor or the lid closed puts the same question in the pinentry. A question that offers "always", a change of the
-  policy, `rbw purge`, a removal of a marked item, a forwarded SSH request, a failed session-bind and a login to a
-  host that is not verified stay in the pinentry, which says more. `[agent] touch_id_confirm = false` in
+  policy, `rbw purge`, a removal of a marked item, a forwarded SSH request, a failed session-bind, a login to a
+  host that is not verified, and every question for an AI-class or unknown caller stay in the pinentry, which says
+  more. Each audit line of a confirmation records where it was answered (`"channel": "touch-id"` or `"pinentry"`). `[agent] touch_id_confirm = false` in
   `config.toml` turns Touch ID confirmations off (the pinentry asks instead; it grants nothing, so a synced file may
   hold it).
 - Grants are a convenience for honest programs, not a boundary: code running as you can defeat them (a script's

@@ -67,6 +67,7 @@ pub(super) fn audit_as(ctx: &Ctx, caller: &Caller, kind: &'static str, op: &'sta
         item: None,
         verdict,
         ssh: None,
+        channel: None,
     });
 }
 

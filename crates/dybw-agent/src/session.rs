@@ -237,21 +237,22 @@ pub(crate) async fn ask<H: Host>(
 ///
 /// With a `touch` reason (it names the caller and the item, ADR 0006), Touch ID asks first. Touch ID is a yes or a no,
 /// so a question that offers "always" stays in the pinentry, which has the three answers. A finger that does not
-/// match is a no; a cancelled, unavailable or switched-off Touch ID puts the same question in the pinentry.
+/// match is a no; a cancelled, unavailable or switched-off Touch ID puts the same question in the pinentry. Also
+/// answers where the user answered ([`TOUCH_ID`] or [`PINENTRY`]), for the audit.
 pub async fn confirm<H: Host>(
     host: &H,
     text: &str,
     touch: Option<String>,
     offer_always: bool,
-) -> Result<bool, AgentError> {
+) -> (Result<bool, AgentError>, &'static str) {
     if let (Some(reason), false) = (touch, offer_always) {
         match host.touch_id(reason).await {
-            TouchId::Allowed => return Ok(false),
-            TouchId::Denied => return Err(AgentError::Denied),
+            TouchId::Allowed => return (Ok(false), TOUCH_ID),
+            TouchId::Denied => return (Err(AgentError::Denied), TOUCH_ID),
             other => tracing::info!("Touch ID {other:?}: asking in the pinentry"),
         }
     }
-    match host.confirm(text, offer_always).await {
+    let answer = match host.confirm(text, offer_always).await {
         Ok(Confirm::Once) => Ok(false),
         Ok(Confirm::Always) => Ok(true),
         Ok(Confirm::Deny) | Err(PromptError::Timeout) => Err(AgentError::Denied),
@@ -259,8 +260,13 @@ pub async fn confirm<H: Host>(
             tracing::warn!("prompt: {e}");
             Err(AgentError::Prompt)
         }
-    }
+    };
+    (answer, PINENTRY)
 }
+
+/// The audit's names of where a confirmation was answered.
+pub const TOUCH_ID: &str = "touch-id";
+pub const PINENTRY: &str = "pinentry";
 
 fn key_of(c: &Credentials) -> ApiKey {
     ApiKey {

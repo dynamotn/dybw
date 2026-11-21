@@ -137,6 +137,7 @@ impl Agent {
                 item: None,
                 verdict: Verdict::Confirmed,
                 ssh: None,
+                channel: None,
             });
         }
     }

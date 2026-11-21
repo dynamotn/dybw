@@ -268,6 +268,8 @@ async fn remove_purge_and_a_new_login_drop_it() {
     assert_eq!(rig.agent.dispatch(Op::Purge { profile: org() }).await, Reply::Done);
     assert!(!file(&dir).exists());
     assert!(sheets(&rig).is_empty(), "a purge is confirmed in the pinentry");
+    let purge = rig.audit.events().into_iter().find(|e| e.op == "purge").unwrap();
+    assert_eq!((purge.verdict, purge.channel), (Verdict::Confirmed, Some("pinentry")));
     assert_eq!(audited(&rig).last(), Some(&("unlock-biometric-dropped", Verdict::Failed)));
 }
 
@@ -292,6 +294,11 @@ async fn an_ssh_unlock_names_its_client_on_the_sheet() {
 }
 
 const WHO: &str = "/usr/local/bin/mytool running /opt/scripts/backup.sh";
+
+/// Each audit line's op, verdict and where the question was answered.
+fn channels(rig: &Rig) -> Vec<(&'static str, Verdict, Option<&'static str>)> {
+    rig.audit.events().iter().map(|e| (e.op, e.verdict, e.channel)).collect()
+}
 
 #[tokio::test]
 async fn a_write_is_confirmed_by_touch_id_naming_the_caller_and_the_item() {
@@ -319,6 +326,17 @@ async fn a_write_is_confirmed_by_touch_id_naming_the_caller_and_the_item() {
     assert_eq!(rig.agent.dispatch(remove_op("m1")).await, Reply::Done);
     assert!(sheets(&rig).is_empty());
     assert_eq!(writes(&rig), 4);
+    let (touch, pinentry) = (Some("touch-id"), Some("pinentry"));
+    assert_eq!(
+        channels(&rig),
+        [
+            ("remove", Verdict::Confirmed, touch),
+            ("remove", Verdict::Declined, touch),
+            ("remove", Verdict::Confirmed, pinentry),
+            ("add", Verdict::Confirmed, pinentry),
+            ("remove", Verdict::Confirmed, pinentry),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -338,12 +356,19 @@ async fn a_read_that_offers_always_keeps_the_pinentry_and_one_asked_every_time_u
     assert_eq!(rig.host.world().offered, [true]);
     touch(&rig, &[Ok(()), Ok(())]);
     assert!(matches!(rig.agent.dispatch(crate::read_tests::history_op("x1")).await, Reply::History { .. }));
+    assert_eq!(sheets(&rig), [format!("let {WHO} history \"Plain\" (dybw profile work)")]);
+    // An unknown caller is asked every time, in the pinentry only (ruling): no sheet, though Touch ID would answer.
+    rig.host.allow();
     assert!(matches!(rig.agent.dispatch_as(password(), unknown()).await, Reply::Value { .. }));
+    assert!(sheets(&rig).is_empty());
+    assert_eq!(rig.host.world().offered, [true, false]);
+    let got: Vec<_> = channels(&rig).into_iter().map(|(_, v, c)| (v, c)).collect();
     let want = [
-        format!("let {WHO} history \"Plain\" (dybw profile work)"),
-        "let an unknown caller (possibly an AI agent) get \"Plain\" (dybw profile work)".to_owned(),
+        (Verdict::Confirmed, Some("pinentry")),
+        (Verdict::Confirmed, Some("touch-id")),
+        (Verdict::Confirmed, Some("pinentry")),
     ];
-    assert_eq!(sheets(&rig), want);
+    assert_eq!(got, want);
 }
 
 #[test]
@@ -355,10 +380,15 @@ fn the_sheet_names_each_kind_of_caller_briefly() {
         relative: false,
         at: At { detached: true, ..At::default() },
     };
-    let shown = crate::worker::touch_who(&detached);
-    assert!(shown.starts_with("/very/l…") && shown.ends_with("/tool (detached, possibly an AI agent)"), "{shown}");
-    assert!(shown.chars().count() < 90, "{shown}");
-    assert_eq!(crate::worker::touch_who(&ai()), "the AI agent claude");
-    assert_eq!(crate::worker::touch_who(&invoker()), WHO);
+    let reason = |caller: &Caller| crate::worker::touch_reason("p", caller, "get \"x\"");
+    let shown = reason(&detached).unwrap();
+    assert!(
+        shown.starts_with("let /very/l…") && shown.contains("/tool (detached, possibly an AI agent) get"),
+        "{shown}"
+    );
+    assert!(shown.chars().count() < 120, "{shown}");
+    assert_eq!(reason(&invoker()).unwrap(), format!("let {WHO} get \"x\" (dybw profile p)"));
+    // AI-class and unknown callers: the pinentry only (ruling).
+    assert_eq!((reason(&ai()), reason(&unknown())), (None, None));
     assert_eq!(crate::worker::touch_name("a\"b"), "\"a\\\"b\"", "a name cannot close the quote");
 }

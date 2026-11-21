@@ -7,7 +7,7 @@ use dybw_proto::{AgentError, Reply};
 use super::{MAX_HELD, Shared, error, quoted, unlock as unlock_profile};
 use crate::caller::Caller;
 use crate::host::Host;
-use crate::policy::{self, Access, Decision, Store, Verdict};
+use crate::policy::{self, Access, AuditEvent, Decision, Store, Verdict};
 use crate::session::{self, Ctx};
 use crate::ssh::Key;
 use crate::ssh_agent::{Data, SignContext, client, host_key, sign_event};
@@ -62,6 +62,7 @@ pub(super) async fn confirm<H: Host>(
     let grant = (caller.clone(), key.blob.clone(), matches!(sign.data, Data::Login { .. }));
     let held = || always && shared.state.borrow().ssh_held.contains(&grant);
     let refused_enough = || shared.state.borrow().ssh_noes.iter().any(|(c, n)| c == caller && *n >= MAX_NOES);
+    let mut channel = None;
     let verdict = if held() {
         Verdict::Granted
     } else {
@@ -73,7 +74,9 @@ pub(super) async fn confirm<H: Host>(
             Verdict::Denied
         } else {
             let touch = touch_reason(&ctx.profile.name, caller, key, sign, forwarded);
-            match session::confirm(host, &text(ctx, caller, key, sign, always), touch, always).await {
+            let (answer, via) = session::confirm(host, &text(ctx, caller, key, sign, always), touch, always).await;
+            channel = Some(via);
+            match answer {
                 // Wiped while the question was open without this task being aborted (a crashed command).
                 Ok(_) if locked() => return error(AgentError::Locked),
                 Ok(true) if always => {
@@ -93,7 +96,7 @@ pub(super) async fn confirm<H: Host>(
             }
         }
     };
-    ctx.audit.record(sign_event(caller, key, sign, verdict));
+    ctx.audit.record(AuditEvent { channel, ..sign_event(caller, key, sign, verdict) });
     match verdict {
         Verdict::Declined | Verdict::Denied => error(AgentError::Denied),
         Verdict::Failed => error(AgentError::Prompt),
@@ -114,7 +117,7 @@ fn touch_reason(profile: &str, caller: &Caller, key: &Key, s: &SignContext, forw
     if forwarded || s.bind_refused {
         return None;
     }
-    Some(super::touch_reason(profile, caller, &what))
+    super::touch_reason(profile, caller, &what)
 }
 
 /// The question: the profile, the client, what is signed (a login, and where to, or data that is not a login), the
@@ -221,5 +224,11 @@ mod tests {
         assert_eq!(reason(&ctx(login(true), None, false), false), None, "no binding: no host to name");
         assert_eq!(reason(&ctx(login(true), bound(true), false), true), None, "forwarded");
         assert_eq!(reason(&ctx(Data::Other, None, true), false), None, "a failed session-bind");
+        // AI-class and unknown callers: the pinentry only, which names them and the host in full (ruling).
+        let ai = Caller::Ai { harness: "claude".into(), via: crate::caller::Via::Ancestry };
+        let unknown = Caller::Unknown { why: "orphan".into(), peer: None };
+        for caller in [ai, unknown] {
+            assert_eq!(touch_reason("work", &caller, &key, &ctx(login(true), bound(false), false), false), None);
+        }
     }
 }

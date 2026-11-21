@@ -556,8 +556,8 @@ fn with_vault<T>(shared: &Shared, f: impl FnOnce(&UnlockedVault) -> Result<T, Ag
 
 /// What the confirmation says: the profile, who asks and by which command, what is read of which item, each on one
 /// line; and when "always" is for this process only, that.
-/// The second text is the Touch ID sheet's reason.
-fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Scope) -> (String, String) {
+/// The second text is the Touch ID sheet's reason, when Touch ID may ask.
+fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Scope) -> (String, Option<String>) {
     let (command, what) = match (read, read.select()) {
         (_, Some(Select::Field(name))) => ("get", format!("its field \"{}\"", tidy(name))),
         (_, Some(Select::Full)) => ("get", "the full item (every value)".to_owned()),
@@ -578,31 +578,23 @@ fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Sc
 }
 
 /// The Touch ID sheet's reason, which macOS shows as "dybw-agent is trying to …": who asks to do what, and the
-/// profile; the sheet cuts it at 120 characters, the pinentry question has the whole text.
-pub(crate) fn touch_reason(profile: &str, caller: &Caller, what: &str) -> String {
-    format!("let {} {what} (dybw profile {profile})", touch_who(caller))
+/// profile; the sheet cuts it at 120 characters, the pinentry question has the whole text. `None` for an AI-class or
+/// unknown caller: its questions stay in the pinentry, which names it and the item in full, where a habitual touch on
+/// a short sheet would be weaker against an AI harness (ruling, Task 4).
+pub(crate) fn touch_reason(profile: &str, caller: &Caller, what: &str) -> Option<String> {
+    let Caller::Invoker { exe, script, .. } = caller else { return None };
+    let exe = policy::shown(&exe.to_string_lossy(), 48);
+    let detached = if caller.detached() { " (detached, possibly an AI agent)" } else { "" };
+    let who = match script {
+        Some(script) => format!("{exe} running {}{detached}", policy::shown(&script.to_string_lossy(), 48)),
+        None => format!("{exe}{detached}"),
+    };
+    Some(format!("let {who} {what} (dybw profile {profile})"))
 }
 
 /// An item's name, quoted and short enough for the Touch ID sheet.
 pub(crate) fn touch_name(name: &str) -> String {
     quoted(&policy::shown(name, 48))
-}
-
-/// Who asks, short enough for the Touch ID sheet: the executable (cut in the middle), the script it claims, or the
-/// class.
-pub(crate) fn touch_who(caller: &Caller) -> String {
-    match caller {
-        Caller::Invoker { exe, script, .. } => {
-            let exe = policy::shown(&exe.to_string_lossy(), 48);
-            let detached = if caller.detached() { " (detached, possibly an AI agent)" } else { "" };
-            match script {
-                Some(script) => format!("{exe} running {}{detached}", policy::shown(&script.to_string_lossy(), 48)),
-                None => format!("{exe}{detached}"),
-            }
-        }
-        Caller::Ai { harness, .. } => format!("the AI agent {}", policy::shown(harness, 48)),
-        Caller::Unknown { .. } => "an unknown caller (possibly an AI agent)".to_owned(),
-    }
 }
 
 /// The item a question is about, told apart from any other of the same name: its name, user, folder or
@@ -700,7 +692,19 @@ fn audit(
     item: Option<&str>,
     verdict: Verdict,
 ) {
-    tracing::info!(profile = %ctx.profile.name, op, item, ?verdict, "caller policy");
+    audit_via(ctx, caller, (op, kind), item, verdict, None);
+}
+
+/// [`audit`], with where the user answered the question (`channel`), when one was asked.
+fn audit_via(
+    ctx: &Ctx,
+    caller: &Caller,
+    (op, kind): (&'static str, Option<&'static str>),
+    item: Option<&str>,
+    verdict: Verdict,
+    channel: Option<&'static str>,
+) {
+    tracing::info!(profile = %ctx.profile.name, op, item, ?verdict, channel, "caller policy");
     ctx.audit.record(AuditEvent {
         time: std::time::SystemTime::now(),
         profile: ctx.profile.name.clone(),
@@ -710,6 +714,7 @@ fn audit(
         item: item.map(str::to_owned),
         verdict,
         ssh: None,
+        channel,
     });
 }
 
@@ -732,6 +737,7 @@ async fn gate<H: Host>(
         policy::decide(caller, &store.load(), &held, access_of(read))
     };
     let mut decision = decide();
+    let mut channel = None;
     let _screen = if matches!(decision, Decision::Confirm { .. }) {
         let screen = shared.asking.lock().await;
         decision = decide();
@@ -744,14 +750,16 @@ async fn gate<H: Host>(
         Decision::Deny => (Verdict::Denied, Err(AgentError::Denied)),
         Decision::Confirm { remember: scope } => {
             let (text, reason) = ask_text(ctx, caller, found, read, scope);
-            match session::confirm(host, &text, Some(reason), scope != Scope::Never).await {
+            let (answer, via) = session::confirm(host, &text, reason, scope != Scope::Never).await;
+            channel = Some(via);
+            match answer {
                 Ok(true) => (remember(shared, ctx, &store, caller, scope), Ok(())),
                 Ok(false) => (Verdict::Confirmed, Ok(())),
                 Err(e) => (Verdict::Declined, Err(e)),
             }
         }
     };
-    audit(ctx, caller, op, Some(&found.id), verdict);
+    audit_via(ctx, caller, op, Some(&found.id), verdict, channel);
     result
 }
 
@@ -1038,19 +1046,21 @@ async fn change_policy<H: Host>(
         change.sentence()
     );
     // A change of the policy grants or refuses for good: the pinentry shows all of it, never Touch ID.
-    if let Err(e) = session::confirm(host, &text, None, false).await {
-        audit(ctx, caller, (op, None), None, Verdict::Declined);
+    let (answer, via) = session::confirm(host, &text, None, false).await;
+    let audit = |verdict| audit_via(ctx, caller, (op, None), None, verdict, Some(via));
+    if let Err(e) = answer {
+        audit(Verdict::Declined);
         return error(e);
     }
     if !still.holds() {
-        audit(ctx, caller, (op, None), None, Verdict::Denied);
+        audit(Verdict::Denied);
         return error(AgentError::Denied);
     }
     let done = match &change {
         Change::Set(entry) => store.set(entry.clone()),
         Change::Forget(invoker) => store.forget(invoker).map(|_| ()),
     };
-    audit(ctx, caller, (op, None), None, if done.is_ok() { Verdict::Confirmed } else { Verdict::Failed });
+    audit(if done.is_ok() { Verdict::Confirmed } else { Verdict::Failed });
     done.map_or_else(
         |e| {
             tracing::warn!(profile = %ctx.profile.name, "the policy was not saved: {e}");
@@ -1071,6 +1081,8 @@ async fn purge<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, s
         audit(ctx, caller, op, None, Verdict::Denied);
         return error(AgentError::Denied);
     }
+    // Asked in the pinentry only, which every line after the question records.
+    let audit = |verdict| audit_via(ctx, caller, op, None, verdict, Some(session::PINENTRY));
     {
         let _screen = shared.asking.lock().await;
         let text = format!(
@@ -1080,13 +1092,13 @@ async fn purge<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, s
             policy::who(caller)
         );
         // Deletes the local copy: the pinentry shows all of it, never Touch ID.
-        if let Err(e) = session::confirm(host, &text, None, false).await {
-            audit(ctx, caller, op, None, Verdict::Declined);
+        if let (Err(e), _) = session::confirm(host, &text, None, false).await {
+            audit(Verdict::Declined);
             return error(e);
         }
     }
     if !still.holds() {
-        audit(ctx, caller, op, None, Verdict::Denied);
+        audit(Verdict::Denied);
         return error(AgentError::Denied);
     }
     let _op = shared.op.lock().await;
@@ -1103,10 +1115,10 @@ async fn purge<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, s
     };
     if let Err(e) = removed {
         tracing::warn!(profile = %ctx.profile.name, "the local copy was not deleted: {}", e.kind());
-        audit(ctx, caller, op, None, Verdict::Failed);
+        audit(Verdict::Failed);
         return internal();
     }
-    audit(ctx, caller, op, None, Verdict::Confirmed);
+    audit(Verdict::Confirmed);
     Reply::Done
 }
 

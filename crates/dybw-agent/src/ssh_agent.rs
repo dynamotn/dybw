@@ -206,6 +206,7 @@ pub(crate) fn sign_event(caller: &Caller, key: &Key, ctx: &SignContext, verdict:
             forwarded: ctx.bound.as_ref().is_some_and(|b| b.forwarded),
             client: ctx.client.clone(),
         }),
+        channel: None,
     }
 }
 
@@ -355,6 +356,7 @@ impl SshAgent {
             item: None,
             verdict,
             ssh: Some(SignAudit { key, client: who.client.clone(), ..SignAudit::default() }),
+            channel: None,
         });
     }
 
