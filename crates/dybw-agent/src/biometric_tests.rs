@@ -113,13 +113,16 @@ async fn a_cancel_or_a_sensor_that_cannot_answer_goes_on_to_the_pin_then_the_mas
     assert!(sheets(&rig).is_empty(), "an enrolment's unlock asks the master password, never Touch ID");
     asked(&rig);
     let mut want = vec![("unlock-add", Verdict::Confirmed), ("unlock-add", Verdict::Confirmed)];
-    for (refusal, verdict) in [
-        (Enclave::Cancelled, Verdict::Declined),
-        (Enclave::Unavailable, Verdict::Failed),
-        (Enclave::LockedOut, Verdict::Failed),
-        (Enclave::Failed, Verdict::Failed),
-        (Enclave::Other(-42), Verdict::Failed),
+    // No sheet was answered when there is no sensor or Touch ID is locked out: no channel.
+    let mut channels = vec![];
+    for (refusal, verdict, channel) in [
+        (Enclave::Cancelled, Verdict::Declined, Some("touch-id")),
+        (Enclave::Unavailable, Verdict::Failed, None),
+        (Enclave::LockedOut, Verdict::Failed, None),
+        (Enclave::Failed, Verdict::Failed, Some("touch-id")),
+        (Enclave::Other(-42), Verdict::Failed, Some("touch-id")),
     ] {
+        channels.push(channel);
         assert_eq!(rig.agent.dispatch(lock_op()).await, Reply::Done);
         touch(&rig, &[Err(refusal)]);
         answer(&rig, &[PIN]);
@@ -129,6 +132,8 @@ async fn a_cancel_or_a_sensor_that_cannot_answer_goes_on_to_the_pin_then_the_mas
         want.extend([("unlock-biometric", verdict), ("unlock-pin", Verdict::Confirmed)]);
     }
     assert_eq!(audited(&rig), want);
+    let got: Vec<_> = rig.audit.events().iter().filter(|e| e.op == "unlock-biometric").map(|e| e.channel).collect();
+    assert_eq!(got, channels);
     // Without a PIN, a cancel goes on to the master password.
     assert_eq!(rig.agent.dispatch(Op::UnlockRemove { profile: org(), protector: "pin".into() }).await, Reply::Done);
     assert_eq!(rig.agent.dispatch(lock_op()).await, Reply::Done);
@@ -445,8 +450,8 @@ fn the_sheet_fits_with_the_item_and_profile_first() {
     let item = "i".repeat(80);
     let what = format!(
         "read the field \"{}\" of \"{}\"",
-        crate::worker::cut(&"f".repeat(40), 16),
-        crate::worker::cut(&item, 32)
+        crate::worker::cut(&"f".repeat(40), 12),
+        crate::worker::cut(&item, 24)
     );
     let profile = "p".repeat(64);
     for caller in [
@@ -455,12 +460,15 @@ fn the_sheet_fits_with_the_item_and_profile_first() {
     ] {
         let reason = crate::worker::touch_reason(&profile, &caller, &what).unwrap();
         assert!(reason.chars().count() <= 120, "{reason}");
-        let essentials = format!("{what} (dybw profile {}…) for ", "p".repeat(19));
+        let essentials = format!("{what} (dybw profile {}…) for ", "p".repeat(11));
         assert!(reason.starts_with(&essentials), "{reason}");
         assert!(
-            reason.starts_with(&format!("read the field \"{}…\" of \"{}…\"", "f".repeat(15), "i".repeat(31))),
+            reason.starts_with(&format!("read the field \"{}…\" of \"{}…\"", "f".repeat(11), "i".repeat(23))),
             "{reason}"
         );
+        // The caller stays on the sheet: at least the first 12 characters of its file name.
+        let program = [" for python3 (".to_owned(), format!(" for {}", "e".repeat(12))];
+        assert!(program.iter().any(|p| reason.contains(p.as_str())), "{reason}");
     }
     let script = long("/usr/bin/python3".into(), Some("/opt/x/backup.py".into()));
     assert_eq!(crate::worker::touch_reason("w", &script, "go").unwrap(), "go (dybw profile w) for python3 (backup.py)");

@@ -145,7 +145,9 @@ pub(super) async fn unlock<H: Host>(host: &H, ctx: &Ctx, caller: &Caller, why: O
             // Kept: a cancel, no sensor, a lockout or an unknown error (its code logged) is no reason to delete it.
             let verdict = if e == enclave::Error::Cancelled { Verdict::Declined } else { Verdict::Failed };
             tracing::info!(profile = %ctx.profile.name, "Touch ID did not unlock: {e}");
-            audit_sheet(ctx, caller, verdict);
+            // No sensor or a lockout: no sheet was answered.
+            let answered = !matches!(e, enclave::Error::Unavailable | enclave::Error::LockedOut);
+            audit_via(ctx, caller, (BIOMETRIC, "unlock-biometric"), verdict, answered.then_some(session::TOUCH_ID));
             return None;
         }
     };

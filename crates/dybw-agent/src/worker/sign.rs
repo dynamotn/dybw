@@ -107,11 +107,11 @@ pub(super) async fn confirm<H: Host>(
 /// The Touch ID reason: who signs what with which key, and for a login to which host. None (the pinentry, which says
 /// why) for a forwarded request, a failed session-bind, or a login to a host that is not verified.
 fn touch_reason(profile: &str, caller: &Caller, key: &Key, s: &SignContext, forwarded: bool) -> Option<String> {
-    let with = format!("with the SSH key \"{}\"", super::cut(&key.name, 16));
-    // At most 83 characters: the user, the start of the host key's fingerprint (the pinentry has it whole), the key.
+    let with = format!("with the SSH key \"{}\"", super::cut(&key.name, 12));
+    // At most 75 characters: the user, the start of the host key's fingerprint (the pinentry has it whole), the key.
     let what = match (&s.data, &s.bound) {
         (Data::Login { user, bound: true }, Some(b)) => {
-            format!("log in as \"{}\" to {} {with}", super::cut(user, 16), super::cut(&host_key(b), 15))
+            format!("log in as \"{}\" to {} {with}", super::cut(user, 12), super::cut(&host_key(b), 15))
         }
         (Data::Login { .. }, _) => return None,
         (Data::Other, _) => format!("sign data that is not an SSH login {with}"),
@@ -230,8 +230,8 @@ mod tests {
         let long = Data::Login { user: "u".repeat(80), bound: true };
         let cut = touch_reason("p".repeat(64).as_str(), &who, &key, &ctx(long, bound(false), false), false).unwrap();
         assert!(cut.chars().count() <= 120, "{cut}");
-        assert!(cut.starts_with(&format!("log in as \"{}…\" to {prefix}…", "u".repeat(15))), "{cut}");
-        assert!(cut.contains(&format!("(dybw profile {}…)", "p".repeat(19))), "{cut}");
+        assert!(cut.starts_with(&format!("log in as \"{}…\" to {prefix}…", "u".repeat(11))), "{cut}");
+        assert!(cut.contains(&format!("(dybw profile {}…) for {}", "p".repeat(11), "s".repeat(12))), "{cut}");
         let data = reason(&ctx(Data::Other, None, false), false).unwrap();
         assert!(data.contains("sign data that is not an SSH login with the SSH key \"work key\""), "{data}");
         assert_eq!(reason(&ctx(login(false), bound(false), false), false), None, "a host that is not verified");

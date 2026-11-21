@@ -558,10 +558,10 @@ fn with_vault<T>(shared: &Shared, f: impl FnOnce(&UnlockedVault) -> Result<T, Ag
 /// line; and when "always" is for this process only, that.
 /// The second text is the Touch ID sheet's reason, when Touch ID may ask: the field, or the full item, of which item.
 fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Scope) -> (String, Option<String>) {
-    let item = format!("\"{}\"", cut(&found.name, 32));
+    let item = format!("\"{}\"", cut(&found.name, 24));
     let (command, what, short) = match (read, read.select()) {
         (_, Some(Select::Field(name))) => {
-            ("get", format!("its field \"{}\"", tidy(name)), format!("the field \"{}\" of {item}", cut(name, 16)))
+            ("get", format!("its field \"{}\"", tidy(name)), format!("the field \"{}\" of {item}", cut(name, 12)))
         }
         (_, Some(Select::Full)) => ("get", "the full item (every value)".to_owned(), format!("the full item {item}")),
         (_, Some(Select::Raw)) => ("get", "the raw item as JSON".to_owned(), format!("the full item {item}")),
@@ -600,15 +600,15 @@ pub(crate) fn cut(s: &str, n: usize) -> String {
 }
 
 /// The Touch ID sheet's reason, which macOS shows as "dybw-agent is trying to …": what is done to which item and the
-/// profile first (`what` is at most 83 characters, so the first 119 always fit), then the file names of who
-/// asks; at most [`REASON_MAX`] characters, the pinentry question has the whole text. `None`, the pinentry only, for
+/// profile first (`what` is at most 75 characters and the profile 12, so the first 103 always fit), then at least
+/// the first 12 characters of the file names of who asks; at most [`REASON_MAX`] characters, the pinentry question has the whole text. `None`, the pinentry only, for
 /// a caller without a stable identity (ruling, Task 4): AI-class, unknown, detached, or one whose grants cannot last
 /// (a bare interpreter, a launcher, a relative script).
 pub(crate) fn touch_reason(profile: &str, caller: &Caller, what: &str) -> Option<String> {
     let (true, Caller::Invoker { exe, script, .. }) = (caller.rememberable(), caller) else { return None };
     let base = |p: &std::path::Path| cut(&p.file_name().unwrap_or(p.as_os_str()).to_string_lossy(), 20);
     let script = script.as_deref().map(|s| format!(" ({})", base(s))).unwrap_or_default();
-    let reason = format!("{what} (dybw profile {}) for {}{script}", cut(profile, 20), base(exe));
+    let reason = format!("{what} (dybw profile {}) for {}{script}", cut(profile, 12), base(exe));
     Some(reason.chars().take(REASON_MAX).collect())
 }
 
