@@ -582,12 +582,9 @@ mod tests {
         assert!(off.enclave_wrap(&[0x5a; 65]).is_err());
         let here = off.enclave();
         let created = off.enclave_create(Policy::CurrentSet, false);
-        assert!(
-            created.is_ok()
-                || !here
-                || std::env::var_os("DYBW_NO_ENCLAVE_TESTS").as_deref() == Some(std::ffi::OsStr::new("1")),
-            "{created:?}"
-        );
+        // Each term on a line that always runs: `||` would skip a line of its own on a system without an enclave.
+        let declared = std::env::var_os("DYBW_NO_ENCLAVE_TESTS").as_deref() == Some(std::ffi::OsStr::new("1"));
+        assert!(created.is_ok() || !here || declared, "{created:?}");
         // On a Mac this would show the sheet.
         #[cfg(not(target_os = "macos"))]
         assert_eq!(RealHost::new(trust(), "/x", true).touch_id("x".into()).await, TouchId::Unavailable);
