@@ -570,7 +570,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dybw"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "clap",
  "clap_complete",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "dybw-agent"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "dybw-agent",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "dybw-peer"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "libc",
  "objc2",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "dybw-proto"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "serde",
  "serde_json",

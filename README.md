@@ -34,7 +34,9 @@ the SSH keys in your vault.
 cargo install --git https://github.com/dynamotn/dybw.git --tag v1.0.0-rc.1 --locked dybw dybw-agent
 ```
 
-Prebuilt binaries will be on the [GitHub releases page](https://github.com/dynamotn/dybw/releases). Building
+Prebuilt binaries are on the [GitHub releases page](https://github.com/dynamotn/dybw/releases): static Linux builds
+for x86_64 and aarch64, and an unsigned macOS arm64 build. See
+[docs/install.md](docs/install.md#prebuilt-binaries) for the asset names and how to verify them. Building
 needs Rust 1.89 or newer. On macOS it also needs the Xcode Command Line Tools (`xcode-select --install`), which build
 the Secure Enclave code.
 

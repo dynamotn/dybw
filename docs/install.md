@@ -7,11 +7,34 @@ cargo install --git https://github.com/dynamotn/dybw.git --tag v1.0.0-rc.1 --loc
 ```
 
 Building needs Rust 1.89 or newer. On macOS it also needs the Xcode Command Line Tools (`xcode-select --install`),
-whose `xcrun swiftc` builds the Secure Enclave code. Prebuilt binaries will be on the
-[GitHub releases page](https://github.com/dynamotn/dybw/releases).
+whose `xcrun swiftc` builds the Secure Enclave code.
 
 The binaries land in `~/.cargo/bin`, or in `<dir>/bin` with `--root <dir>`. Keep them in one directory: `dybw`
 starts only the `dybw-agent` next to it, and the agent trusts only the `dybw` next to it.
+
+### Prebuilt binaries
+
+Each `v*` tag has a [GitHub release](https://github.com/dynamotn/dybw/releases) with these assets, where
+`<version>` is the tag without its `v` (`1.0.0-rc.1`):
+
+| Platform | Asset |
+| --- | --- |
+| Linux x86_64 (static, musl) | `dybw-<version>-x86_64-linux-musl.tar.gz` |
+| Linux aarch64 (static, musl) | `dybw-<version>-aarch64-linux-musl.tar.gz` |
+| macOS arm64 | `dybw-<version>-aarch64-apple-darwin.tar.gz` |
+
+Each has a `<asset>.sha256` next to it. A tarball holds `dybw`, `dybw-agent`, `contrib/`, `README.md` and `LICENSE`
+at its top level, with no enclosing directory. The macOS build is not signed or notarized: a browser download gets
+the quarantine attribute, so fetch it with `curl` (as below) or clear it with `xattr -d com.apple.quarantine`.
+
+```sh
+version=1.0.0-rc.1
+asset=dybw-$version-x86_64-linux-musl.tar.gz      # or aarch64-linux-musl, aarch64-apple-darwin
+base=https://github.com/dynamotn/dybw/releases/download/v$version
+curl -fsSLO "$base/$asset" -O "$base/$asset.sha256"
+shasum -a 256 -c "$asset.sha256"                   # or sha256sum -c
+mkdir -p ~/.local/bin && tar -xzf "$asset" -C ~/.local/bin dybw dybw-agent
+```
 
 Then write `~/.config/dybw/config.toml` ([configuration.md](configuration.md)), and for each profile run:
 
