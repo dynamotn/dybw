@@ -235,17 +235,17 @@ pub(crate) async fn ask<H: Host>(
 /// Ask the user to allow one read of a value. Only an explicit yes passes (`true`: and "always"); a no, a cancel
 /// and a timeout are `Denied`, a prompt that could not be put is `Prompt`.
 ///
-/// With a `touch` reason (it names the caller and the item, ADR 0006), Touch ID asks first. Touch ID is a yes or a no,
-/// so a question that offers "always" stays in the pinentry, which has the three answers. A finger that does not
-/// match is a no; a cancelled, unavailable or switched-off Touch ID puts the same question in the pinentry. Also
-/// answers where the user answered ([`TOUCH_ID`] or [`PINENTRY`]), for the audit.
+/// With a `touch` reason (it names the item and the caller, ADR 0006), Touch ID asks first. Touch ID is a yes or a no:
+/// a match is "yes once", even where "always" is offered. A finger that does not match is a no; a cancelled,
+/// unavailable or switched-off Touch ID puts the same question in the pinentry, which offers "always" where it may
+/// (ruling, Task 4). Also answers where the user answered ([`TOUCH_ID`] or [`PINENTRY`]), for the audit.
 pub async fn confirm<H: Host>(
     host: &H,
     text: &str,
     touch: Option<String>,
     offer_always: bool,
 ) -> (Result<bool, AgentError>, &'static str) {
-    if let (Some(reason), false) = (touch, offer_always) {
+    if let Some(reason) = touch {
         match host.touch_id(reason).await {
             TouchId::Allowed => return (Ok(false), TOUCH_ID),
             TouchId::Denied => return (Err(AgentError::Denied), TOUCH_ID),

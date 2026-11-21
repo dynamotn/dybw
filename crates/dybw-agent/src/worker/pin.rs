@@ -57,7 +57,18 @@ fn audit(ctx: &Ctx, caller: &Caller, op: &'static str, verdict: Verdict) {
 
 /// One local unlock line in the log and the audit, for the protector `kind`; never a secret.
 pub(super) fn audit_as(ctx: &Ctx, caller: &Caller, kind: &'static str, op: &'static str, verdict: Verdict) {
-    tracing::info!(profile = %ctx.profile.name, op, kind, ?verdict, "local unlock");
+    audit_via(ctx, caller, (kind, op), verdict, None);
+}
+
+/// [`audit_as`], with where the user answered (`channel`: the Touch ID sheet of a `biometric` unlock).
+pub(super) fn audit_via(
+    ctx: &Ctx,
+    caller: &Caller,
+    (kind, op): (&'static str, &'static str),
+    verdict: Verdict,
+    channel: Option<&'static str>,
+) {
+    tracing::info!(profile = %ctx.profile.name, op, kind, ?verdict, channel, "local unlock");
     ctx.audit.record(AuditEvent {
         time: std::time::SystemTime::now(),
         profile: ctx.profile.name.clone(),
@@ -67,7 +78,7 @@ pub(super) fn audit_as(ctx: &Ctx, caller: &Caller, kind: &'static str, op: &'sta
         item: None,
         verdict,
         ssh: None,
-        channel: None,
+        channel,
     });
 }
 
@@ -99,9 +110,19 @@ pub(super) fn list(shared: &Shared, ctx: &Ctx, names_only: bool) -> Reply {
     Reply::Protectors { profile: ctx.profile.name.clone(), protectors: infos(shared, ctx, names_only) }
 }
 
+/// Every protector name, offered by this build or not: a file another build left can still be removed.
+fn named(name: &str) -> Option<Protector> {
+    match name {
+        PIN => Some(Protector::Pin),
+        login::LOGIN => Some(Protector::Login),
+        biometric::BIOMETRIC => Some(Protector::Biometric),
+        _ => None,
+    }
+}
+
 /// `dybw unlock remove <protector>`: refused to any caller but a named invoker, audited.
 pub(super) fn remove(shared: &Shared, ctx: &Ctx, caller: &Caller, name: &str) -> Reply {
-    let kind = offered(name);
+    let kind = named(name);
     let shown = kind.map_or(PIN, Protector::name);
     if !matches!(caller, Caller::Invoker { .. }) {
         audit_as(ctx, caller, shown, "unlock-remove", Verdict::Denied);

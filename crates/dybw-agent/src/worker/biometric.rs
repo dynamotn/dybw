@@ -18,7 +18,7 @@ use dybw_native::ports::random::OsRandom;
 use dybw_peer::enclave::{self, Policy, PublicKey};
 use serde::{Deserialize, Serialize};
 
-use super::pin::{audit_as, binding};
+use super::pin::{audit_as, audit_via, binding};
 use crate::caller::Caller;
 use crate::host::Host;
 use crate::policy::Verdict;
@@ -96,10 +96,28 @@ pub(super) async fn enrol<H: Host>(
     ensure_private_dir(&ctx.paths.unlock).and_then(|()| write_private(&path(ctx), &json)).map_err(|e| e.to_string())
 }
 
+/// An `unlock-biometric` line after the Touch ID sheet: it records where the user answered.
+fn audit_sheet(ctx: &Ctx, caller: &Caller, verdict: Verdict) {
+    audit_via(ctx, caller, (BIOMETRIC, "unlock-biometric"), verdict, Some(session::TOUCH_ID));
+}
+
+/// Whether the blob is bound to this device and machine, read before any sheet is shown: the core checks it again
+/// when it unwraps. The fields are read from the blob's stored form, which the core does not otherwise expose.
+fn bound_here(blob: &ProtectorBlob, device: &str, machine: &str) -> bool {
+    let stored = serde_json::to_value(blob).unwrap_or_default();
+    let field = |name| stored.get(name).and_then(serde_json::Value::as_str);
+    field("deviceId") == Some(device) && field("machine") == Some(machine)
+}
+
 /// Try Touch ID, when the profile has the protector: `Some` session on success; `None` to go on to the PIN or the
 /// master password. `why`: what asks for the unlock, when not the user.
 pub(super) async fn unlock<H: Host>(host: &H, ctx: &Ctx, caller: &Caller, why: Option<&str>) -> Option<Session> {
     let stored = read(ctx)?;
+    // A file on a machine without a Secure Enclave (another build's, or a copy) can never open: it goes.
+    if !host.enclave() {
+        drop_biometric(ctx, caller, "this machine has no Secure Enclave");
+        return None;
+    }
     let (device, machine) = binding(host, ctx)?;
     let (mut blob, handle, ephemeral) = match stored {
         Ok(stored) => stored,
@@ -108,13 +126,18 @@ pub(super) async fn unlock<H: Host>(host: &H, ctx: &Ctx, caller: &Caller, why: O
             return None;
         }
     };
+    // Another device or machine: dropped without asking for a finger.
+    if !bound_here(&blob, &device, &machine) {
+        drop_biometric(ctx, caller, &ProtectorError::Binding.to_string());
+        return None;
+    }
     let account = session::account(host, ctx).await?;
     let why = why.map(|w| format!(": {w}")).unwrap_or_default();
     let reason = format!("Unlock dybw profile {}{why}", ctx.profile.name);
     let secret = match host.enclave_derive(handle, ephemeral, reason).await {
         Ok(secret) => secret,
         Err(enclave::Error::Invalidated) => {
-            audit_as(ctx, caller, BIOMETRIC, "unlock-biometric", Verdict::Denied);
+            audit_sheet(ctx, caller, Verdict::Denied);
             drop_biometric(ctx, caller, "the Secure Enclave key no longer works (the enrolled fingers changed)");
             return None;
         }
@@ -122,7 +145,7 @@ pub(super) async fn unlock<H: Host>(host: &H, ctx: &Ctx, caller: &Caller, why: O
             // Kept: a cancel, no sensor, a lockout or an unknown error (its code logged) is no reason to delete it.
             let verdict = if e == enclave::Error::Cancelled { Verdict::Declined } else { Verdict::Failed };
             tracing::info!(profile = %ctx.profile.name, "Touch ID did not unlock: {e}");
-            audit_as(ctx, caller, BIOMETRIC, "unlock-biometric", verdict);
+            audit_sheet(ctx, caller, verdict);
             return None;
         }
     };
@@ -131,19 +154,19 @@ pub(super) async fn unlock<H: Host>(host: &H, ctx: &Ctx, caller: &Caller, why: O
         Ok(user) => user,
         Err(e) => {
             // Binding, Stale (a rotation), Wrong (bytes from another key), Format: the core's text, never a secret.
-            audit_as(ctx, caller, BIOMETRIC, "unlock-biometric", Verdict::Denied);
+            audit_sheet(ctx, caller, Verdict::Denied);
             drop_biometric(ctx, caller, &e.to_string());
             return None;
         }
     };
     match session::unlock_with_key(ctx, user, account).await {
         Ok(session) => {
-            audit_as(ctx, caller, BIOMETRIC, "unlock-biometric", Verdict::Confirmed);
+            audit_sheet(ctx, caller, Verdict::Confirmed);
             Some(session)
         }
         Err(e) => {
             tracing::warn!(profile = %ctx.profile.name, "the biometric protector's key was refused: {e}");
-            audit_as(ctx, caller, BIOMETRIC, "unlock-biometric", Verdict::Denied);
+            audit_sheet(ctx, caller, Verdict::Denied);
             drop_biometric(ctx, caller, "the account refused its key");
             None
         }

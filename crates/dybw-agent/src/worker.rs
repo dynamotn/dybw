@@ -556,16 +556,29 @@ fn with_vault<T>(shared: &Shared, f: impl FnOnce(&UnlockedVault) -> Result<T, Ag
 
 /// What the confirmation says: the profile, who asks and by which command, what is read of which item, each on one
 /// line; and when "always" is for this process only, that.
-/// The second text is the Touch ID sheet's reason, when Touch ID may ask.
+/// The second text is the Touch ID sheet's reason, when Touch ID may ask: the field, or the full item, of which item.
 fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Scope) -> (String, Option<String>) {
-    let (command, what) = match (read, read.select()) {
-        (_, Some(Select::Field(name))) => ("get", format!("its field \"{}\"", tidy(name))),
-        (_, Some(Select::Full)) => ("get", "the full item (every value)".to_owned()),
-        (_, Some(Select::Raw)) => ("get", "the raw item as JSON".to_owned()),
-        (_, Some(Select::EditText)) => ("edit", "its current password and notes, to edit them".to_owned()),
-        (_, Some(_)) => ("get", "its main value (password, notes, number or public key)".to_owned()),
-        (Read::History, None) => ("history", "its password history".to_owned()),
-        (_, None) => ("code", "a TOTP code".to_owned()),
+    let item = format!("\"{}\"", cut(&found.name, 32));
+    let (command, what, short) = match (read, read.select()) {
+        (_, Some(Select::Field(name))) => {
+            ("get", format!("its field \"{}\"", tidy(name)), format!("the field \"{}\" of {item}", cut(name, 16)))
+        }
+        (_, Some(Select::Full)) => ("get", "the full item (every value)".to_owned(), format!("the full item {item}")),
+        (_, Some(Select::Raw)) => ("get", "the raw item as JSON".to_owned(), format!("the full item {item}")),
+        (_, Some(Select::EditText)) => (
+            "edit",
+            "its current password and notes, to edit them".to_owned(),
+            format!("the password and notes of {item}"),
+        ),
+        (_, Some(_)) => (
+            "get",
+            "its main value (password, notes, number or public key)".to_owned(),
+            format!("the main value of {item}"),
+        ),
+        (Read::History, None) => {
+            ("history", "its password history".to_owned(), format!("the password history of {item}"))
+        }
+        (_, None) => ("code", "a TOTP code".to_owned(), format!("a TOTP code of {item}")),
     };
     let scope = if remember == Scope::Process { " [always (this process only)]" } else { "" };
     let text = format!(
@@ -574,27 +587,29 @@ fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Sc
         policy::who(caller),
         item_text(found)
     );
-    (text, touch_reason(&ctx.profile.name, caller, &format!("{command} {}", touch_name(&found.name))))
+    (text, touch_reason(&ctx.profile.name, caller, &format!("read {short}")))
 }
 
-/// The Touch ID sheet's reason, which macOS shows as "dybw-agent is trying to …": who asks to do what, and the
-/// profile; the sheet cuts it at 120 characters, the pinentry question has the whole text. `None` for an AI-class or
-/// unknown caller: its questions stay in the pinentry, which names it and the item in full, where a habitual touch on
-/// a short sheet would be weaker against an AI harness (ruling, Task 4).
+/// The longest Touch ID reason: the shim's cut.
+const REASON_MAX: usize = 120;
+
+/// `s` on one line, its double quotes made single (a name cannot close a quote), at most `n` characters.
+pub(crate) fn cut(s: &str, n: usize) -> String {
+    let line = one_line(s).replace('"', "'");
+    if line.chars().count() <= n { line } else { format!("{}…", line.chars().take(n - 1).collect::<String>()) }
+}
+
+/// The Touch ID sheet's reason, which macOS shows as "dybw-agent is trying to …": what is done to which item and the
+/// profile first (`what` is at most 83 characters, so the first 119 always fit), then the file names of who
+/// asks; at most [`REASON_MAX`] characters, the pinentry question has the whole text. `None`, the pinentry only, for
+/// a caller without a stable identity (ruling, Task 4): AI-class, unknown, detached, or one whose grants cannot last
+/// (a bare interpreter, a launcher, a relative script).
 pub(crate) fn touch_reason(profile: &str, caller: &Caller, what: &str) -> Option<String> {
-    let Caller::Invoker { exe, script, .. } = caller else { return None };
-    let exe = policy::shown(&exe.to_string_lossy(), 48);
-    let detached = if caller.detached() { " (detached, possibly an AI agent)" } else { "" };
-    let who = match script {
-        Some(script) => format!("{exe} running {}{detached}", policy::shown(&script.to_string_lossy(), 48)),
-        None => format!("{exe}{detached}"),
-    };
-    Some(format!("let {who} {what} (dybw profile {profile})"))
-}
-
-/// An item's name, quoted and short enough for the Touch ID sheet.
-pub(crate) fn touch_name(name: &str) -> String {
-    quoted(&policy::shown(name, 48))
+    let (true, Caller::Invoker { exe, script, .. }) = (caller.rememberable(), caller) else { return None };
+    let base = |p: &std::path::Path| cut(&p.file_name().unwrap_or(p.as_os_str()).to_string_lossy(), 20);
+    let script = script.as_deref().map(|s| format!(" ({})", base(s))).unwrap_or_default();
+    let reason = format!("{what} (dybw profile {}) for {}{script}", cut(profile, 20), base(exe));
+    Some(reason.chars().take(REASON_MAX).collect())
 }
 
 /// The item a question is about, told apart from any other of the same name: its name, user, folder or
@@ -1171,9 +1186,12 @@ async fn open<H: Host>(
     (reply, typed)
 }
 
-/// The local unlock protectors in order: `biometric` (one touch, nothing to guess), then `pin`.
+/// The local unlock protectors in order: `biometric` (one touch, nothing to guess), then `pin`. An unknown caller
+/// raises no Touch ID sheet: the PIN or the master password question names what asks.
 async fn local<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, why: Option<&str>) -> Option<Session> {
-    match biometric::unlock(host, ctx, caller, why).await {
+    let unknown = matches!(caller, Caller::Unknown { .. });
+    let touched = if unknown { None } else { biometric::unlock(host, ctx, caller, why).await };
+    match touched {
         Some(session) => Some(session),
         None => pin::unlock(shared, host, ctx, caller, why).await,
     }

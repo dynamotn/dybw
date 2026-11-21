@@ -77,6 +77,8 @@ async fn touch_id_is_enrolled_with_the_master_password_and_unlocks_after_a_lock(
     assert_eq!(sheets(&rig), ["Unlock dybw profile org"]);
     assert!(unlocked(&rig).await);
     assert_eq!(audited(&rig), [("unlock-add", Verdict::Confirmed), ("unlock-biometric", Verdict::Confirmed)]);
+    let line = rig.audit.events().into_iter().find(|e| e.op == "unlock-biometric").unwrap();
+    assert_eq!(line.channel, Some("touch-id"), "answered on the sheet");
     let list = Op::List { profile: org(), fields: vec![], folder: None };
     assert!(matches!(rig.agent.dispatch(list).await, Reply::Items { items } if !items.is_empty()));
     // Every unlock asks.
@@ -180,13 +182,28 @@ async fn a_protector_that_does_not_fit_this_mac_device_or_kind_is_dropped() {
         rig.host.world().touches.clear();
         assert_eq!(rig.agent.dispatch(lock_op()).await, Reply::Done);
     }
-    // Another machine: the Secure Enclave answers, the core refuses the binding.
+    // Another machine, or another device id: dropped before any sheet.
+    for edit in [&|v: &mut Value| v["protector"]["machine"] = "another-machine".into(), &|v: &mut Value| {
+        v["protector"]["deviceId"] = "another-device".into();
+    }] as [&dyn Fn(&mut Value); 2]
+    {
+        std::fs::write(file(&dir), edited(edit)).unwrap();
+        touch(&rig, &[Ok(())]);
+        answer(&rig, &[PASSWORD]);
+        assert_eq!(rig.agent.dispatch(unlock_op()).await, Reply::Done);
+        assert!(sheets(&rig).is_empty() && !file(&dir).exists());
+        assert_eq!(audited(&rig).last(), Some(&("unlock-biometric-dropped", Verdict::Failed)));
+        rig.host.world().touches.clear();
+        assert_eq!(rig.agent.dispatch(lock_op()).await, Reply::Done);
+    }
+    // A machine without a Secure Enclave (a file another build left): dropped, and `remove` would find it too.
     std::fs::write(file(&dir), serde_json::to_vec(&good).unwrap()).unwrap();
-    rig.host.world().machine = Some("another-machine".into());
-    touch(&rig, &[Ok(())]);
+    rig.host.world().enclave = false;
     answer(&rig, &[PASSWORD]);
     assert_eq!(rig.agent.dispatch(unlock_op()).await, Reply::Done);
-    assert!(!file(&dir).exists());
+    assert!(sheets(&rig).is_empty() && !file(&dir).exists());
+    rig.host.world().enclave = true;
+    assert_eq!(rig.agent.dispatch(lock_op()).await, Reply::Done);
     // No fingerprint: nothing is asked of Touch ID, and the protector stays.
     std::fs::write(file(&dir), serde_json::to_vec(&good).unwrap()).unwrap();
     rig.host.world().machine = None;
@@ -194,6 +211,16 @@ async fn a_protector_that_does_not_fit_this_mac_device_or_kind_is_dropped() {
     sheets(&rig);
     answer(&rig, &[PASSWORD]);
     assert_eq!(rig.agent.dispatch(unlock_op()).await, Reply::Done);
+    assert!(sheets(&rig).is_empty() && file(&dir).exists());
+}
+
+#[tokio::test]
+async fn an_unknown_caller_raises_no_sheet_and_goes_to_the_master_password() {
+    let (dir, rig) = enrolled().await;
+    touch(&rig, &[Ok(())]);
+    answer(&rig, &[PASSWORD]);
+    assert_eq!(rig.agent.dispatch_as(unlock_op(), unknown()).await, Reply::Done);
+    assert_eq!(asked(&rig), ["Master password:"]);
     assert!(sheets(&rig).is_empty() && file(&dir).exists());
 }
 
@@ -293,102 +320,154 @@ async fn an_ssh_unlock_names_its_client_on_the_sheet() {
     assert_eq!(sheets(&rig), ["Unlock dybw profile org: ssh git@host"]);
 }
 
-const WHO: &str = "/usr/local/bin/mytool running /opt/scripts/backup.sh";
+/// A plain program: a stable identity, so Touch ID may ask for it (ruling).
+fn program() -> Caller {
+    Caller::Invoker {
+        exe: "/usr/local/bin/mytool".into(),
+        script: None,
+        hash: "h1".into(),
+        relative: false,
+        at: At::default(),
+    }
+}
 
 /// Each audit line's op, verdict and where the question was answered.
 fn channels(rig: &Rig) -> Vec<(&'static str, Verdict, Option<&'static str>)> {
     rig.audit.events().iter().map(|e| (e.op, e.verdict, e.channel)).collect()
 }
 
+const TOUCH: Option<&str> = Some("touch-id");
+const PINENTRY: Option<&str> = Some("pinentry");
+
 #[tokio::test]
-async fn a_write_is_confirmed_by_touch_id_naming_the_caller_and_the_item() {
+async fn a_write_is_confirmed_by_touch_id_naming_the_item_then_the_caller() {
     let (_dir, rig) = setup(|_| {}).await;
     touch(&rig, &[Ok(())]);
-    assert_eq!(rig.agent.dispatch(remove_op("x1")).await, Reply::Done);
-    assert_eq!(sheets(&rig), [format!("let {WHO} remove \"Plain\" (dybw profile work)")]);
+    assert_eq!(rig.agent.dispatch_as(remove_op("x1"), program()).await, Reply::Done);
+    assert_eq!(sheets(&rig), ["remove \"Plain\" (dybw profile work) for mytool"]);
     assert!(rig.host.world().confirmed.is_empty(), "no pinentry");
     // A finger that does not match is a no.
     touch(&rig, &[Err(Enclave::Failed)]);
-    assert_eq!(rig.agent.dispatch(remove_op("x2")).await, err(AgentError::Denied));
+    assert_eq!(rig.agent.dispatch_as(remove_op("x2"), program()).await, err(AgentError::Denied));
     assert!(rig.host.world().confirmed.is_empty());
     // A cancel, or no Touch ID: the same question in the pinentry.
     touch(&rig, &[Err(Enclave::Cancelled)]);
     rig.host.allow();
-    assert_eq!(rig.agent.dispatch(remove_op("x2")).await, Reply::Done);
+    assert_eq!(rig.agent.dispatch_as(remove_op("x2"), program()).await, Reply::Done);
     rig.host.allow();
-    assert_eq!(rig.agent.dispatch(add_op("New", None, &[])).await, Reply::Done);
-    let want =
-        ["remove \"Twelve\"", "remove \"Twelve\"", "add \"New\""].map(|w| format!("let {WHO} {w} (dybw profile work)"));
+    assert_eq!(rig.agent.dispatch_as(add_op("New", None, &[]), program()).await, Reply::Done);
+    let want = ["remove \"Twelve\"", "remove \"Twelve\"", "add \"New\""]
+        .map(|w| format!("{w} (dybw profile work) for mytool"));
     assert_eq!(sheets(&rig), want, "no match, a cancel, then no Touch ID");
     assert_eq!(rig.host.world().confirmed.len(), 2);
     // A removal that takes a marked item from other tools: the pinentry only, which says so.
     rig.host.allow();
-    assert_eq!(rig.agent.dispatch(remove_op("m1")).await, Reply::Done);
+    assert_eq!(rig.agent.dispatch_as(remove_op("m1"), program()).await, Reply::Done);
+    // A caller whose grants cannot last (here, a script run by a program that is not an interpreter): the pinentry.
+    touch(&rig, &[Ok(())]);
+    rig.host.allow();
+    assert_eq!(rig.agent.dispatch(add_op("Other", None, &[])).await, Reply::Done);
     assert!(sheets(&rig).is_empty());
-    assert_eq!(writes(&rig), 4);
-    let (touch, pinentry) = (Some("touch-id"), Some("pinentry"));
+    assert_eq!(writes(&rig), 5);
     assert_eq!(
         channels(&rig),
         [
-            ("remove", Verdict::Confirmed, touch),
-            ("remove", Verdict::Declined, touch),
-            ("remove", Verdict::Confirmed, pinentry),
-            ("add", Verdict::Confirmed, pinentry),
-            ("remove", Verdict::Confirmed, pinentry),
+            ("remove", Verdict::Confirmed, TOUCH),
+            ("remove", Verdict::Declined, TOUCH),
+            ("remove", Verdict::Confirmed, PINENTRY),
+            ("add", Verdict::Confirmed, PINENTRY),
+            ("remove", Verdict::Confirmed, PINENTRY),
+            ("add", Verdict::Confirmed, PINENTRY),
         ]
     );
 }
 
 #[tokio::test]
-async fn a_read_that_offers_always_keeps_the_pinentry_and_one_asked_every_time_uses_touch_id() {
+async fn touch_id_says_yes_once_and_a_cancel_offers_always_in_the_pinentry() {
     let (_dir, rig) = setup(|_| {}).await;
     let password = || crate::read_tests::get_op("x1", Select::Password);
-    let program = Caller::Invoker {
-        exe: "/usr/local/bin/mytool".into(),
-        script: None,
-        hash: "h1".into(),
-        relative: false,
-        at: At::default(),
-    };
-    rig.host.allow();
-    assert!(matches!(rig.agent.dispatch_as(password(), program).await, Reply::Value { .. }));
-    assert!(sheets(&rig).is_empty(), "\"always\" is offered: the pinentry's three answers");
+    // "Always" could be offered: Touch ID asks first, and a match is a yes for this read only.
+    touch(&rig, &[Ok(())]);
+    assert!(matches!(rig.agent.dispatch_as(password(), program()).await, Reply::Value { .. }));
+    assert_eq!(sheets(&rig), ["read the main value of \"Plain\" (dybw profile work) for mytool"]);
+    assert!(rig.host.world().offered.is_empty(), "no pinentry");
+    // A cancel: the pinentry's three answers, where "always" is kept.
+    touch(&rig, &[Err(Enclave::Cancelled)]);
+    rig.host.allow_always();
+    assert!(matches!(rig.agent.dispatch_as(password(), program()).await, Reply::Value { .. }));
     assert_eq!(rig.host.world().offered, [true]);
+    // The grant answers now: nobody is asked.
+    assert!(matches!(rig.agent.dispatch_as(password(), program()).await, Reply::Value { .. }));
+    assert_eq!(sheets(&rig).len(), 1);
+    // The sheet names the field, or the full item.
     touch(&rig, &[Ok(()), Ok(())]);
-    assert!(matches!(rig.agent.dispatch(crate::read_tests::history_op("x1")).await, Reply::History { .. }));
-    assert_eq!(sheets(&rig), [format!("let {WHO} history \"Plain\" (dybw profile work)")]);
-    // An unknown caller is asked every time, in the pinentry only (ruling): no sheet, though Touch ID would answer.
-    rig.host.allow();
-    assert!(matches!(rig.agent.dispatch_as(password(), unknown()).await, Reply::Value { .. }));
+    assert!(matches!(
+        rig.agent.dispatch_as(crate::read_tests::history_op("x1"), program()).await,
+        Reply::History { .. }
+    ));
+    let full = crate::read_tests::get_op("x1", Select::Full);
+    assert!(!matches!(rig.agent.dispatch_as(full, program()).await, Reply::Error { .. }));
+    let want = ["read the password history of \"Plain\"", "read the full item \"Plain\""]
+        .map(|w| format!("{w} (dybw profile work) for mytool"));
+    assert_eq!(sheets(&rig), want);
+    // No stable identity (unknown, detached, a grant that cannot last): the pinentry only, though Touch ID would answer.
+    let at = At { detached: true, ..At::default() };
+    let detached =
+        Caller::Invoker { exe: "/usr/local/bin/mytool".into(), script: None, hash: "h1".into(), relative: false, at };
+    for caller in [unknown(), detached, invoker()] {
+        rig.host.allow();
+        assert!(matches!(rig.agent.dispatch_as(password(), caller).await, Reply::Value { .. }));
+    }
     assert!(sheets(&rig).is_empty());
-    assert_eq!(rig.host.world().offered, [true, false]);
     let got: Vec<_> = channels(&rig).into_iter().map(|(_, v, c)| (v, c)).collect();
     let want = [
-        (Verdict::Confirmed, Some("pinentry")),
-        (Verdict::Confirmed, Some("touch-id")),
-        (Verdict::Confirmed, Some("pinentry")),
+        (Verdict::Confirmed, TOUCH),
+        (Verdict::Remembered, PINENTRY),
+        (Verdict::Granted, None),
+        (Verdict::Confirmed, TOUCH),
+        (Verdict::Confirmed, TOUCH),
+        (Verdict::Confirmed, PINENTRY),
+        (Verdict::Confirmed, PINENTRY),
+        (Verdict::Confirmed, PINENTRY),
     ];
     assert_eq!(got, want);
 }
 
 #[test]
-fn the_sheet_names_each_kind_of_caller_briefly() {
-    let detached = Caller::Invoker {
-        exe: format!("/very/long/{}/tool", "x".repeat(80)).into(),
-        script: None,
-        hash: String::new(),
+fn the_sheet_fits_with_the_item_and_profile_first() {
+    let long = |exe: String, script: Option<String>| Caller::Invoker {
+        exe: exe.into(),
+        script: script.map(Into::into),
+        hash: "h".into(),
         relative: false,
-        at: At { detached: true, ..At::default() },
+        at: At::default(),
     };
-    let reason = |caller: &Caller| crate::worker::touch_reason("p", caller, "get \"x\"");
-    let shown = reason(&detached).unwrap();
-    assert!(
-        shown.starts_with("let /very/l…") && shown.contains("/tool (detached, possibly an AI agent) get"),
-        "{shown}"
+    let item = "i".repeat(80);
+    let what = format!(
+        "read the field \"{}\" of \"{}\"",
+        crate::worker::cut(&"f".repeat(40), 16),
+        crate::worker::cut(&item, 32)
     );
-    assert!(shown.chars().count() < 120, "{shown}");
-    assert_eq!(reason(&invoker()).unwrap(), format!("let {WHO} get \"x\" (dybw profile p)"));
-    // AI-class and unknown callers: the pinentry only (ruling).
-    assert_eq!((reason(&ai()), reason(&unknown())), (None, None));
-    assert_eq!(crate::worker::touch_name("a\"b"), "\"a\\\"b\"", "a name cannot close the quote");
+    let profile = "p".repeat(64);
+    for caller in [
+        long(format!("/opt/{}", "e".repeat(48)), None),
+        long("/usr/bin/python3".into(), Some(format!("/home/me/{}", "s".repeat(48)))),
+    ] {
+        let reason = crate::worker::touch_reason(&profile, &caller, &what).unwrap();
+        assert!(reason.chars().count() <= 120, "{reason}");
+        let essentials = format!("{what} (dybw profile {}…) for ", "p".repeat(19));
+        assert!(reason.starts_with(&essentials), "{reason}");
+        assert!(
+            reason.starts_with(&format!("read the field \"{}…\" of \"{}…\"", "f".repeat(15), "i".repeat(31))),
+            "{reason}"
+        );
+    }
+    let script = long("/usr/bin/python3".into(), Some("/opt/x/backup.py".into()));
+    assert_eq!(crate::worker::touch_reason("w", &script, "go").unwrap(), "go (dybw profile w) for python3 (backup.py)");
+    // A quote in a name cannot close the sheet's quote; no stable identity, no sheet.
+    assert_eq!(crate::worker::cut("a\"b\nc", 10), "a'b\u{fffd}c");
+    assert_eq!(
+        (crate::worker::touch_reason("p", &ai(), "x"), crate::worker::touch_reason("p", &unknown(), "x")),
+        (None, None)
+    );
 }

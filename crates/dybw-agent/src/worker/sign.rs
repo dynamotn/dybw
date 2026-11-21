@@ -107,10 +107,12 @@ pub(super) async fn confirm<H: Host>(
 /// The Touch ID reason: who signs what with which key, and for a login to which host. None (the pinentry, which says
 /// why) for a forwarded request, a failed session-bind, or a login to a host that is not verified.
 fn touch_reason(profile: &str, caller: &Caller, key: &Key, s: &SignContext, forwarded: bool) -> Option<String> {
-    let with = format!("with the SSH key {}", quoted(&key.name));
-    // The host key last: the sheet cuts the end, and the pinentry question has it whole.
+    let with = format!("with the SSH key \"{}\"", super::cut(&key.name, 16));
+    // At most 83 characters: the user, the start of the host key's fingerprint (the pinentry has it whole), the key.
     let what = match (&s.data, &s.bound) {
-        (Data::Login { user, bound: true }, Some(b)) => format!("log in as {} {with} to {}", quoted(user), host_key(b)),
+        (Data::Login { user, bound: true }, Some(b)) => {
+            format!("log in as \"{}\" to {} {with}", super::cut(user, 16), super::cut(&host_key(b), 15))
+        }
         (Data::Login { .. }, _) => return None,
         (Data::Other, _) => format!("sign data that is not an SSH login {with}"),
     };
@@ -200,7 +202,13 @@ mod tests {
         let host = PrivateKey::new(KeypairData::from(Ed25519Keypair::from_seed(&[7; 32])), "").unwrap();
         let fp = host.public_key().fingerprint(HashAlg::Sha256).to_string();
         let key = Key { id: "k1".into(), name: "work key".into(), fingerprint: "SHA256:x".into(), blob: vec![] };
-        let who = crate::agent::testing::invoker();
+        let who = Caller::Invoker {
+            exe: format!("/opt/{}", "s".repeat(48)).into(),
+            script: None,
+            hash: "h".into(),
+            relative: false,
+            at: crate::caller::At::default(),
+        };
         let bound = |forwarded| Some(Binding { host_key: host.public_key().clone(), forwarded });
         let login = |bound| Data::Login { user: "git".into(), bound };
         let ctx = |data, bound, bind_refused| SignContext {
@@ -211,23 +219,29 @@ mod tests {
             client: Programs::default(),
         };
         let reason = |s: &SignContext, forwarded| touch_reason("work", &who, &key, s, forwarded);
+        let prefix: String = fp.chars().take(14).collect();
         assert_eq!(
             reason(&ctx(login(true), bound(false), false), false).unwrap(),
             format!(
-                "let /usr/local/bin/mytool running /opt/scripts/backup.sh log in as \"git\" with the SSH key \"work key\" \
-                 to {fp} (dybw profile work)"
+                "log in as \"git\" to {prefix}… with the SSH key \"work key\" (dybw profile work) for sssssssssssssssssss…"
             )
         );
+        // A long user is cut; the host key's start and the profile always fit.
+        let long = Data::Login { user: "u".repeat(80), bound: true };
+        let cut = touch_reason("p".repeat(64).as_str(), &who, &key, &ctx(long, bound(false), false), false).unwrap();
+        assert!(cut.chars().count() <= 120, "{cut}");
+        assert!(cut.starts_with(&format!("log in as \"{}…\" to {prefix}…", "u".repeat(15))), "{cut}");
+        assert!(cut.contains(&format!("(dybw profile {}…)", "p".repeat(19))), "{cut}");
         let data = reason(&ctx(Data::Other, None, false), false).unwrap();
         assert!(data.contains("sign data that is not an SSH login with the SSH key \"work key\""), "{data}");
         assert_eq!(reason(&ctx(login(false), bound(false), false), false), None, "a host that is not verified");
         assert_eq!(reason(&ctx(login(true), None, false), false), None, "no binding: no host to name");
         assert_eq!(reason(&ctx(login(true), bound(true), false), true), None, "forwarded");
         assert_eq!(reason(&ctx(Data::Other, None, true), false), None, "a failed session-bind");
-        // AI-class and unknown callers: the pinentry only, which names them and the host in full (ruling).
+        // Callers without a stable identity: the pinentry only, which names them and the host in full (ruling).
         let ai = Caller::Ai { harness: "claude".into(), via: crate::caller::Via::Ancestry };
         let unknown = Caller::Unknown { why: "orphan".into(), peer: None };
-        for caller in [ai, unknown] {
+        for caller in [ai, unknown, crate::agent::testing::invoker()] {
             assert_eq!(touch_reason("work", &caller, &key, &ctx(login(true), bound(false), false), false), None);
         }
     }

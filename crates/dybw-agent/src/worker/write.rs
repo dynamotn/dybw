@@ -377,7 +377,7 @@ pub(super) async fn write<H: Host>(
     // A removal that takes an item from other tools says so in the pinentry only.
     let touch = planned.markers.is_empty().then(|| {
         let name = planned.found.as_ref().map_or(&planned.name, |f| &f.name);
-        super::touch_reason(&ctx.profile.name, caller, &format!("{} {}", write.op(), super::touch_name(name)))
+        super::touch_reason(&ctx.profile.name, caller, &format!("{} \"{}\"", write.op(), super::cut(name, 32)))
     });
     let (answer, via) = session::confirm(host, &question(ctx, caller, &write, &planned), touch.flatten(), false).await;
     let end = |verdict, e| {
