@@ -60,14 +60,17 @@ They land in `~/.cargo/bin` (`--root <dir>`: `<dir>/bin`) and must stay in one d
   with the GUI session's (so pinentry and Touch ID show for hotkeys and launchers without a terminal), install the
   service; on-demand start stays as the fallback, and a second agent finds the lock held and exits.
   - macOS: [`contrib/macos/org.dybw.agent.plist`](contrib/macos/org.dybw.agent.plist) (label `org.dybw.agent`).
-    Replace `@HOME@` with your home and `@TMPDIR@` with `getconf DARWIN_USER_TEMP_DIR`, copy it to
+    It is a template: `@HOME@` and `@TMPDIR@` must be substituted before launchd loads it (launchd expands no
+    variables), `@HOME@` with your home and `@TMPDIR@` with `getconf DARWIN_USER_TEMP_DIR`. Copy it to
     `~/Library/LaunchAgents/`, then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.dybw.agent.plist`.
     It logs to `~/Library/Logs/dybw-agent.log`.
   - Linux with systemd: [`contrib/systemd/dybw-agent.service`](contrib/systemd/dybw-agent.service), a user unit
     wanted by `graphical-session.target`: copy it to `~/.config/systemd/user/`, then
     `systemctl --user enable --now dybw-agent.service`. The compositor must import `WAYLAND_DISPLAY`, `DISPLAY`,
     `XAUTHORITY` and `DBUS_SESSION_BUS_ADDRESS` into the user manager first (`systemctl --user import-environment
-    ...`; niri-session and uwsm do it). It logs to the journal (`journalctl --user -u dybw-agent`).
+    ...`; niri-session and uwsm do it). Until `WAYLAND_DISPLAY` or `DISPLAY` is there the unit is skipped
+    (`ConditionEnvironment`, systemd 246+) rather than started without a display, and dybw starts the agent on
+    demand. It logs to the journal (`journalctl --user -u dybw-agent`).
   - Check that your shells reach that agent: `dybw agent stop` in a terminal must stop the service's process
     (`launchctl print gui/$(id -u)/org.dybw.agent`, `systemctl --user status dybw-agent`); a shell with another
     `TMPDIR` or `XDG_RUNTIME_DIR` would start an agent of its own.
