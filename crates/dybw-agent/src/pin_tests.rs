@@ -24,7 +24,7 @@ pub(crate) fn err(error: AgentError) -> Reply {
 }
 
 fn add() -> Op {
-    Op::UnlockAdd { profile: org(), protector: "pin".into() }
+    Op::UnlockAdd { profile: org(), protector: "pin".into(), any: false, watch: false }
 }
 
 fn unlock_op() -> Op {
@@ -274,7 +274,7 @@ async fn the_worker_refuses_a_caller_that_is_not_a_named_invoker() {
     let (_dir, rig) = enrolled().await;
     let w = rig.agent.running("org").unwrap();
     let still = crate::worker::Recheck::new(|| true);
-    let cmd = crate::worker::Cmd::UnlockAdd { protector: "pin".into(), caller: ai(), still };
+    let cmd = crate::worker::Cmd::UnlockAdd { protector: "pin".into(), any: false, watch: false, caller: ai(), still };
     assert_eq!(w.call(cmd, Instant::now()).await, err(AgentError::Denied));
     let cmd = crate::worker::Cmd::UnlockRemove { protector: "pin".into(), caller: ai() };
     assert_eq!(w.call(cmd, Instant::now()).await, err(AgentError::Denied));
@@ -284,7 +284,7 @@ async fn the_worker_refuses_a_caller_that_is_not_a_named_invoker() {
 #[tokio::test]
 async fn an_unknown_or_absent_protector_is_named() {
     let (_dir, rig) = world();
-    let nfc = Op::UnlockAdd { profile: org(), protector: "nfc".into() };
+    let nfc = Op::UnlockAdd { profile: org(), protector: "nfc".into(), any: false, watch: false };
     assert_eq!(rig.agent.dispatch(nfc).await, err(AgentError::NoSuchProtector("nfc".into())));
     let remove = Op::UnlockRemove { profile: org(), protector: "pin".into() };
     assert_eq!(rig.agent.dispatch(remove).await, err(AgentError::NoSuchProtector("pin".into())));
@@ -302,6 +302,8 @@ async fn enrolment_stops_at_a_cancelled_unlock_a_changed_caller_or_an_empty_fing
     let gone = crate::worker::Recheck::new(|| false);
     let cmd = crate::worker::Cmd::UnlockAdd {
         protector: "pin".into(),
+        any: false,
+        watch: false,
         caller: crate::agent::testing::invoker(),
         still: gone,
     };

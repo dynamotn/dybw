@@ -72,7 +72,8 @@ pub(super) async fn confirm<H: Host>(
             tracing::info!(profile = %ctx.profile.name, "not asking again for an SSH client refused {MAX_NOES} times");
             Verdict::Denied
         } else {
-            match session::confirm(host, &text(ctx, caller, key, sign, always), always).await {
+            let touch = touch_reason(&ctx.profile.name, caller, key, sign, forwarded);
+            match session::confirm(host, &text(ctx, caller, key, sign, always), touch, always).await {
                 // Wiped while the question was open without this task being aborted (a crashed command).
                 Ok(_) if locked() => return error(AgentError::Locked),
                 Ok(true) if always => {
@@ -98,6 +99,22 @@ pub(super) async fn confirm<H: Host>(
         Verdict::Failed => error(AgentError::Prompt),
         _ => Reply::Done,
     }
+}
+
+/// The Touch ID reason: who signs what with which key, and for a login to which host. None (the pinentry, which says
+/// why) for a forwarded request, a failed session-bind, or a login to a host that is not verified.
+fn touch_reason(profile: &str, caller: &Caller, key: &Key, s: &SignContext, forwarded: bool) -> Option<String> {
+    let with = format!("with the SSH key {}", quoted(&key.name));
+    // The host key last: the sheet cuts the end, and the pinentry question has it whole.
+    let what = match (&s.data, &s.bound) {
+        (Data::Login { user, bound: true }, Some(b)) => format!("log in as {} {with} to {}", quoted(user), host_key(b)),
+        (Data::Login { .. }, _) => return None,
+        (Data::Other, _) => format!("sign data that is not an SSH login {with}"),
+    };
+    if forwarded || s.bind_refused {
+        return None;
+    }
+    Some(super::touch_reason(profile, caller, &what))
 }
 
 /// The question: the profile, the client, what is signed (a login, and where to, or data that is not a login), the
@@ -163,4 +180,46 @@ pub(super) async fn unlock<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller
         declined.push(caller.clone());
     }
     reply
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod tests {
+    use ssh_key::private::{Ed25519Keypair, KeypairData};
+    use ssh_key::{HashAlg, PrivateKey};
+
+    use super::*;
+    use crate::caller::Programs;
+    use crate::ssh_agent::Binding;
+
+    #[test]
+    fn touch_id_names_a_verified_login_or_data_and_leaves_every_warning_to_the_pinentry() {
+        let host = PrivateKey::new(KeypairData::from(Ed25519Keypair::from_seed(&[7; 32])), "").unwrap();
+        let fp = host.public_key().fingerprint(HashAlg::Sha256).to_string();
+        let key = Key { id: "k1".into(), name: "work key".into(), fingerprint: "SHA256:x".into(), blob: vec![] };
+        let who = crate::agent::testing::invoker();
+        let bound = |forwarded| Some(Binding { host_key: host.public_key().clone(), forwarded });
+        let login = |bound| Data::Login { user: "git".into(), bound };
+        let ctx = |data, bound, bind_refused| SignContext {
+            profile: "work".into(),
+            data,
+            bound,
+            bind_refused,
+            client: Programs::default(),
+        };
+        let reason = |s: &SignContext, forwarded| touch_reason("work", &who, &key, s, forwarded);
+        assert_eq!(
+            reason(&ctx(login(true), bound(false), false), false).unwrap(),
+            format!(
+                "let /usr/local/bin/mytool running /opt/scripts/backup.sh log in as \"git\" with the SSH key \"work key\" \
+                 to {fp} (dybw profile work)"
+            )
+        );
+        let data = reason(&ctx(Data::Other, None, false), false).unwrap();
+        assert!(data.contains("sign data that is not an SSH login with the SSH key \"work key\""), "{data}");
+        assert_eq!(reason(&ctx(login(false), bound(false), false), false), None, "a host that is not verified");
+        assert_eq!(reason(&ctx(login(true), None, false), false), None, "no binding: no host to name");
+        assert_eq!(reason(&ctx(login(true), bound(true), false), true), None, "forwarded");
+        assert_eq!(reason(&ctx(Data::Other, None, true), false), None, "a failed session-bind");
+    }
 }

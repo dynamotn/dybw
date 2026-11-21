@@ -331,10 +331,17 @@ pub enum Op {
     /// The SSH agent's keys (profiles §8): names, fingerprints, types and profiles, no secret.
     SshList,
     /// Enrol a local unlock protector (ADR 0006) on this device: the agent asks for the master password, then for
-    /// the factor twice, in the pinentry: `pin` (a PIN), or `login` (the login password; Linux only).
+    /// the factor twice, in the pinentry: `pin` (a PIN), or `login` (the login password; Linux only); or, for
+    /// `biometric` (macOS), makes a Secure Enclave key that Touch ID opens.
     UnlockAdd {
         profile: Option<String>,
         protector: String,
+        /// `biometric`: any finger enrolled at the time of use opens it (`biometryAny`), not only today's.
+        #[serde(default)]
+        any: bool,
+        /// `biometric`: an Apple Watch (or, on macOS 15 and later, another paired device) opens it too.
+        #[serde(default)]
+        watch: bool,
     },
     /// Drop a local unlock protector of the profile.
     UnlockRemove {
@@ -575,7 +582,7 @@ pub enum AgentError {
     #[error("internal agent error")]
     Internal,
     /// `dybw unlock add/remove` named a protector this device does not offer, or the profile does not have.
-    #[error("no such protector: {0} (dybw offers pin, and login on Linux)")]
+    #[error("no such protector: {0} (dybw offers pin, login on Linux, and biometric on a Mac with a Secure Enclave)")]
     NoSuchProtector(String),
 }
 
@@ -982,7 +989,8 @@ mod tests {
             Op::Policy { profile: None, action: PolicyAction::Deny { invoker: s("/bin/sh"), script: None } },
             Op::Policy { profile: None, action: PolicyAction::Forget { invoker: s("/bin/sh") } },
             Op::SshList,
-            Op::UnlockAdd { profile: p(), protector: s("pin") },
+            Op::UnlockAdd { profile: p(), protector: s("pin"), any: false, watch: false },
+            Op::UnlockAdd { profile: None, protector: s("biometric"), any: true, watch: true },
             Op::UnlockRemove { profile: None, protector: s("pin") },
             Op::UnlockList { profile: p() },
             Op::StopAgent,

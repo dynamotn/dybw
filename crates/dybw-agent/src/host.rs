@@ -1,5 +1,6 @@
-//! What a profile worker needs from the machine: an HTTP client and the pinentry. The real host is the one in
-//! `dybw-native`; tests plug in a fake, so no test touches the network or a screen.
+//! What a profile worker needs from the machine: an HTTP client, the pinentry, and the Secure Enclave and Touch ID
+//! (macOS). The real host is the one in `dybw-native` and `dybw-peer`; tests plug in a fake, so no test touches the
+//! network, a screen or a sensor.
 
 use std::time::Duration;
 
@@ -7,6 +8,7 @@ use dybw_core::ports::{Http, PortError};
 use dybw_native::config::Trust;
 use dybw_native::ports::http::HttpPort;
 use dybw_native::prompter::{Confirm, PromptError, Prompter, SESSION_ENV};
+use dybw_peer::enclave::{self, Confirm as TouchId, Created, Policy, PublicKey, Wrapped};
 use zeroize::Zeroizing;
 
 /// How long the user has to answer one pinentry question.
@@ -33,18 +35,36 @@ pub trait Host: Send + 'static {
     fn hostname(&self) -> String;
     /// The machine fingerprint local unlock protectors are bound to (ADR 0006); `None` when it cannot be read.
     fn machine(&self) -> Option<String>;
+    /// Whether this machine has a Secure Enclave (the `biometric` protector).
+    fn enclave(&self) -> bool;
+    /// A new Secure Enclave key ([`enclave::create`]); asks nothing.
+    fn enclave_create(&self, policy: Policy, watch: bool) -> Result<Created, enclave::Error>;
+    /// The wrapping side ([`enclave::wrap`]); asks nothing.
+    fn enclave_wrap(&self, public: &PublicKey) -> Result<Wrapped, enclave::Error>;
+    /// The unwrapping side ([`enclave::derive`]): the Touch ID sheet says `reason`. The worker goes on meanwhile.
+    async fn enclave_derive(
+        &self,
+        handle: Vec<u8>,
+        ephemeral: PublicKey,
+        reason: String,
+    ) -> Result<Zeroizing<[u8; 32]>, enclave::Error>;
+    /// A yes or no by Touch ID ([`enclave::confirm`]); `Unavailable` too when confirmations by Touch ID are off
+    /// (`[agent] touch_id_confirm = false`).
+    async fn touch_id(&self, reason: String) -> TouchId;
 }
 
 /// The real host: `HttpPort` and a trusted pinentry. A pinentry that fails the trust rule is kept as text and
 /// reported when the first question is asked, so one profile's bad `pinentry` does not stop the agent.
 pub struct RealHost {
     prompter: Result<Prompter, String>,
+    /// Confirmations may use Touch ID (`[agent] touch_id_confirm`).
+    touch_id: bool,
 }
 
 impl RealHost {
-    pub fn new(trust: Trust, pinentry: &str) -> Self {
+    pub fn new(trust: Trust, pinentry: &str, touch_id: bool) -> Self {
         let prompter = Prompter::trusted(trust, pinentry, PROMPT_TIMEOUT, SESSION_ENV).map_err(|e| format!("{e:#}"));
-        RealHost { prompter }
+        RealHost { prompter, touch_id }
     }
 }
 
@@ -81,6 +101,38 @@ impl Host for RealHost {
     fn machine(&self) -> Option<String> {
         // Why it cannot be read is `dybw doctor`'s to say.
         dybw_peer::machine_id().ok()
+    }
+
+    fn enclave(&self) -> bool {
+        enclave::available()
+    }
+
+    fn enclave_create(&self, policy: Policy, watch: bool) -> Result<Created, enclave::Error> {
+        enclave::create(policy, watch)
+    }
+
+    fn enclave_wrap(&self, public: &PublicKey) -> Result<Wrapped, enclave::Error> {
+        enclave::wrap(public)
+    }
+
+    async fn enclave_derive(
+        &self,
+        handle: Vec<u8>,
+        ephemeral: PublicKey,
+        reason: String,
+    ) -> Result<Zeroizing<[u8; 32]>, enclave::Error> {
+        // The sheet blocks its thread for up to 60 s: off the worker's, so a lock is still served. A lock that
+        // cancels this leaves the sheet up until it ends, and its answer is dropped.
+        let derived = tokio::task::spawn_blocking(move || enclave::derive(&handle, &ephemeral, &reason)).await;
+        derived.unwrap_or(Err(enclave::Error::Unavailable))
+    }
+
+    async fn touch_id(&self, reason: String) -> TouchId {
+        if self.touch_id {
+            tokio::task::spawn_blocking(move || enclave::confirm(&reason)).await.unwrap_or(TouchId::Unavailable)
+        } else {
+            TouchId::Unavailable
+        }
     }
 }
 
@@ -168,6 +220,19 @@ pub(crate) mod fake {
         pub folder_reply: Option<u16>,
         /// The machine fingerprint; `None` cannot be read.
         pub machine: Option<String>,
+        /// The Mac has a Secure Enclave.
+        pub enclave: bool,
+        /// What creating a Secure Enclave key answers instead of a key.
+        pub enclave_fails: Option<enclave::Error>,
+        /// What the user does at each Touch ID sheet, an unlock's or a confirmation's: `Ok` is a match. None left:
+        /// Touch ID is unavailable.
+        pub touches: VecDeque<Result<(), enclave::Error>>,
+        /// The sheet never ends.
+        pub touch_hangs: bool,
+        /// The reason of every Touch ID sheet.
+        pub reasons: Vec<String>,
+        /// The access control of every Secure Enclave key made: `biometryAny`, and an Apple Watch.
+        pub created: Vec<(bool, bool)>,
     }
 
     impl World {
@@ -242,6 +307,12 @@ pub(crate) mod fake {
                 sync_fails_after_write: false,
                 folder_reply: None,
                 machine: Some("fake-machine".into()),
+                enclave: true,
+                enclave_fails: None,
+                touches: VecDeque::new(),
+                touch_hangs: false,
+                reasons: Vec::new(),
+                created: Vec::new(),
             })))
         }
 
@@ -261,6 +332,19 @@ pub(crate) mod fake {
         /// The user says yes and ticks "always" (which only counts when it was offered).
         pub fn allow_always(&self) {
             self.world().confirms.push_back(Answer::Always);
+        }
+
+        /// One Touch ID sheet: shows `reason`, then answers the next scripted touch.
+        async fn touch(&self, reason: String) -> Result<(), enclave::Error> {
+            let (touch, hangs) = {
+                let mut w = self.world();
+                w.reasons.push(reason);
+                (w.touches.pop_front().unwrap_or(Err(enclave::Error::Unavailable)), w.touch_hangs)
+            };
+            if hangs {
+                std::future::pending::<()>().await;
+            }
+            touch
         }
 
         /// The `ciphers` and `folders` of `/sync`, from a `{ciphers, folders}` JSON text.
@@ -422,7 +506,46 @@ pub(crate) mod fake {
         fn machine(&self) -> Option<String> {
             self.0.lock().unwrap().machine.clone()
         }
+
+        fn enclave(&self) -> bool {
+            self.world().enclave
+        }
+
+        /// The fake enclave holds one key, whose handle is [`HANDLE`].
+        fn enclave_create(&self, policy: Policy, watch: bool) -> Result<Created, enclave::Error> {
+            let mut w = self.world();
+            w.created.push((policy == Policy::Any, watch));
+            w.enclave_fails.map_or(Ok(Created { handle: HANDLE.to_vec(), public: [4; 65] }), Err)
+        }
+
+        fn enclave_wrap(&self, public: &PublicKey) -> Result<Wrapped, enclave::Error> {
+            Ok(Wrapped { ephemeral: *public, secret: Zeroizing::new(SECRET) })
+        }
+
+        /// A match gives the wrapped secret back for the fake key; another handle is not this Mac's key.
+        async fn enclave_derive(
+            &self,
+            handle: Vec<u8>,
+            _ephemeral: PublicKey,
+            reason: String,
+        ) -> Result<Zeroizing<[u8; 32]>, enclave::Error> {
+            self.touch(reason).await?;
+            if handle == HANDLE { Ok(Zeroizing::new(SECRET)) } else { Err(enclave::Error::Invalidated) }
+        }
+
+        async fn touch_id(&self, reason: String) -> TouchId {
+            match self.touch(reason).await {
+                Ok(()) => TouchId::Allowed,
+                Err(enclave::Error::Failed) => TouchId::Denied,
+                Err(enclave::Error::Cancelled) => TouchId::Cancelled,
+                Err(_) => TouchId::Unavailable,
+            }
+        }
     }
+
+    /// The fake enclave key's handle, and the secret it wraps.
+    pub const HANDLE: &[u8] = b"fake enclave key";
+    const SECRET: [u8; 32] = [0x5e; 32];
 }
 
 #[cfg(test)]
@@ -440,7 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_real_host_builds_a_client_names_the_machine_and_refuses_an_untrusted_pinentry() {
-        let host = RealHost::new(trust(), "/nonexistent/pinentry");
+        let host = RealHost::new(trust(), "/nonexistent/pinentry", false);
         assert!(host.http().is_ok());
         assert!(!host.hostname().is_empty() && !host.hostname().chars().any(char::is_control));
         assert!(host.machine().is_some_and(|m| !m.is_empty()));
@@ -451,10 +574,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_real_host_reaches_the_enclave_and_touch_id_confirmations_can_be_off() {
+        let off = RealHost::new(trust(), "/nonexistent/pinentry", false);
+        assert_eq!(off.touch_id("x".into()).await, TouchId::Unavailable, "off: no sheet");
+        // Garbage is refused without a sheet; a key is made where an enclave can make one, held by its handle only.
+        assert!(off.enclave_derive(b"not a handle".to_vec(), [0x5a; 65], "test".into()).await.is_err());
+        assert!(off.enclave_wrap(&[0x5a; 65]).is_err());
+        let here = off.enclave();
+        let created = off.enclave_create(Policy::CurrentSet, false);
+        assert!(created.is_ok() || !here || std::env::var_os("DYBW_NO_ENCLAVE_TESTS").is_some(), "{created:?}");
+        // On a Mac this would show the sheet.
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(RealHost::new(trust(), "/x", true).touch_id("x".into()).await, TouchId::Unavailable);
+    }
+
+    #[tokio::test]
     async fn the_real_host_runs_a_trusted_pinentry() {
         let false = crate::skipped_as_root(crate::ROOT_BYPASSES) else { return };
         // `true` is not a pinentry: it says nothing, which is a protocol error, and that proves it was run.
-        let host = RealHost::new(trust(), "/usr/bin/true");
+        let host = RealHost::new(trust(), "/usr/bin/true", false);
         let e = host.password("p", "x", None).await.err().unwrap();
         assert!(!matches!(e, PromptError::Untrusted(_)), "{e}");
         let e = host.confirm("x", false).await.err().unwrap();

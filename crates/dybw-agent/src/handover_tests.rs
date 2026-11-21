@@ -43,7 +43,7 @@ impl Keyring for Ring {
 }
 
 fn add() -> Op {
-    Op::UnlockAdd { profile: org(), protector: "login".into() }
+    Op::UnlockAdd { profile: org(), protector: "login".into(), any: false, watch: false }
 }
 
 fn blob(dir: &TempDir) -> PathBuf {
@@ -300,7 +300,7 @@ async fn an_ai_caller_cannot_enrol_or_remove_it() {
     assert_eq!(audited(&rig)[1..], [("unlock-add", Verdict::Denied), ("unlock-remove", Verdict::Denied)]);
     // Through the worker itself.
     let still = crate::worker::Recheck::new(|| true);
-    let cmd = Cmd::UnlockAdd { protector: "login".into(), caller: ai(), still };
+    let cmd = Cmd::UnlockAdd { protector: "login".into(), any: false, watch: false, caller: ai(), still };
     assert_eq!(rig.agent.on_profile(org().as_deref(), cmd).await, err(AgentError::Denied));
 }
 
@@ -424,7 +424,7 @@ fn the_real_keyring_answers_none_for_an_absent_or_unreadable_entry() {
 #[tokio::test]
 async fn a_pin_and_a_login_protector_live_side_by_side() {
     const PIN: &str = "246813";
-    let pin_add = || Op::UnlockAdd { profile: org(), protector: "pin".into() };
+    let pin_add = || Op::UnlockAdd { profile: org(), protector: "pin".into(), any: false, watch: false };
     let remove = |p: &str| Op::UnlockRemove { profile: org(), protector: p.into() };
     let info = |name: &str, left| ProtectorInfo { name: name.into(), attempts_left: left };
     let (dir, rig) = world();

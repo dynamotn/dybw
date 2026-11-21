@@ -18,14 +18,15 @@ trashes logins; the rbw shim and the SSH and git integrations come in later phas
 | Command | What |
 |---------|------|
 | `dybw login` | Store the profile's API key (client id and secret, asked through pinentry) |
-| `dybw unlock` | Unlock: the PIN first when one is set (cancel it to type the master password), else the master password |
+| `dybw unlock` | Unlock: Touch ID first when a `biometric` protector is set, then the PIN when one is set (cancel either to go on), else the master password |
 | `dybw unlock add pin` | Set a PIN for this profile on this device: the master password, then the PIN twice (at least 6 characters), in the agent's pinentry. The PIN lives in the agent's memory only: `dybw lock` and the idle lock keep it; `dybw agent stop`, `dybw login`, `rbw purge`, a user-key rotation and 5 wrong PINs drop it. Refused to AI-class and unnamed callers. A PIN unlocks only: an item that asks for the master password again (reprompt) still needs the master password |
 | `dybw unlock add login` | Linux, with `pam_bwss` (bwss) in the PAM stack: the master password, then your login password twice (not checked against the system: type it exactly). The key is wrapped by Argon2id over it and kept in `~/.local/state/dybw/profiles/<p>/unlock/login` (0600), bound to this device. Logging in or unlocking the screen then unlocks the profile without a question: the agent takes the password `pam_bwss` puts in your kernel keyring (polled every second while a profile has this protector) and invalidates it at once. A password change re-wraps it; the old wrap stays until a login with the new password. A login password that opens neither the protector nor a pending re-wrap (a reset by root, say) deletes it, and so do another machine, a rotation, `dybw login` and `rbw purge`: the next unlock asks for the PIN or the master password, and enrolling again needs the master password. Without a TPM2, someone who takes the disk can guess the login password offline. When your last logind session closes, every profile locks |
-| `dybw unlock remove pin\|login` | Drop the protector. Refused to AI-class and unnamed callers |
-| `dybw unlock list` | `profile`, protector, wrong tries left (`-` for an AI-class caller, which gets names only, and for `login`, which has no limit); no agent running means the `login` protector only |
+| `dybw unlock add biometric [--any] [--watch]` | macOS, on a Mac with a Secure Enclave: the master password, then a P-256 key is made in the Secure Enclave (no Touch ID at enrolment). The user key is wrapped to it and kept in `~/.local/state/dybw/profiles/<p>/unlock/biometric` (0600) with the key's handle, bound to this device and usable only by this Mac's Secure Enclave. Every unlock then shows a Touch ID sheet naming the profile ("Unlock dybw profile <p>"). A cancel, no sensor (lid closed), a lockout or another error goes on to the PIN or the master password and keeps it. Adding or removing a finger makes the key unusable: the next unlock deletes the protector and asks for the master password, unless `--any` (any finger enrolled at the time, weaker). `--watch` lets an Apple Watch (on macOS 15 and later, another paired device too) open it. Another machine, a rotation, `dybw login` and `rbw purge` delete it; enrolling again needs the master password. Refused to AI-class and unnamed callers, and an AI-class caller never raises the sheet |
+| `dybw unlock remove pin\|login\|biometric` | Drop the protector. Refused to AI-class and unnamed callers |
+| `dybw unlock list` | `profile`, protector, wrong tries left (`-` for an AI-class caller, which gets names only, and for `login`, or `biometric`, which have no limit); no agent running means the `login` and `biometric` protectors only |
 | `dybw unlocked` | Exit 0 when unlocked, 1 when not; never unlocks |
 | `dybw lock [--all]` | Lock now |
-| `dybw status` | `profile`, logged in, locked or unlocked, last sync (unix seconds), local unlock protectors (`pin`, `login`, comma-separated, or `-`); never unlocks |
+| `dybw status` | `profile`, logged in, locked or unlocked, last sync (unix seconds), local unlock protectors (`pin`, `login`, `biometric`, comma-separated, or `-`); never unlocks |
 | `dybw sync [--all]` | Fetch the vault now |
 | `dybw list`, `dybw search <term>` | Names, or `--fields id,name,user,folder,type`, `--folder`, `--raw` (list only, JSON) |
 | `dybw get <item> [user]` | The main value; `-f <field>`, `--full`, `--raw`, `-l` (`--list-fields`), `--folder`, `-i`, `-c` (copy instead of print) |
@@ -38,7 +39,7 @@ trashes logins; the rbw shim and the SSH and git integrations come in later phas
 | `dybw generate <len> <name> [user]` | The agent makes the password and saves it as a new login (`--uri`, `--folder`); nothing is printed |
 | `dybw policy show\|allow\|deny\|forget` | Show or change which programs may read values (changes are confirmed in pinentry) |
 | `dybw audit [--ai] [-n N]` | The latest N audit lines (default 50) as tab-separated columns; `--ai` keeps AI-class callers. Read straight from the file, no agent needed |
-| `dybw doctor` | Check the socket directory, the agent (reachable, same version), config, pinentry, the machine fingerprint a PIN is bound to, on Linux the `login` protector (the user keyring readable, the last handover), `policy.json` and `audit.log`; exit 0 when all pass, 1 otherwise. Under an AI harness it also warns that the harness sandbox must not reach the agent |
+| `dybw doctor` | Check the socket directory, the agent (reachable, same version), config, pinentry, the machine fingerprint a PIN is bound to, on Linux the `login` protector (the user keyring readable, the last handover), on macOS the Secure Enclave, the `biometric` protector and whether confirmations use Touch ID, `policy.json` and `audit.log`; exit 0 when all pass, 1 otherwise. Under an AI harness it also warns that the harness sandbox must not reach the agent |
 | `dybw agent stop` | Stop the agent (locks every profile) |
 | `dybw gen-completions <shell>` | Print the completion script for `bash`, `zsh`, `fish`, `elvish` or `powershell` (no agent needed). `rbw gen-completions <shell>` prints the shim's, as rbw |
 
@@ -119,6 +120,14 @@ only says "see the agent log" is explained there.
   are decrypted; a reprompt item's field names still need the master password, so an AI-class caller gets none). An AI-class caller also cannot stop
   the agent, unlock, log in or use `dybw policy` (even `show`), and never raises a master-password prompt: a locked
   profile answers "locked" to its `list` and `search`.
+- On a Mac with Touch ID, a question with a yes or a no only (a write, a value read that is asked every time, an SSH
+  signature with no "always") shows the Touch ID sheet instead of the pinentry, naming who asks, what and which item
+  (cut at 120 characters; the pinentry has the whole question). A finger that does not match is a no; a cancel, no
+  sensor or the lid closed puts the same question in the pinentry. A question that offers "always", a change of the
+  policy, `rbw purge`, a removal of a marked item, a forwarded SSH request, a failed session-bind and a login to a
+  host that is not verified stay in the pinentry, which says more. `[agent] touch_id_confirm = false` in
+  `config.toml` turns Touch ID confirmations off (the pinentry asks instead; it grants nothing, so a synced file may
+  hold it).
 - Grants are a convenience for honest programs, not a boundary: code running as you can defeat them (a script's
   argv is its own memory, the environment can be injected, `policy.json` can be edited). The boundary is the harness
   sandbox, which must not reach the agent's socket or state directories, and the out-of-band pinentry confirmation.

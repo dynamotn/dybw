@@ -228,7 +228,11 @@ fn every_command_maps_to_its_op() {
     let cases: Vec<(Vec<&str>, Reply, Op)> = vec![
         (vec!["login"], Reply::Done, Op::Login { profile: Some(s("p")) }),
         (vec!["unlock"], Reply::Done, Op::Unlock { profile: Some(s("p")) }),
-        (vec!["unlock", "add", "pin"], Reply::Done, Op::UnlockAdd { profile: Some(s("p")), protector: s("pin") }),
+        (
+            vec!["unlock", "add", "pin"],
+            Reply::Done,
+            Op::UnlockAdd { profile: Some(s("p")), protector: s("pin"), any: false, watch: false },
+        ),
         (vec!["unlock", "remove", "pin"], Reply::Done, Op::UnlockRemove { profile: Some(s("p")), protector: s("pin") }),
         (vec!["lock", "--all"], Reply::Done, Op::Lock { target: Target::All }),
         (vec!["lock"], Reply::Done, Op::Lock { target: Target::Profile(s("p")) }),
@@ -1121,19 +1125,66 @@ fn unlock_list_prints_each_protector_and_needs_no_agent() {
 fn an_unknown_protector_is_named_in_the_error() {
     let (r, _) = one(&["unlock", "add", "nfc"], Reply::Error { error: AgentError::NoSuchProtector(s("nfc")) });
     assert_eq!(r.0, 1);
-    assert!(r.2.contains("no such protector: nfc (dybw offers pin, and login on Linux)"), "{}", r.2);
+    assert!(r.2.contains("no such protector: nfc (dybw offers pin, login on Linux, and biometric on a Mac"), "{}", r.2);
 }
 
 #[test]
 fn enrolling_the_login_protector_warns_about_a_stolen_disk() {
     let (r, op) = one(&["unlock", "add", "login"], Reply::Done);
-    assert_eq!(op, Op::UnlockAdd { profile: None, protector: s("login") });
+    assert_eq!(op, Op::UnlockAdd { profile: None, protector: s("login"), any: false, watch: false });
     assert_eq!((r.0, r.1.as_str()), (0, ""));
     assert!(r.2.contains("Without a TPM2, someone who takes this disk can guess that password offline"), "{}", r.2);
     let (r, _) = one(&["unlock", "add", "pin"], Reply::Done);
     assert_eq!(r, (0, s(""), s("")));
     let (r, _) = one(&["unlock", "add", "login"], Reply::Error { error: AgentError::Denied });
     assert!(r.0 == 1 && !r.2.contains("TPM2"), "{}", r.2);
+}
+
+#[test]
+fn enrolling_touch_id_takes_its_options_which_no_other_protector_has() {
+    let (r, op) = one(&["unlock", "add", "biometric", "--any", "--watch"], Reply::Done);
+    assert_eq!(r, (0, s(""), s("")));
+    assert_eq!(op, Op::UnlockAdd { profile: None, protector: s("biometric"), any: true, watch: true });
+    let (_, op) = one(&["unlock", "add", "biometric"], Reply::Done);
+    assert_eq!(op, Op::UnlockAdd { profile: None, protector: s("biometric"), any: false, watch: false });
+    for args in [["unlock", "add", "pin", "--any"], ["unlock", "add", "login", "--watch"]] {
+        let env = env_in(base().path(), None, None);
+        let (code, out, err) = run_in(&env, &args);
+        assert!(code == 1 && out.is_empty() && err.contains("options of the biometric protector only"), "{err}");
+    }
+}
+
+#[test]
+fn unlock_list_without_an_agent_shows_the_biometric_protector_on_disk() {
+    let base = base();
+    write_config(base.path());
+    let dir = login_blob(base.path()).parent().unwrap().to_owned();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("biometric"), "{}").unwrap();
+    std::fs::write(dir.join("login"), "{}").unwrap();
+    let listed = run_in(&env_in(base.path(), None, None), &["unlock", "list"]);
+    assert_eq!(listed, (0, s("work\tlogin\t-\nwork\tbiometric\t-\n"), s("")));
+}
+
+#[test]
+fn doctor_reports_the_secure_enclave_the_biometric_protector_and_touch_id_confirmations() {
+    let base = base();
+    let file = base.path().join("biometric");
+    let doctor = |enclave, touch| {
+        let mut out = vec![];
+        let mut r = crate::doctor::Report { out: &mut out, failed: false };
+        crate::doctor::biometric_unlock(&file, enclave, touch, &mut r).unwrap();
+        assert!(!r.failed);
+        String::from_utf8(out).unwrap()
+    };
+    let none = doctor(false, true);
+    assert!(none.contains("no Secure Enclave") && !none.contains("confirmations"), "{none}");
+    let on = doctor(true, true);
+    assert!(on.contains("none; `dybw unlock add biometric`") && on.contains("Touch ID where available"), "{on}");
+    std::fs::write(&file, "{}").unwrap();
+    let off = doctor(true, false);
+    assert!(off.contains("bound to this device and its Secure Enclave"), "{off}");
+    assert!(off.contains("confirmations: the pinentry (`[agent] touch_id_confirm = false`)"), "{off}");
 }
 
 /// The `login` protector's file of profile `work` under `base`.

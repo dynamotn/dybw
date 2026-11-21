@@ -54,6 +54,7 @@ impl Config {
             config.profile(Some(&name))?;
         }
         config.ssh_agent_profiles()?;
+        config.touch_id_confirm()?;
         Ok(config)
     }
 
@@ -80,6 +81,20 @@ impl Config {
             self.profile(Some(name)).context("in [ssh_agent] profiles")?;
         }
         Ok(names)
+    }
+
+    /// `[agent] touch_id_confirm` (ADR 0006): whether the agent's yes-or-no confirmations use Touch ID where a Mac has
+    /// it; on by default. Off, they use the pinentry, as where Touch ID is unavailable: the same question, never a
+    /// grant, so a synced file may hold it. The agent owns the table, so it is checked strictly.
+    pub fn touch_id_confirm(&self) -> anyhow::Result<bool> {
+        let shown = &self.shown;
+        let Some(table) = self.doc.get("agent") else { return Ok(true) };
+        let table = table.as_table().with_context(|| format!("`agent` in {shown} must be a table"))?;
+        if let Some(key) = table.keys().find(|k| *k != "touch_id_confirm") {
+            bail!("unknown key `{key}` in [agent] in {shown}");
+        }
+        let Some(value) = table.get("touch_id_confirm") else { return Ok(true) };
+        value.as_bool().with_context(|| format!("`touch_id_confirm` in [agent] in {shown} must be true or false"))
     }
 
     /// The profile `name`, else the file's `default`. The file is validated as a whole, and the profile strictly;
@@ -190,6 +205,24 @@ mod tests {
         );
         let bare = config("default = \"a\"\n[profiles.a]\nserver_url = \"u\"\nemail = \"e\"\n").profile(None).unwrap();
         assert_eq!((bare.auth, bare.lock_timeout), (Auth::ApiKey, Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn touch_id_confirmations_are_on_unless_the_agent_table_turns_them_off() {
+        assert!(config(TWO).touch_id_confirm().unwrap());
+        assert!(config(&format!("{TWO}[agent]\n")).touch_id_confirm().unwrap());
+        assert!(!config(&format!("{TWO}[agent]\ntouch_id_confirm = false\n")).touch_id_confirm().unwrap());
+        assert!(config(&format!("{TWO}[agent]\ntouch_id_confirm = true\n")).touch_id_confirm().unwrap());
+        let e = |text: &str| format!("{:#}", config(text).touch_id_confirm().unwrap_err());
+        assert!(e(&format!("agent = 1\n{TWO}")).contains("`agent` in config.toml must be a table"));
+        assert!(e(&format!("{TWO}[agent]\ntouch_id = false\n")).contains("unknown key `touch_id` in [agent]"));
+        assert!(e(&format!("{TWO}[agent]\ntouch_id_confirm = \"no\"\n")).contains("must be true or false"));
+        // The profile still resolves: the table is the agent's, not the registry's.
+        assert_eq!(config(&format!("{TWO}[agent]\ntouch_id_confirm = false\n")).profile(None).unwrap().name, "work");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("{TWO}[agent]\ntouch_id_confirm = 1\n")).unwrap();
+        assert!(Config::load(&path).is_err(), "checked at load");
     }
 
     #[test]

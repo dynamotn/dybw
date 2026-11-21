@@ -40,8 +40,9 @@ struct Cli {
 enum Cmd {
     /// Store the API key of the profile.
     Login,
-    /// Unlock the vault (asks for the PIN when one is set, else the master password; with a `login` protector, logging
-    /// in or unlocking the screen unlocks it); `add`, `remove` and `list` manage the local unlock protectors.
+    /// Unlock the vault (Touch ID, then the PIN, when they are set, else the master password; with a `login`
+    /// protector, logging in or unlocking the screen unlocks it); `add`, `remove` and `list` manage the local unlock
+    /// protectors.
     Unlock {
         #[command(subcommand)]
         command: Option<UnlockCmd>,
@@ -213,11 +214,21 @@ enum UnlockCmd {
     /// Enrol a protector: `pin` (asks for the master password, then the PIN twice, in the pinentry). The PIN stays in
     /// the agent's memory: it survives `dybw lock` and the idle lock, not `dybw agent stop`; five wrong PINs drop it.
     /// `login` (Linux, with `pam_bwss`): the master password, then your login password twice; kept on disk, bound to
-    /// this device, it unlocks the profile when you log in or unlock the screen.
-    Add { protector: String },
+    /// this device, it unlocks the profile when you log in or unlock the screen. `biometric` (a Mac with a Secure
+    /// Enclave): the master password, then a key in the Secure Enclave that Touch ID opens at every unlock; adding or
+    /// removing a finger drops it unless `--any`.
+    Add {
+        protector: String,
+        /// `biometric`: any finger enrolled at the time of use opens it, so a finger added later does too (weaker).
+        #[arg(long)]
+        any: bool,
+        /// `biometric`: an Apple Watch opens it too (on macOS 15 and later, also another paired device).
+        #[arg(long)]
+        watch: bool,
+    },
     /// Drop a protector.
     Remove { protector: String },
-    /// The profile's protectors and the wrong attempts each has left (no agent running: the `login` one only).
+    /// The profile's protectors and the wrong attempts each has left (no agent running: the ones on disk only).
     List,
 }
 
@@ -385,9 +396,12 @@ fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, er
     match cmd {
         Cmd::Login => done(ask_started(env, Op::Login { profile })?),
         Cmd::Unlock { command: None } => done(ask_started(env, Op::Unlock { profile })?),
-        Cmd::Unlock { command: Some(UnlockCmd::Add { protector }) } => {
+        Cmd::Unlock { command: Some(UnlockCmd::Add { protector, any, watch }) } => {
+            if (any || watch) && protector != "biometric" {
+                return Err(Fail::Log("--any and --watch are options of the biometric protector only".into()));
+            }
             let login = protector == "login";
-            let code = done(ask_started(env, Op::UnlockAdd { profile, protector })?)?;
+            let code = done(ask_started(env, Op::UnlockAdd { profile, protector, any, watch })?)?;
             if login {
                 writeln!(err, "{LOGIN_WARNING}")?;
             }
@@ -396,13 +410,13 @@ fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, er
         Cmd::Unlock { command: Some(UnlockCmd::Remove { protector }) } => {
             done(ask_started(env, Op::UnlockRemove { profile, protector })?)
         }
-        // A PIN lives in the agent: with none running only the `login` protector on disk is listed, and no agent is
-        // started for it.
+        // A PIN lives in the agent: with none running only the protectors on disk are listed, and no agent is started
+        // for them.
         Cmd::Unlock { command: Some(UnlockCmd::List) } => {
             match ask(env, Op::UnlockList { profile: profile.clone() }, false)? {
                 None => {
-                    if let Some(name) = login_on_disk(env, profile.as_deref()) {
-                        writeln!(out, "{}\tlogin\t-", escape(&name))?;
+                    for (name, protector) in on_disk(env, profile.as_deref()) {
+                        writeln!(out, "{}\t{protector}\t-", escape(&name))?;
                     }
                     Ok(0)
                 }
@@ -695,11 +709,13 @@ fn target(env: &Env, profile: Option<String>, all: bool, autostart: bool) -> Res
 const LOGIN_WARNING: &str = "dybw: the login protector is kept on this disk, wrapped by your login password. Without a \
     TPM2, someone who takes this disk can guess that password offline; a long login password slows them down.";
 
-/// The profile, when it has a `login` protector on this device.
-fn login_on_disk(env: &Env, profile: Option<&str>) -> Option<String> {
-    let home = env.home.as_ref()?;
-    let p = dybw_agent::config::Config::load(&dybw_agent::paths::config_path(home)).ok()?.profile(profile).ok()?;
-    dybw_agent::paths::ProfilePaths::with(home, &p).unlock.join("login").exists().then_some(p.name)
+/// The profile and each protector it has on this device's disk (`login`, `biometric`).
+fn on_disk(env: &Env, profile: Option<&str>) -> Vec<(String, &'static str)> {
+    let Some(home) = env.home.as_ref() else { return Vec::new() };
+    let config = dybw_agent::config::Config::load(&dybw_agent::paths::config_path(home));
+    let Some(p) = config.ok().and_then(|c| c.profile(profile).ok()) else { return Vec::new() };
+    let dir = dybw_agent::paths::ProfilePaths::with(home, &p).unlock;
+    ["login", "biometric"].into_iter().filter(|f| dir.join(f).exists()).map(|f| (p.name.clone(), f)).collect()
 }
 
 fn done(reply: Reply) -> Result<u8, Fail> {

@@ -5,7 +5,7 @@
 //!
 //! Enrolment needs the master password, typed on this device (ADR 0006); `config.toml` cannot add a protector. The
 //! enrolment, removal and listing here serve every protector this build offers ([`offered`]): the `login` one is
-//! kept on disk ([`super::login`]). An unlock tries the PIN first: a cancel goes on to the master password, a wrong
+//! kept on disk ([`super::login`]), and so is the `biometric` one ([`super::biometric`]). An unlock tries the PIN first: a cancel goes on to the master password, a wrong
 //! PIN is counted, and every other failure drops the blob, is logged and audited, and goes on to the master password.
 
 use dybw_core::crypto::{KdfParams, SymmetricKey};
@@ -17,7 +17,7 @@ use dybw_native::ports::random::OsRandom;
 use dybw_proto::{AgentError, ProtectorInfo, Reply};
 use zeroize::Zeroizing;
 
-use super::{Recheck, Shared, error, login, open as open_profile, with_vault};
+use super::{Recheck, Shared, biometric, error, login, open as open_profile, with_vault};
 use crate::caller::Caller;
 use crate::device::device_id_for;
 use crate::host::Host;
@@ -38,12 +38,15 @@ pub(crate) const MIN_PIN: usize = 6;
 /// How often the new secret may be mistyped at enrolment before it gives up.
 const TRIES: usize = 3;
 
-/// The protector `name` names, when this build offers it: `pin` everywhere, `login` on Linux only (`pam_bwss`).
+/// The protector `name` names, when this build offers it: `pin` everywhere, `login` on Linux only (`pam_bwss`),
+/// `biometric` on macOS only (the Secure Enclave).
 pub(crate) fn offered(name: &str) -> Option<Protector> {
     match name {
         PIN => Some(Protector::Pin),
         #[cfg(any(target_os = "linux", test))]
         login::LOGIN => Some(Protector::Login),
+        #[cfg(any(target_os = "macos", test))]
+        biometric::BIOMETRIC => Some(Protector::Biometric),
         _ => None,
     }
 }
@@ -79,12 +82,15 @@ pub(super) fn binding<H: Host>(host: &H, ctx: &Ctx) -> Option<(String, String)> 
 }
 
 /// The profile's protectors: names and attempts left (none with `names_only`, and none for `login`, which has no
-/// limit: the system checked its password before `pam_bwss` handed it over), never a secret.
+/// limit: the system checked its password before `pam_bwss` handed it over, nor for `biometric`, whose tries Touch ID
+/// counts), never a secret.
 pub(super) fn infos(shared: &Shared, ctx: &Ctx, names_only: bool) -> Vec<ProtectorInfo> {
     let left = |b: &ProtectorBlob| (!names_only).then(|| MAX_ATTEMPTS.saturating_sub(b.attempts()));
     let pin = shared.state.borrow().pin.as_ref().map(|b| ProtectorInfo { name: PIN.into(), attempts_left: left(b) });
     let login = login::enrolled(ctx).then(|| ProtectorInfo { name: login::LOGIN.into(), attempts_left: None });
-    pin.into_iter().chain(login).collect()
+    let touch =
+        biometric::enrolled(ctx).then(|| ProtectorInfo { name: biometric::BIOMETRIC.into(), attempts_left: None });
+    pin.into_iter().chain(login).chain(touch).collect()
 }
 
 /// `dybw unlock list`.
@@ -102,6 +108,7 @@ pub(super) fn remove(shared: &Shared, ctx: &Ctx, caller: &Caller, name: &str) ->
     }
     let removed = match kind {
         Some(Protector::Pin) => shared.state.borrow_mut().pin.take().is_some(),
+        Some(Protector::Biometric) => biometric::delete(ctx),
         Some(_) => login::delete(ctx),
         None => false,
     };
@@ -124,6 +131,7 @@ pub(super) fn drop_pin(shared: &Shared, ctx: &Ctx, caller: &Caller, why: &str) {
 pub(super) fn drop_all(shared: &Shared, ctx: &Ctx, caller: &Caller, why: &str) {
     drop_pin(shared, ctx, caller, why);
     login::drop_login(ctx, caller, why);
+    biometric::drop_biometric(ctx, caller, why);
 }
 
 /// The caller of what the agent does on its own (a sync's rotation check, a login password handed over): its own
@@ -165,8 +173,9 @@ async fn new_secret<H: Host>(host: &H, ctx: &Ctx, kind: Protector) -> Result<Zer
 }
 
 /// `dybw unlock add <protector>`: unlock with the master password when locked, else ask for it (enrolment needs it,
-/// ADR 0006), then the new secret twice; the blob replaces any earlier one. Refused to any caller but a named
-/// invoker. Audited.
+/// ADR 0006), then the new secret twice, or for `biometric` a new Secure Enclave key (`options`: `--any`, `--watch`;
+/// ignored for the others); the protector replaces any earlier one. Refused to any caller but a named invoker.
+/// Audited.
 pub(super) async fn add<H: Host>(
     shared: &Shared,
     host: &H,
@@ -174,13 +183,17 @@ pub(super) async fn add<H: Host>(
     caller: &Caller,
     still: &Recheck,
     name: &str,
+    options: (bool, bool),
 ) -> Reply {
     let kind = offered(name);
     if !matches!(caller, Caller::Invoker { .. }) {
         audit_as(ctx, caller, kind.map_or(PIN, Protector::name), "unlock-add", Verdict::Denied);
         return error(AgentError::Denied);
     }
-    let Some(kind) = kind else { return error(AgentError::NoSuchProtector(name.into())) };
+    // A Mac without a Secure Enclave has no `biometric`: said before the master password is asked.
+    let Some(kind) = kind.filter(|k| *k != Protector::Biometric || host.enclave()) else {
+        return error(AgentError::NoSuchProtector(name.into()));
+    };
     // Only a master password typed for this very unlock counts: a profile another unlock (a PIN) opened meanwhile
     // asks for it again below.
     let (unlocked, typed) = open_profile(shared, host, ctx, caller, None, false).await;
@@ -188,7 +201,7 @@ pub(super) async fn add<H: Host>(
         return unlocked;
     }
     let _screen = shared.asking.lock().await;
-    let result = enrol(shared, host, ctx, still, typed, kind).await;
+    let result = enrol(shared, host, ctx, still, typed, kind, options).await;
     audit_as(ctx, caller, kind.name(), "unlock-add", result.as_ref().map_or_else(|(_, v)| *v, |()| Verdict::Confirmed));
     result.map_or_else(|(e, _)| error(e), |()| Reply::Done)
 }
@@ -202,6 +215,7 @@ async fn enrol<H: Host>(
     still: &Recheck,
     typed: bool,
     kind: Protector,
+    (any, watch): (bool, bool),
 ) -> Result<(), (AgentError, Verdict)> {
     let declined = |e| (e, Verdict::Declined);
     let failed = |e| (e, Verdict::Failed);
@@ -212,7 +226,11 @@ async fn enrol<H: Host>(
             Err(e) => return Err(declined(e)),
         }
     }
-    let secret = new_secret(host, ctx, kind).await.map_err(declined)?;
+    // Touch ID is not asked at enrolment: the wrap needs only the enclave key's public half.
+    let secret = match kind {
+        Protector::Biometric => None,
+        _ => Some(new_secret(host, ctx, kind).await.map_err(declined)?),
+    };
     if !still.holds() {
         return Err((AgentError::Denied, Verdict::Denied));
     }
@@ -220,6 +238,15 @@ async fn enrol<H: Host>(
     let user =
         with_vault(shared, |v| SymmetricKey::from_bytes(&v.keys.user().to_bytes()).map_err(|_| AgentError::Internal))
             .map_err(failed)?;
+    let bound = (device.as_str(), machine.as_str());
+    let Some(secret) = secret else {
+        // One write of the protector's file at a time, as for `login`.
+        let _op = shared.op.lock().await;
+        return biometric::enrol(host, ctx, &user, bound, any, watch).await.map_err(|e| {
+            tracing::warn!(profile = %ctx.profile.name, kind = "biometric", "not enrolled: {e}");
+            failed(AgentError::Internal)
+        });
+    };
     let source = KekSource::Secret { secret: Zeroizing::new(secret.as_bytes().to_vec()), params: PIN_KDF };
     drop(secret);
     let bound = Binding { device_id: &device, machine: &machine };
@@ -251,7 +278,11 @@ async fn master_password<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, kind: Pr
     };
     let target = shared.state.borrow().slot.as_ref().map(|s| (account(s), s.vault.user_key_id()));
     let Some(((origin, account), unlocked)) = target else { return Err(AgentError::Locked) };
-    let what = if kind == Protector::Pin { "a PIN" } else { "unlock at login" };
+    let what = match kind {
+        Protector::Pin => "a PIN",
+        Protector::Biometric => "Touch ID",
+        _ => "unlock at login",
+    };
     let description =
         format!("dybw profile {}: type the master password to set {what} for this device", ctx.profile.name);
     let password = session::ask(host, "Master password:", &description, None).await?;
@@ -321,7 +352,7 @@ pub(super) async fn unlock<H: Host>(
 
 /// After a sync: drop every protector when the user key no longer opens the account (a rotation).
 pub(super) async fn after_sync(shared: &Shared, ctx: &Ctx, sync: &serde_json::Value) {
-    if shared.state.borrow().pin.is_none() && !login::enrolled(ctx) {
+    if shared.state.borrow().pin.is_none() && !login::enrolled(ctx) && !biometric::enrolled(ctx) {
         return;
     }
     let user =

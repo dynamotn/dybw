@@ -32,6 +32,7 @@ use crate::session::{self, Ctx, Session};
 use crate::ssh::{self, Key, SshError};
 use crate::ssh_agent::SignContext;
 
+mod biometric;
 mod login;
 mod pin;
 mod sign;
@@ -90,9 +91,11 @@ pub enum Cmd {
     Unlock {
         caller: Caller,
     },
-    /// Enrol a local unlock protector (`dybw unlock add`).
+    /// Enrol a local unlock protector (`dybw unlock add`); `any` and `watch` are `biometric`'s.
     UnlockAdd {
         protector: String,
+        any: bool,
+        watch: bool,
         caller: Caller,
         still: Recheck,
     },
@@ -210,7 +213,7 @@ pub enum Cmd {
 enum Long {
     Login(Caller),
     Unlock(Caller),
-    UnlockAdd(String, Caller, Recheck),
+    UnlockAdd(String, (bool, bool), Caller, Recheck),
     LoginToken(Token, Option<Token>),
     Sync,
     /// A value request, and whose request it is.
@@ -429,7 +432,9 @@ fn on_msg<H: Host>(shared: &Rc<Shared>, host: &Rc<H>, ctx: &Rc<Ctx>, Msg { cmd, 
         }
         Cmd::Login { caller } => Long::Login(caller),
         Cmd::Unlock { caller } => Long::Unlock(caller),
-        Cmd::UnlockAdd { protector, caller, still } => Long::UnlockAdd(protector, caller, still),
+        Cmd::UnlockAdd { protector, any, watch, caller, still } => {
+            Long::UnlockAdd(protector, (any, watch), caller, still)
+        }
         Cmd::LoginToken { token, old } => Long::LoginToken(token, old),
         Cmd::Sync => Long::Sync,
         #[cfg(test)]
@@ -525,7 +530,9 @@ async fn run_long<H: Host>(shared: Rc<Shared>, host: Rc<H>, ctx: Rc<Ctx>, long: 
             outcome(done)
         }
         Long::Unlock(caller) => unlock(&shared, &*host, &ctx, &caller, None, true).await,
-        Long::UnlockAdd(name, caller, still) => pin::add(&shared, &*host, &ctx, &caller, &still, &name).await,
+        Long::UnlockAdd(name, options, caller, still) => {
+            pin::add(&shared, &*host, &ctx, &caller, &still, &name, options).await
+        }
         Long::LoginToken(token, old) => {
             login::on_token(&shared, &*host, &ctx, &token.0, old.as_ref().map(|o| &o.0[..])).await
         }
@@ -549,7 +556,8 @@ fn with_vault<T>(shared: &Shared, f: impl FnOnce(&UnlockedVault) -> Result<T, Ag
 
 /// What the confirmation says: the profile, who asks and by which command, what is read of which item, each on one
 /// line; and when "always" is for this process only, that.
-fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Scope) -> String {
+/// The second text is the Touch ID sheet's reason.
+fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Scope) -> (String, String) {
     let (command, what) = match (read, read.select()) {
         (_, Some(Select::Field(name))) => ("get", format!("its field \"{}\"", tidy(name))),
         (_, Some(Select::Full)) => ("get", "the full item (every value)".to_owned()),
@@ -560,12 +568,41 @@ fn ask_text(ctx: &Ctx, caller: &Caller, found: &Found, read: &Read, remember: Sc
         (_, None) => ("code", "a TOTP code".to_owned()),
     };
     let scope = if remember == Scope::Process { " [always (this process only)]" } else { "" };
-    format!(
+    let text = format!(
         "dybw profile {}: allow {} (dybw {command}) to read {what} of the item {}?{scope}",
         ctx.profile.name,
         policy::who(caller),
         item_text(found)
-    )
+    );
+    (text, touch_reason(&ctx.profile.name, caller, &format!("{command} {}", touch_name(&found.name))))
+}
+
+/// The Touch ID sheet's reason, which macOS shows as "dybw-agent is trying to …": who asks to do what, and the
+/// profile; the sheet cuts it at 120 characters, the pinentry question has the whole text.
+pub(crate) fn touch_reason(profile: &str, caller: &Caller, what: &str) -> String {
+    format!("let {} {what} (dybw profile {profile})", touch_who(caller))
+}
+
+/// An item's name, quoted and short enough for the Touch ID sheet.
+pub(crate) fn touch_name(name: &str) -> String {
+    quoted(&policy::shown(name, 48))
+}
+
+/// Who asks, short enough for the Touch ID sheet: the executable (cut in the middle), the script it claims, or the
+/// class.
+pub(crate) fn touch_who(caller: &Caller) -> String {
+    match caller {
+        Caller::Invoker { exe, script, .. } => {
+            let exe = policy::shown(&exe.to_string_lossy(), 48);
+            let detached = if caller.detached() { " (detached, possibly an AI agent)" } else { "" };
+            match script {
+                Some(script) => format!("{exe} running {}{detached}", policy::shown(&script.to_string_lossy(), 48)),
+                None => format!("{exe}{detached}"),
+            }
+        }
+        Caller::Ai { harness, .. } => format!("the AI agent {}", policy::shown(harness, 48)),
+        Caller::Unknown { .. } => "an unknown caller (possibly an AI agent)".to_owned(),
+    }
 }
 
 /// The item a question is about, told apart from any other of the same name: its name, user, folder or
@@ -706,8 +743,8 @@ async fn gate<H: Host>(
         Decision::Allow => (Verdict::Granted, Ok(())),
         Decision::Deny => (Verdict::Denied, Err(AgentError::Denied)),
         Decision::Confirm { remember: scope } => {
-            let text = ask_text(ctx, caller, found, read, scope);
-            match session::confirm(host, &text, scope != Scope::Never).await {
+            let (text, reason) = ask_text(ctx, caller, found, read, scope);
+            match session::confirm(host, &text, Some(reason), scope != Scope::Never).await {
                 Ok(true) => (remember(shared, ctx, &store, caller, scope), Ok(())),
                 Ok(false) => (Verdict::Confirmed, Ok(())),
                 Err(e) => (Verdict::Declined, Err(e)),
@@ -1000,7 +1037,8 @@ async fn change_policy<H: Host>(
         policy::who(caller),
         change.sentence()
     );
-    if let Err(e) = session::confirm(host, &text, false).await {
+    // A change of the policy grants or refuses for good: the pinentry shows all of it, never Touch ID.
+    if let Err(e) = session::confirm(host, &text, None, false).await {
         audit(ctx, caller, (op, None), None, Verdict::Declined);
         return error(e);
     }
@@ -1041,7 +1079,8 @@ async fn purge<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, s
             ctx.profile.name,
             policy::who(caller)
         );
-        if let Err(e) = session::confirm(host, &text, false).await {
+        // Deletes the local copy: the pinentry shows all of it, never Touch ID.
+        if let Err(e) = session::confirm(host, &text, None, false).await {
             audit(ctx, caller, op, None, Verdict::Declined);
             return error(e);
         }
@@ -1103,9 +1142,10 @@ async fn open<H: Host>(
     if shared.state.borrow().slot.is_some() {
         return (Reply::Done, false);
     }
-    let by_pin = if use_pin { pin::unlock(shared, host, ctx, caller, why).await } else { None };
-    let typed = by_pin.is_none();
-    let result = match by_pin {
+    // Touch ID, then the PIN, then the master password (profiles §4).
+    let by_protector = if use_pin { local(shared, host, ctx, caller, why).await } else { None };
+    let typed = by_protector.is_none();
+    let result = match by_protector {
         Some(session) => Ok(session),
         None => session::unlock(host, ctx, why).await,
     };
@@ -1117,6 +1157,14 @@ async fn open<H: Host>(
         Err(e) => error(e),
     };
     (reply, typed)
+}
+
+/// The local unlock protectors in order: `biometric` (one touch, nothing to guess), then `pin`.
+async fn local<H: Host>(shared: &Shared, host: &H, ctx: &Ctx, caller: &Caller, why: Option<&str>) -> Option<Session> {
+    match biometric::unlock(host, ctx, caller, why).await {
+        Some(session) => Some(session),
+        None => pin::unlock(shared, host, ctx, caller, why).await,
+    }
 }
 
 /// Hold an unlocked session: the SSH refusals of the locked time are forgotten.

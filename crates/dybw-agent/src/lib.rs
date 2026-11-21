@@ -24,6 +24,8 @@ pub mod trust;
 pub mod worker;
 
 #[cfg(test)]
+mod biometric_tests;
+#[cfg(test)]
 mod flow_tests;
 #[cfg(test)]
 mod pin_tests;
@@ -108,6 +110,7 @@ fn run_on(passwd: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     let var = |name: &str| std::env::var_os(name);
     let config = config::Config::load(&paths::config_path(&home))?;
     let ssh_profiles = config.ssh_agent_profiles()?;
+    let touch_id = config.touch_id_confirm()?;
     let user = trust.user.clone();
     let dir = socket::socket_dir(&var, user.uid);
     // The lock file stays held until the process ends.
@@ -118,7 +121,7 @@ fn run_on(passwd: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     let companion = trust.exe.as_deref().and_then(|exe| std::fs::canonicalize(exe.with_file_name("dybw")).ok());
     let resolver = Arc::new(caller::Resolver::new(Arc::new(dybw_peer::Os), harnesses).with_companion(companion));
     let audit = Arc::new(audit::FileAudit::new(&paths::audit_path(&home), user.uid));
-    let agent = Arc::new(agent::Agent::new(config, home, user, real_spawn(trust), resolver, audit));
+    let agent = Arc::new(agent::Agent::new(config, home, user, real_spawn(trust, touch_id), resolver, audit));
     let confirm = Arc::new(ssh_agent::Confirm(agent.clone()));
     let ssh = Arc::new(ssh_agent::SshAgent::new(agent.clone(), ssh_profiles, confirm));
     let _ = agent.ssh.set(Arc::downgrade(&ssh));
@@ -128,10 +131,11 @@ fn run_on(passwd: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     served.map_err(anyhow::Error::from)
 }
 
-/// Workers with the real host: the HTTP port and the trusted pinentry of their profile.
-fn real_spawn(trust: dybw_native::config::Trust) -> agent::Spawn {
+/// Workers with the real host: the HTTP port, the trusted pinentry of their profile, and Touch ID for confirmations
+/// unless `[agent] touch_id_confirm = false`.
+fn real_spawn(trust: dybw_native::config::Trust, touch_id: bool) -> agent::Spawn {
     Box::new(move |ctx| {
-        let host = host::RealHost::new(trust.clone(), &ctx.profile.pinentry);
+        let host = host::RealHost::new(trust.clone(), &ctx.profile.pinentry, touch_id);
         worker::Worker::spawn(host, ctx)
     })
 }
@@ -172,7 +176,7 @@ mod tests {
         let paths = crate::paths::ProfilePaths::with(dir.path(), &profile);
         let user = User { uid: rustix::process::geteuid().as_raw(), groups: None };
         let trust = Trust { search: Some("/usr/bin:/bin".into()), user: user.clone(), exe: None, home: None };
-        let worker = super::real_spawn(trust)(crate::session::Ctx {
+        let worker = super::real_spawn(trust, false)(crate::session::Ctx {
             profile,
             paths,
             user,

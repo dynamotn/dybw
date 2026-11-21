@@ -212,6 +212,31 @@ pub(crate) fn login_unlock(
     r.ok("last handover", &note)
 }
 
+/// The `biometric` protector and Touch ID (ADR 0006, macOS): whether this Mac has a Secure Enclave, the protector,
+/// and whether the agent's confirmations use Touch ID (`[agent] touch_id_confirm`).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn biometric_unlock(
+    file: &std::path::Path,
+    enclave: bool,
+    touch_confirm: bool,
+    r: &mut Report<'_>,
+) -> std::io::Result<()> {
+    if !enclave {
+        return r.ok("biometric unlock", "no Secure Enclave on this Mac: no Touch ID unlock, the pinentry confirms");
+    }
+    if file.exists() {
+        r.ok("biometric unlock", &format!("{}, bound to this device and its Secure Enclave", file.display()))?;
+    } else {
+        r.ok("biometric unlock", "none; `dybw unlock add biometric` sets one")?;
+    }
+    let note = if touch_confirm {
+        "Touch ID where available, else the pinentry; `[agent] touch_id_confirm = false` turns it off"
+    } else {
+        "the pinentry (`[agent] touch_id_confirm = false`)"
+    };
+    r.ok("confirmations", note)
+}
+
 /// When the agent last unlocked `profile` by a login password: `None` when no agent answers.
 #[cfg(target_os = "linux")]
 fn handover(env: &Env, profile: &str) -> Option<Option<u64>> {
@@ -239,6 +264,12 @@ fn profile_checks(
         Err(e) => r.problem("pinentry", &format!("{}: {e}", profile.pinentry))?,
     }
     local_unlock(dybw_peer::machine_id(), r)?;
+    #[cfg(target_os = "macos")]
+    {
+        let file = ProfilePaths::with(home, &profile).unlock.join("biometric");
+        let touch = config.touch_id_confirm().unwrap_or(true);
+        biometric_unlock(&file, dybw_peer::enclave::available(), touch, r)?;
+    }
     #[cfg(target_os = "linux")]
     {
         let file = ProfilePaths::with(home, &profile).unlock.join("login");

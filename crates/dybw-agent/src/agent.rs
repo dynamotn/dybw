@@ -249,7 +249,7 @@ impl Agent {
             | Op::Purge { .. } => sensitive.clone(),
             Op::StopAgent => Some((kind(&op), None, None)),
             Op::Unlock { profile } | Op::Login { profile } => Some((kind(&op), None, profile.clone())),
-            Op::UnlockAdd { profile, protector } | Op::UnlockRemove { profile, protector } => {
+            Op::UnlockAdd { profile, protector, .. } | Op::UnlockRemove { profile, protector } => {
                 let named = crate::worker::offered(protector).map(dybw_core::profile::protector::Protector::name);
                 Some((kind(&op), named, profile.clone()))
             }
@@ -358,8 +358,8 @@ impl Agent {
             Op::Status { profile } => self.on_profile(profile.as_deref(), Cmd::Status).await,
             Op::Login { profile } => self.on_profile(profile.as_deref(), Cmd::Login { caller: caller() }).await,
             Op::Unlock { profile } => self.on_profile(profile.as_deref(), Cmd::Unlock { caller: caller() }).await,
-            Op::UnlockAdd { profile, protector } => {
-                let cmd = Cmd::UnlockAdd { protector, caller: caller(), still: still() };
+            Op::UnlockAdd { profile, protector, any, watch } => {
+                let cmd = Cmd::UnlockAdd { protector, any, watch, caller: caller(), still: still() };
                 self.on_profile(profile.as_deref(), cmd).await
             }
             Op::UnlockRemove { profile, protector } => {
@@ -855,7 +855,7 @@ mod tests {
             Op::Remove { profile: None, needle: "n".into(), user: None, folder: None, ignorecase: false },
             Op::Purge { profile: None },
             Op::SshList,
-            Op::UnlockAdd { profile: None, protector: "pin".into() },
+            Op::UnlockAdd { profile: None, protector: "pin".into(), any: false, watch: false },
             Op::UnlockRemove { profile: None, protector: "pin".into() },
             Op::UnlockList { profile: None },
             Op::StopAgent,

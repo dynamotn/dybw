@@ -14,6 +14,7 @@ use dybw_core::vault::Organizations;
 use dybw_native::fsutil::{User, write_private};
 use dybw_native::ports::{clock::SystemClock, kdf::BlockingArgon2};
 use dybw_native::prompter::{Confirm, PromptError, one_line};
+use dybw_peer::enclave::Confirm as TouchId;
 use dybw_proto::AgentError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -233,7 +234,23 @@ pub(crate) async fn ask<H: Host>(
 
 /// Ask the user to allow one read of a value. Only an explicit yes passes (`true`: and "always"); a no, a cancel
 /// and a timeout are `Denied`, a prompt that could not be put is `Prompt`.
-pub async fn confirm<H: Host>(host: &H, text: &str, offer_always: bool) -> Result<bool, AgentError> {
+///
+/// With a `touch` reason (it names the caller and the item, ADR 0006), Touch ID asks first. Touch ID is a yes or a no,
+/// so a question that offers "always" stays in the pinentry, which has the three answers. A finger that does not
+/// match is a no; a cancelled, unavailable or switched-off Touch ID puts the same question in the pinentry.
+pub async fn confirm<H: Host>(
+    host: &H,
+    text: &str,
+    touch: Option<String>,
+    offer_always: bool,
+) -> Result<bool, AgentError> {
+    if let (Some(reason), false) = (touch, offer_always) {
+        match host.touch_id(reason).await {
+            TouchId::Allowed => return Ok(false),
+            TouchId::Denied => return Err(AgentError::Denied),
+            other => tracing::info!("Touch ID {other:?}: asking in the pinentry"),
+        }
+    }
     match host.confirm(text, offer_always).await {
         Ok(Confirm::Once) => Ok(false),
         Ok(Confirm::Always) => Ok(true),

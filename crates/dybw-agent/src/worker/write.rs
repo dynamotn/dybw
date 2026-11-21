@@ -379,7 +379,12 @@ pub(super) async fn write<H: Host>(
     };
     let values = {
         let _screen = shared.asking.lock().await;
-        if let Err(e) = session::confirm(host, &question(ctx, caller, &write, &planned), false).await {
+        // A removal that takes an item from other tools says so in the pinentry only.
+        let touch = planned.markers.is_empty().then(|| {
+            let name = planned.found.as_ref().map_or(&planned.name, |f| &f.name);
+            super::touch_reason(&ctx.profile.name, caller, &format!("{} {}", write.op(), super::touch_name(name)))
+        });
+        if let Err(e) = session::confirm(host, &question(ctx, caller, &write, &planned), touch, false).await {
             return end(Verdict::Declined, e);
         }
         if let Some(found) = planned.found.as_ref().filter(|f| f.reprompt)
