@@ -288,6 +288,20 @@ fn every_command_maps_to_its_op() {
         (vec!["get", "n", "-f", "totp"], Reply::Value { value: secret("v") }, get(Select::Field(s("totp")))),
         (vec!["get", "n", "--full", "-f", "totp"], item(), get(Select::Full)),
         (vec!["get", "n", "--raw", "--full", "-f", "x"], item(), get(Select::Raw)),
+        // chezmoi's `rbw`/`rbwFields` template functions: `get --raw <name>`, then the template's extra arguments.
+        (
+            vec!["get", "--raw", "n", "me", "--folder", "f"],
+            item(),
+            Op::Get {
+                profile: Some(s("p")),
+                needle: s("n"),
+                user: Some(s("me")),
+                folder: Some(s("f")),
+                ignorecase: false,
+                select: Select::Raw,
+                rbw: true,
+            },
+        ),
         (
             vec!["get", "n", "-l", "--raw", "--full", "-f", "x"],
             Reply::FieldNames { names: vec![] },

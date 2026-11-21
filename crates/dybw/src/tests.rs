@@ -183,6 +183,25 @@ fn help_and_version_succeed_without_an_agent() {
 }
 
 #[test]
+fn gen_completions_prints_the_script_for_dybw_without_an_agent() {
+    // No socket, no exe_dir: a connect attempt or a start would fail.
+    let env = env_in(base().path(), None, None);
+    let marks = [
+        ("bash", "complete -F _dybw"),
+        ("zsh", "#compdef dybw"),
+        ("fish", "complete -c dybw"),
+        ("elvish", "edit:completion:arg-completer[dybw]"),
+        ("powershell", "-CommandName 'dybw'"),
+    ];
+    for (shell, mark) in marks {
+        let (code, out, err) = run_in(&env, &["gen-completions", shell]);
+        assert_eq!((code, err.as_str()), (0, ""), "{shell}");
+        assert!(out.contains(mark) && out.contains("unlocked"), "{shell}: {out}");
+    }
+    assert_eq!(run_in(&env, &["gen-completions", "tcsh"]).0, 1);
+}
+
+#[test]
 fn usage_errors_exit_1_on_stderr() {
     let env = env_in(base().path(), None, None);
     for args in

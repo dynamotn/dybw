@@ -195,6 +195,8 @@ enum Cmd {
     },
     /// Check this machine: socket directory, agent, config, pinentry, policy and audit files.
     Doctor,
+    /// Print the completion script for a shell.
+    GenCompletions { shell: clap_complete::Shell },
     /// Talk to the agent process itself.
     Agent {
         #[command(subcommand)]
@@ -592,6 +594,10 @@ fn execute(cmd: Cmd, profile: Option<String>, env: &Env, out: &mut dyn Write, er
         }
         // Nothing to stop when no agent runs, and none is started to be stopped.
         Cmd::Agent { command: AgentCmd::Stop } => done(ask(env, Op::StopAgent, false)?.unwrap_or(Reply::Done)),
+        Cmd::GenCompletions { shell } => {
+            clap_complete::generate(shell, &mut <Cli as clap::CommandFactory>::command(), "dybw", out);
+            Ok(0)
+        }
         Cmd::ClearClipboard => clear_later(env),
     }
 }

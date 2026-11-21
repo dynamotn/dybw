@@ -40,8 +40,57 @@ trashes logins; the rbw shim and the SSH and git integrations come in later phas
 | `dybw audit [--ai] [-n N]` | The latest N audit lines (default 50) as tab-separated columns; `--ai` keeps AI-class callers. Read straight from the file, no agent needed |
 | `dybw doctor` | Check the socket directory, the agent (reachable, same version), config, pinentry, the machine fingerprint a PIN is bound to, on Linux the `login` protector (the user keyring readable, the last handover), `policy.json` and `audit.log`; exit 0 when all pass, 1 otherwise. Under an AI harness it also warns that the harness sandbox must not reach the agent |
 | `dybw agent stop` | Stop the agent (locks every profile) |
+| `dybw gen-completions <shell>` | Print the completion script for `bash`, `zsh`, `fish`, `elvish` or `powershell` (no agent needed). `rbw gen-completions <shell>` prints the shim's, as rbw |
 
 `--profile <name>` (or `DYBW_PROFILE`) picks the profile; the default is the config's `default`.
+
+## Install
+
+Needs Rust 1.89 or newer (`cargo`), and on macOS the Xcode Command Line Tools (`xcode-select --install`), whose
+`xcrun swiftc` builds the Secure Enclave code. Both binaries come from this repository, at a pinned revision:
+
+```sh
+cargo install --locked --git https://gitlab.com/dynamo-tools/dybw-cli.git --rev <rev> dybw dybw-agent
+```
+
+They land in `~/.cargo/bin` (`--root <dir>`: `<dir>/bin`) and must stay in one directory: `dybw` starts only the
+`dybw-agent` next to it, and the agent trusts only the `dybw` next to it.
+
+- **The agent.** `dybw` starts it on first use, with the environment of that first caller. To have it start at login
+  with the GUI session's (so pinentry and Touch ID show for hotkeys and launchers without a terminal), install the
+  service; on-demand start stays as the fallback, and a second agent finds the lock held and exits.
+  - macOS: [`contrib/macos/org.dybw.agent.plist`](contrib/macos/org.dybw.agent.plist) (label `org.dybw.agent`).
+    Replace `@HOME@` with your home and `@TMPDIR@` with `getconf DARWIN_USER_TEMP_DIR`, copy it to
+    `~/Library/LaunchAgents/`, then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.dybw.agent.plist`.
+    It logs to `~/Library/Logs/dybw-agent.log`.
+  - Linux with systemd: [`contrib/systemd/dybw-agent.service`](contrib/systemd/dybw-agent.service), a user unit
+    wanted by `graphical-session.target`: copy it to `~/.config/systemd/user/`, then
+    `systemctl --user enable --now dybw-agent.service`. The compositor must import `WAYLAND_DISPLAY`, `DISPLAY`,
+    `XAUTHORITY` and `DBUS_SESSION_BUS_ADDRESS` into the user manager first (`systemctl --user import-environment
+    ...`; niri-session and uwsm do it). It logs to the journal (`journalctl --user -u dybw-agent`).
+  - Check that your shells reach that agent: `dybw agent stop` in a terminal must stop the service's process
+    (`launchctl print gui/$(id -u)/org.dybw.agent`, `systemctl --user status dybw-agent`); a shell with another
+    `TMPDIR` or `XDG_RUNTIME_DIR` would start an agent of its own.
+- **The `rbw` name.** A symlink named `rbw` to `dybw` makes it the rbw shim: `ln -s dybw ~/.cargo/bin/rbw`, or from
+  any directory on `PATH` (`ln -s ~/.cargo/bin/dybw ~/.local/bin/rbw`). It must come before rbw's own `rbw` on
+  `PATH`, so uninstall rbw. No `rbw-agent` is needed: the shim never starts one, and `rbw stop-agent` stops
+  `dybw-agent`.
+- **Completions.** fish loads `~/.config/fish/completions/<command>.fish` on first use, so these two files keep up
+  with the installed version:
+
+  ```fish
+  # ~/.config/fish/completions/dybw.fish
+  type -q dybw; and dybw gen-completions fish | source
+  # ~/.config/fish/completions/rbw.fish
+  type -q rbw; and rbw gen-completions fish | source
+  ```
+
+  bash: `dybw gen-completions bash > ~/.local/share/bash-completion/completions/dybw` (and `rbw` likewise); zsh:
+  `dybw gen-completions zsh > ~/.zfunc/_dybw` with `~/.zfunc` on `fpath`.
+- **First steps.** Write `~/.config/dybw/config.toml` (`default = "<profile>"`, then per profile `[profiles.<name>]`
+  with `server_url`, `email`, and `pinentry` as an absolute path or a name found in
+  `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`). Then, per profile, `dybw -p <name> login` (the API key's
+  client id and secret, from the web vault's account security settings), `dybw -p <name> unlock`, and `dybw doctor`.
 
 ## Usage
 
