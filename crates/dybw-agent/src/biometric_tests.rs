@@ -175,6 +175,8 @@ async fn a_protector_that_does_not_fit_this_mac_device_or_kind_is_dropped() {
         ("a short ephemeral key", edited(&|v| v["ephemeral"] = serde_json::json!([4, 1, 2])), false),
         ("a PIN blob", edited(&|v| v["protector"]["protector"] = "pin".into()), false),
         ("another Mac's key", edited(&|v| v["handle"] = serde_json::json!([1, 2, 3])), true),
+        // The sheet is answered, then the core refuses the blob itself.
+        ("a blob with its attempts used up", edited(&|v| v["protector"]["attempts"] = 5.into()), true),
     ];
     for (case, raw, sheet) in cases {
         std::fs::write(file(&dir), raw).unwrap();
