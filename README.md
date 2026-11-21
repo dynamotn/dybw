@@ -1,260 +1,280 @@
-# dybw-cli
+# dybw
 
-The `dybw` command line client and the `dybw-agent` that holds the vault session, built on
-[dybw-core](https://gitlab.com/dynamo-tools/dybw-core). MIT licensed.
+A Bitwarden and Vaultwarden command line client and agent that knows who is asking for your secrets.
 
-**Status: P4.3.** `dybw` logs in with an API key, unlocks, lists, searches and reads items through the agent, gives
-TOTP codes, copies to the clipboard, finds items by id, name or URI as rbw does, and adds, edits, generates and
-trashes logins; the rbw shim and the SSH and git integrations come in later phases.
+dybw is a drop-in replacement for [rbw](https://github.com/doy/rbw): same commands, same output, byte for byte.
+On top of that, its agent identifies every caller and applies a per-caller policy. An AI coding agent or a script
+cannot silently read a password: AI agents get item names only, and other programs must be confirmed in a pinentry
+or a Touch ID sheet. It unlocks with Touch ID, a PIN or your Linux login password, and it doubles as an SSH agent for
+the SSH keys in your vault.
 
-| Crate | What |
-|-------|------|
-| `dybw-proto` | Versioned IPC types (`{ version, op }`) and length-prefixed JSON framing (u32 big-endian, max 1 MiB) |
-| `dybw-agent` | The agent: one worker per profile holds the unlocked vault, locks it on idle and after a suspend |
-| `dybw` | The client binary |
+## Features
+
+- **rbw drop-in.** Symlink `rbw` to `dybw` and your scripts keep working: 296 of 296 rbw 1.15 cases give
+  byte-identical output and exit codes, and 20 of 20 write cases leave the same vault state
+  ([conformance report](docs/rbw-conformance.md)).
+- **Caller policy.** Every value read is confirmed per program, out of band. "Always" is remembered only for an
+  unchanged program binary, and scripts get it for one process only.
+- **An AI-agent class.** Claude Code, Codex, Gemini, Copilot, Cursor, opencode, aider and others are recognized.
+  They can list names but never read a value, unlock, log in or change the policy.
+- **Audit log.** Every decision is logged as one JSON line: caller, item id and verdict, never a value.
+  `dybw audit --ai` shows what your AI agents asked for.
+- **Local unlock.** Touch ID through the Secure Enclave, a PIN held in memory, or on Linux your login password
+  through `pam_bwss`. You type the master password far less often.
+- **SSH agent.** SSH keys stored in the vault, each signature confirmed, `session-bind@openssh.com` host
+  verification, refusal of SHA-1 RSA. Private keys never leave the agent.
+- **The everyday parts.** TOTP codes, add, edit, generate and trash logins, and clipboard copies marked as secret
+  and cleared after 30 seconds.
+
+## Quick start
+
+### Install
+
+```sh
+cargo install --git https://github.com/dynamotn/dybw.git --tag v1.0.0-rc.1 --locked dybw dybw-agent
+```
+
+Prebuilt binaries will be on the [GitHub releases page](https://github.com/dynamotn/dybw/releases). Building
+needs Rust 1.89 or newer. On macOS it also needs the Xcode Command Line Tools (`xcode-select --install`), which build
+the Secure Enclave code.
+
+Keep `dybw` and `dybw-agent` in the same directory: `dybw` starts only the agent next to it, and the agent trusts
+only the `dybw` next to it.
+
+### Configure a profile
+
+A profile is one account on one server. Write `~/.config/dybw/config.toml`:
+
+```toml
+default = "personal"
+pinentry = "pinentry-mac"        # or pinentry-gnome3, pinentry-qt, ...
+
+[profiles.personal]
+server_url = "https://vault.bitwarden.com"
+email = "me@example.com"
+```
+
+Every key is described in [docs/configuration.md](docs/configuration.md).
+
+### First steps
+
+```sh
+dybw login                   # the API key (client id and secret), asked in the pinentry
+dybw unlock                  # the master password, asked in the pinentry
+dybw list                    # item names
+dybw get example.org         # a password, after you confirm the read
+dybw get example.org -f user
+dybw code github             # a TOTP code
+dybw doctor                  # check the setup
+```
+
+`dybw login` takes the API key from your web vault's account security settings, not the master password. A locked
+profile unlocks on first need, so `dybw unlock` is optional.
+
+## Use it as rbw
+
+Make `rbw` a symlink to `dybw`, earlier on `PATH` than rbw's own binary (or uninstall rbw):
+
+```sh
+ln -s ~/.cargo/bin/dybw ~/.local/bin/rbw
+rbw get example.org
+RBW_PROFILE=work rbw list
+```
+
+Invoked as `rbw`, the binary takes rbw 1.15's command line and prints what rbw prints. You do not need an
+`rbw-agent`: `rbw stop-agent` stops `dybw-agent`. Value reads still go through the caller policy. A few commands
+behave differently on purpose. For example, `rbw remove` moves the item to the trash. See
+[docs/rbw-shim.md](docs/rbw-shim.md).
+
+## Unlock with Touch ID or a PIN
+
+```sh
+dybw unlock add biometric    # macOS: a Secure Enclave key that Touch ID opens
+dybw unlock add pin          # any platform: a PIN of at least 6 characters, held in the agent's memory
+dybw unlock add login        # Linux with pam_bwss: your login or screen unlock opens the vault
+dybw unlock list
+```
+
+Each one asks for the master password once to enrol. `dybw unlock` then tries Touch ID, then the PIN, then the
+master password. Cancel one to move on to the next. Five wrong PINs drop the PIN. Adding or removing a fingerprint
+drops the Touch ID protector unless you enrolled it with `--any`. Details and trade-offs are in
+[docs/local-unlock.md](docs/local-unlock.md).
+
+## SSH agent
+
+List the profiles whose SSH key items the agent should offer, then point `SSH_AUTH_SOCK` at its socket:
+
+```toml
+[ssh_agent]
+profiles = ["personal"]
+```
+
+```sh
+export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/dybw/ssh-agent.sock"   # Linux
+export SSH_AUTH_SOCK="${TMPDIR%/}/dybw-$(id -u)/ssh-agent.sock"   # macOS (no XDG_RUNTIME_DIR)
+dybw ssh list
+ssh-add -l
+ssh git@example.org
+```
+
+Each signature asks for confirmation. The prompt names the client, the key and the destination host, and says
+whether that host is verified. Git commit signing works the same way and is labelled "NOT an SSH login". See
+[docs/ssh-agent.md](docs/ssh-agent.md).
+
+## Let a script read one item
+
+The first time a program reads a value, the agent asks you in the pinentry, or with Touch ID on a Mac:
+
+```sh
+#!/bin/sh
+export PGPASSWORD="$(dybw get db.example.org)"   # you confirm this read
+pg_dump mydb > backup.sql
+```
+
+For a script, "always" lasts only as long as that process. For a compiled program, you can remember the answer,
+tied to that exact binary:
+
+```sh
+dybw policy allow /usr/local/bin/backup-tool
+dybw policy show
+dybw policy deny /usr/local/bin/untrusted
+```
+
+A grant never covers `get --full`, `get --raw` or `history`: those ask every time. See
+[docs/policy.md](docs/policy.md).
+
+## Keep AI agents in check
+
+The agent walks each caller's process ancestry, and checks marker variables such as `CLAUDECODE`, to spot an AI
+harness. An AI-class caller can:
+
+- list and search item names;
+- ask for a value, which is always denied and logged;
+- ask for an SSH signature, which you confirm every time, outside its terminal.
+
+It can never unlock, log in, change the policy or raise a master-password prompt. Review what it tried:
+
+```sh
+dybw audit --ai
+```
+
+This is a speed bump for honest tools, not a wall. The boundary that holds is the harness's sandbox, which must not
+reach the agent's socket or state directories. `dybw doctor` warns when it runs under a harness. To teach the agent
+another harness, add it to `~/.local/state/dybw/harnesses.toml` ([docs/policy.md](docs/policy.md#ai-agents)).
+
+## Run the agent as a service
+
+`dybw` starts the agent on first use, with that first caller's environment. Run it as a login service instead, so
+pinentry and Touch ID also show for hotkeys and launchers:
+
+```sh
+# macOS (launchd)
+sed -e "s|@HOME@|$HOME|g" -e "s|@TMPDIR@|$(getconf DARWIN_USER_TEMP_DIR)|g" \
+  contrib/macos/org.dybw.agent.plist > ~/Library/LaunchAgents/org.dybw.agent.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.dybw.agent.plist
+
+# Linux (systemd user unit, started with the graphical session)
+cp contrib/systemd/dybw-agent.service ~/.config/systemd/user/
+systemctl --user enable --now dybw-agent.service
+```
+
+See [docs/install.md](docs/install.md) for what each unit needs, how to check that your shells reach it, and how
+to set up shell completions.
 
 ## Commands
 
-| Command | What |
-|---------|------|
-| `dybw login` | Store the profile's API key (client id and secret, asked through pinentry) |
-| `dybw unlock` | Unlock: Touch ID first when a `biometric` protector is set, then the PIN when one is set (cancel either to go on), else the master password |
-| `dybw unlock add pin` | Set a PIN for this profile on this device: the master password, then the PIN twice (at least 6 characters), in the agent's pinentry. The PIN lives in the agent's memory only: `dybw lock` and the idle lock keep it; `dybw agent stop`, `dybw login`, `rbw purge`, a user-key rotation and 5 wrong PINs drop it. Refused to AI-class and unnamed callers. A PIN unlocks only: an item that asks for the master password again (reprompt) still needs the master password |
-| `dybw unlock add login` | Linux, with `pam_bwss` (bwss) in the PAM stack: the master password, then your login password twice (not checked against the system: type it exactly). The key is wrapped by Argon2id over it and kept in `~/.local/state/dybw/profiles/<p>/unlock/login` (0600), bound to this device. Logging in or unlocking the screen then unlocks the profile without a question: the agent takes the password `pam_bwss` puts in your kernel keyring (polled every second while a profile has this protector) and invalidates it at once. A password change re-wraps it; the old wrap stays until a login with the new password. A login password that opens neither the protector nor a pending re-wrap (a reset by root, say) deletes it, and so do another machine, a rotation, `dybw login` and `rbw purge`: the next unlock asks for the PIN or the master password, and enrolling again needs the master password. Without a TPM2, someone who takes the disk can guess the login password offline. When your last logind session closes, every profile locks |
-| `dybw unlock add biometric [--any] [--watch]` | macOS, on a Mac with a Secure Enclave: the master password, then a P-256 key is made in the Secure Enclave (no Touch ID at enrolment). The user key is wrapped to it and kept in `~/.local/state/dybw/profiles/<p>/unlock/biometric` (0600) with the key's handle, bound to this device and usable only by this Mac's Secure Enclave. Every unlock then shows a Touch ID sheet naming the profile ("Unlock dybw profile <p>"). A cancel, no sensor (lid closed), a lockout or another error goes on to the PIN or the master password and keeps it; an unknown caller's unlock shows no sheet. A file bound to another device or machine, or on a machine without a Secure Enclave, is deleted before any sheet. Adding or removing a finger makes the key unusable: the next unlock deletes the protector and asks for the master password, unless `--any` (any finger enrolled at the time, weaker). `--watch` lets an Apple Watch (on macOS 15 and later, another paired device too) open it. Another machine, a rotation, `dybw login` and `rbw purge` delete it; enrolling again needs the master password. Refused to AI-class and unnamed callers, and an AI-class caller never raises the sheet |
-| `dybw unlock remove pin\|login\|biometric` | Drop the protector. Refused to AI-class and unnamed callers |
-| `dybw unlock list` | `profile`, protector, wrong tries left (`-` for an AI-class caller, which gets names only, and for `login`, or `biometric`, which have no limit); no agent running means the `login` and `biometric` protectors only |
-| `dybw unlocked` | Exit 0 when unlocked, 1 when not; never unlocks |
-| `dybw lock [--all]` | Lock now |
-| `dybw status` | `profile`, logged in, locked or unlocked, last sync (unix seconds), local unlock protectors (`pin`, `login`, `biometric`, comma-separated, or `-`); never unlocks |
+| Command | What it does |
+|---------|--------------|
+| `dybw login` | Store the profile's API key |
+| `dybw unlock` / `lock [--all]` / `unlocked` | Unlock, lock, or test (exit 0 when unlocked) |
+| `dybw unlock add\|remove\|list` | Manage local unlock protectors: `pin`, `biometric`, `login` |
+| `dybw status` | Logged in, locked, last sync, protectors |
 | `dybw sync [--all]` | Fetch the vault now |
-| `dybw list`, `dybw search <term>` | Names, or `--fields id,name,user,folder,type`, `--folder`, `--raw` (list only, JSON) |
-| `dybw get <item> [user]` | The main value; `-f <field>`, `--full`, `--raw`, `-l` (`--list-fields`), `--folder`, `-i`, `-c` (copy instead of print) |
-| `dybw history <item>` | Previous passwords, newest first |
-| `dybw code <item> [user]` | The current TOTP code; `--next` waits for the next one when fewer than 5 s are left; `--folder`, `-i`, `-c` |
-| `dybw add <name> [user]` | A new login: `--uri U` (repeatable), `--folder F` (created if missing); the password (unless `--no-password`), and with `--notes` the notes, are typed in the agent's pinentry |
-| `dybw edit <item> [user]` | A new password (the old one goes to the history), and with `--notes` new notes (`--no-password`: notes only), typed in the agent's pinentry; `--folder` (to find the item) |
-| `dybw remove <item> [user]` | Move the item to the trash (never purged); `--folder` |
-| `dybw generate <len>` | Print a random password made here (OS random numbers, no agent): `--no-symbols`, `--only-numbers`, `--nonconfusables`, `--diceware` (`<len>` words of the EFF large list) |
-| `dybw generate <len> <name> [user]` | The agent makes the password and saves it as a new login (`--uri`, `--folder`); nothing is printed |
-| `dybw policy show\|allow\|deny\|forget` | Show or change which programs may read values (changes are confirmed in pinentry) |
-| `dybw audit [--ai] [-n N]` | The latest N audit lines (default 50) as tab-separated columns; `--ai` keeps AI-class callers. Read straight from the file, no agent needed |
-| `dybw doctor` | Check the socket directory, the agent (reachable, same version), config, pinentry, the machine fingerprint a PIN is bound to, on Linux the `login` protector (the user keyring readable, the last handover), on macOS the Secure Enclave, the `biometric` protector and whether confirmations use Touch ID, `policy.json` and `audit.log`; exit 0 when all pass, 1 otherwise. Under an AI harness it also warns that the harness sandbox must not reach the agent |
-| `dybw agent stop` | Stop the agent (locks every profile) |
-| `dybw gen-completions <shell>` | Print the completion script for `bash`, `zsh`, `fish`, `elvish` or `powershell` (no agent needed). `rbw gen-completions <shell>` prints the shim's, as rbw |
+| `dybw list`, `dybw search <term>` | Item names (`--fields id,name,user,folder,type`, `--folder`, `--raw`) |
+| `dybw get <item> [user]` | A value (`-f <field>`, `--full`, `--raw`, `-l`, `-c` to copy) |
+| `dybw history <item> [user]` | Previous passwords, newest first |
+| `dybw code <item> [user]` | The current TOTP code (`--next`, `-c`) |
+| `dybw add`, `edit`, `remove` | Write logins; new values are typed in the agent's pinentry |
+| `dybw generate <len> [name [user]]` | Print a password, or save a new login with one |
+| `dybw policy show\|allow\|deny\|forget` | Which programs may read values |
+| `dybw ssh list` | Keys the SSH agent offers |
+| `dybw audit [--ai] [-n N]` | The latest audit lines |
+| `dybw doctor` | Check the setup |
+| `dybw agent stop` | Stop the agent and lock every profile |
+| `dybw gen-completions <shell>` | Completion script for bash, zsh, fish, elvish or powershell |
 
-`--profile <name>` (or `DYBW_PROFILE`) picks the profile; the default is the config's `default`.
+Every command takes `-p, --profile <name>`, and falls back to `DYBW_PROFILE` and then the config's `default`.
+`dybw <command> --help` has the details.
 
-## Install
+## How it works
 
-Needs Rust 1.89 or newer (`cargo`), and on macOS the Xcode Command Line Tools (`xcode-select --install`), whose
-`xcrun swiftc` builds the Secure Enclave code. Both binaries come from this repository, at a pinned revision:
-
-```sh
-cargo install --locked --git https://gitlab.com/dynamo-tools/dybw-cli.git --rev <rev> dybw dybw-agent
+```text
+ dybw / rbw  ──┐
+               ├─ agent.sock ──►  dybw-agent  ──►  worker "personal" ──► dybw-core ──► Bitwarden / Vaultwarden
+ ssh, git    ──┘  ssh-agent.sock   (caller check,   worker "work"
+                                    policy, audit)
 ```
 
-They land in `~/.cargo/bin` (`--root <dir>`: `<dir>/bin`) and must stay in one directory: `dybw` starts only the
-`dybw-agent` next to it, and the agent trusts only the `dybw` next to it.
+`dybw` is a thin client. It sends versioned, length-prefixed JSON requests to `dybw-agent` over a Unix socket in
+`$XDG_RUNTIME_DIR/dybw/` (or `$TMPDIR/dybw-<uid>/` when that is not set). For each request, the agent identifies
+the calling process, its parents and its executable, then applies the policy and writes the audit line. It hands
+the request to the worker of that profile. Each worker holds one unlocked vault through
+[dybw-core](https://gitlab.com/dynamo-tools/dybw-core), which does the crypto and the API calls. Workers lock
+after the idle timeout, after the machine sleeps and on `dybw lock`, and their keys are zeroized. The SSH agent
+runs in the same process.
 
-- **The agent.** `dybw` starts it on first use, with the environment of that first caller. To have it start at login
-  with the GUI session's (so pinentry and Touch ID show for hotkeys and launchers without a terminal), install the
-  service; on-demand start stays as the fallback, and a second agent finds the lock held and exits.
-  - macOS: [`contrib/macos/org.dybw.agent.plist`](contrib/macos/org.dybw.agent.plist) (label `org.dybw.agent`).
-    It is a template: `@HOME@` and `@TMPDIR@` must be substituted before launchd loads it (launchd expands no
-    variables), `@HOME@` with your home and `@TMPDIR@` with `getconf DARWIN_USER_TEMP_DIR`. Copy it to
-    `~/Library/LaunchAgents/`, then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.dybw.agent.plist`.
-    It logs to `~/Library/Logs/dybw-agent.log`.
-  - Linux with systemd: [`contrib/systemd/dybw-agent.service`](contrib/systemd/dybw-agent.service), a user unit
-    wanted by `graphical-session.target`: copy it to `~/.config/systemd/user/`, then
-    `systemctl --user enable --now dybw-agent.service`. The compositor must import `WAYLAND_DISPLAY`, `DISPLAY`,
-    `XAUTHORITY` and `DBUS_SESSION_BUS_ADDRESS` into the user manager first (`systemctl --user import-environment
-    ...`; niri-session and uwsm do it). Until `WAYLAND_DISPLAY` or `DISPLAY` is there the unit is skipped
-    (`ConditionEnvironment`, systemd 246+) rather than started without a display, and dybw starts the agent on
-    demand. It logs to the journal (`journalctl --user -u dybw-agent`).
-  - Check that your shells reach that agent: `dybw agent stop` in a terminal must stop the service's process
-    (`launchctl print gui/$(id -u)/org.dybw.agent`, `systemctl --user status dybw-agent`); a shell with another
-    `TMPDIR` or `XDG_RUNTIME_DIR` would start an agent of its own.
-- **The `rbw` name.** A symlink named `rbw` to `dybw` makes it the rbw shim: `ln -s dybw ~/.cargo/bin/rbw`, or from
-  any directory on `PATH` (`ln -s ~/.cargo/bin/dybw ~/.local/bin/rbw`). It must come before rbw's own `rbw` on
-  `PATH`, so uninstall rbw. No `rbw-agent` is needed: the shim never starts one, and `rbw stop-agent` stops
-  `dybw-agent`.
-- **Completions.** fish loads `~/.config/fish/completions/<command>.fish` on first use, so these two files keep up
-  with the installed version:
+| Crate | Role |
+|-------|------|
+| `dybw` | The client binary, and the rbw shim when invoked as `rbw` |
+| `dybw-agent` | The agent: caller identity, policy, audit, one worker per profile, the SSH agent |
+| `dybw-proto` | Versioned IPC types and framing (u32 big-endian length, at most 1 MiB) |
+| `dybw-peer` | Platform layer: who is on the other end of a socket, the secret clipboard (the only crate with `unsafe`) |
 
-  ```fish
-  # ~/.config/fish/completions/dybw.fish
-  type -q dybw; and dybw gen-completions fish | source
-  # ~/.config/fish/completions/rbw.fish
-  type -q rbw; and rbw gen-completions fish | source
-  ```
+## Security model
 
-  bash: `dybw gen-completions bash > ~/.local/share/bash-completion/completions/dybw` (and `rbw` likewise); zsh:
-  `dybw gen-completions zsh > ~/.zfunc/_dybw` with `~/.zfunc` on `fpath`.
-- **First steps.** Write `~/.config/dybw/config.toml` (`default = "<profile>"`, then per profile `[profiles.<name>]`
-  with `server_url`, `email`, and `pinentry` as an absolute path or a name found in
-  `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`). Then, per profile, `dybw -p <name> login` (the API key's
-  client id and secret, from the web vault's account security settings), `dybw -p <name> unlock`, and `dybw doctor`.
+- **The master password and new values never cross the socket.** The agent asks for them in its own pinentry, a
+  program you cannot replace without write access to its directory.
+- **Confirmation happens out of band:** a pinentry window or a Touch ID sheet, not the caller's terminal. Writes,
+  policy changes and `rbw purge` are confirmed every time.
+- **Grants are a convenience, not a boundary.** Code running as you can defeat them. The boundaries that hold are
+  the AI harness's sandbox, which must not reach the agent, and the out-of-band confirmation.
+- **Nothing that grants access comes from a synced file.** The policy, the protectors and the harness list are
+  device state under `~/.local/state/dybw`. `config.toml` can be synced with your dotfiles and holds no secret.
+- **The agent trusts only its own home.** It refuses to start when `HOME` is not your home in the password
+  database, and it ignores the caller's `XDG_*` variables. It also denies debugger attach (`PT_DENY_ATTACH` on
+  macOS, `PR_SET_DUMPABLE=0` on Linux).
+- **An API key is bound to the server it was entered for** and is never sent to another one.
 
-## Usage
+The details are in [docs/policy.md](docs/policy.md) (caller policy, AI agents, audit log, writes) and
+[docs/local-unlock.md](docs/local-unlock.md) (protectors). The design records behind them are ADR 0006 (local unlock
+protectors), ADR 0008 (one config file), ADR 0012 (AI agents as callers) and ADR 0025 (the agent as the vault
+client). They live in the dybw specification repository.
 
-```sh
-dybw login                 # once per profile: the API key, not the master password
-dybw get example.org       # unlocks first if locked, then asks you to confirm the read
-dybw get example.org -f user
-dybw list --fields name,user,folder
-```
+## Status
 
-A locked profile unlocks on first need: `list`, `search`, `get`, `history` and `sync` run the unlock flow first
-(a master-password prompt; offline, the cached copy is used), then continue. A cancelled or failed unlock is its
-own error and nothing else happens. A profile that is not logged in says so; there is no implicit login. The
-agent starts on first use and logs to `agent.log` in its socket directory (`$XDG_RUNTIME_DIR/dybw/`); an error that
-only says "see the agent log" is explained there.
+Release candidate **v1.0.0-rc.1**. It runs on macOS (Touch ID needs a Mac with a Secure Enclave) and Linux (the
+`login` protector needs `pam_bwss`). The minimum supported Rust version is 1.89. Login
+uses an API key only, so there is no password login and no 2FA prompt. Organization items are readable, and new
+items are personal.
 
-## Limits
-
-- API-key login only (`auth = "password"` profiles are refused).
-- Reading a value (including `history`) follows the caller policy: an AI-class caller is
-  denied, an unknown caller (for example a `dybw` whose own parent exited) is asked every time, any other invoker is
-  asked once or "always". `list`, `search` and `get --list-fields` show only names and never ask (only the names
-  are decrypted; a reprompt item's field names still need the master password, so an AI-class caller gets none). An AI-class caller also cannot stop
-  the agent, unlock, log in or use `dybw policy` (even `show`), and never raises a master-password prompt: a locked
-  profile answers "locked" to its `list` and `search`.
-- On a Mac with Touch ID, a confirmation for a caller with a stable identity (a plain program, or an interpreter
-  running a script by its absolute path, not detached) shows the Touch ID sheet first: what is done to which item
-  (the field, or the full item) and the profile, then the program's file name, in at most 120 characters. A match is
-  a yes for this request only; a finger that does not match is a no; a cancel, no sensor or the lid closed puts the
-  whole question in the pinentry, which offers "always" where it may. An AI-class, unknown or detached caller, a bare
-  interpreter, a launcher or a relative script, a change of the policy, `rbw purge`, a removal of a marked item, a
-  forwarded SSH request, a failed session-bind and a login to a host that is not verified are asked in the pinentry
-  only. Each audit line of a confirmation records where it was answered (`"channel": "touch-id"` or `"pinentry"`).
-  `[agent] touch_id_confirm = false` in `config.toml` turns Touch ID confirmations off (it grants nothing, so a
-  synced file may hold it).
-- Grants are a convenience for honest programs, not a boundary: code running as you can defeat them (a script's
-  argv is its own memory, the environment can be injected, `policy.json` can be edited). The boundary is the harness
-  sandbox, which must not reach the agent's socket or state directories, and the out-of-band pinentry confirmation.
-  So:
-  - "always" for a plain program is remembered in `policy.json` by its path (as the kernel reports it) and content
-    hash; a changed program asks again. On Linux the running image is hashed (`/proc/<pid>/exe`); on macOS the file
-    at the path must carry the running image's `LC_UUID` (a file without one is trusted by path and content).
-  - "always" for a script run by an interpreter or shell ("which claims to run" it, in the question) lasts for that
-    process only, in the agent's memory: until it exits or the profile locks or the agent stops. It is never written,
-    and script entries an older build wrote to `policy.json` are ignored.
-  - an interpreter, a shell, a launcher, multiplexer or terminal (`xargs`, `env`, `make`, `git`, `tmux`, `kitty`,
-    `ssh`, `cron` and the like), a relative script and an unknown caller are never offered "always".
-  - a detached caller (its parent exited, or it was started by launchd or a subreaper) is never offered "always" and
-    is told apart in the question ("possibly an AI agent"); only `dybw policy allow --detached <program>` makes a
-    grant for it, and that grant matches only its detached runs.
-  - a grant never covers `get --full`, `get --raw` or `history`: they are asked every time.
-- The policy file (`policy.json`, in the profile's state directory) is plain device state. `dybw policy show` is
-  open to every class but AI; `allow`, `deny` and `forget` are confirmed in pinentry and refused for AI-class and
-  unknown callers. `allow` takes a plain program only (`--detached` for its detached runs) and refuses interpreters,
-  shells and launchers; `deny` accepts anything, and without `--script` covers every script of the program.
-- The audit log (`~/.local/state/dybw/audit.log` under the agent's trusted home, never `XDG_STATE_HOME`, which the
-  first caller of an on-demand agent could set; 0600, append-only, never through a symlink) records every decision
-  on a value request from the AI class and every request, decision or not, from AI and unknown callers (`listed` for
-  names, `failed` for a lookup that went nowhere; no needle, no candidates), and every decision of other callers on
-  a value or a policy change. A line is JSON: time (UTC), profile, caller (program and script, or the harness),
-  class, op, what `get` selected (`password`, `field`, `full`, `raw`, `list-fields`; never a field name), the item
-  id (never its name or a value) and the verdict; for an unknown caller also why it could not be named and the
-  program on the socket, and for any caller the program on the socket when it is a `dybw` or `rbw` other than the
-  one next to the agent. `dybw audit --ai` shows AI-class and unknown callers. It rotates once to `audit.log.1` at 10 MiB (`dybw audit` reads
-  only the current file); a rotation that fails is reported and the live file just keeps growing. A line that cannot
-  be written is reported in the agent log and dropped: the request is still answered, and `dybw doctor` shows an
-  unwritable log. The log is same-user device state: evidence, not a barrier; a program running as you can edit or
-  delete it. `dybw audit` and `dybw doctor` find it under your home in the password database, like the agent.
-- A `policy.json` that fails its checks (wrong mode, owner, not valid) is ignored for decisions, and `dybw policy
-  allow|deny|forget` refuse to write over it, so a deny entry is never dropped by accident. Repair it by hand
-  (`chmod 600`, or fix or remove the file; the grants are then asked again). `dybw doctor` names the problem.
-- On macOS the agent calls `ptrace(PT_DENY_ATTACH)` first thing, so a debugger cannot attach to read the unlocked
-  vault: running `dybw-agent` under lldb kills it. (Linux sets `PR_SET_DUMPABLE=0` instead.) A failure is reported
-  on stderr and the agent keeps running.
-- An item is found as rbw 1.15 finds it: by id (any UUID spelling), else a URL with a scheme such as `https://` is
-  matched against the logins' URIs by their match types (domain by default, host, starts with, exact, regular
-  expression, never), else by name; an exact name before a part of one, and an item with no folder or user before
-  one with when `--folder` or the user is not given. Only names, users, folders and URIs are decrypted to find it.
-- An item that asks for a master-password reprompt gives no value (a code included) and takes no change until the
-  master password is typed again in the agent's pinentry, after the confirmation; a grant never skips it. The password
-  is checked against the unlocked key and sent nowhere; a wrong one is refused and audited.
-- Organization items are readable; one whose organization hides the password (`viewPassword: false`) gives no
-  password, TOTP key or code, history, `--full`, `--raw`, nor any custom field of the hidden type.
-- Writes (`add`, `edit`, `remove`, `generate <len> <name>`) are confirmed in the pinentry every time: no grant
-  counts and "always" is never offered. AI-class and unknown callers are refused. `dybw`'s new values never travel
-  over the socket: the agent asks for them in its own pinentry, one line each, so notes are a single line. An empty
-  answer cancels. (The rbw shim's `add` and `edit` send theirs, see below.) `edit` changes the password and the notes
-  only (no rename, user, URIs, folder or TOTP key). An item changed on the server since the last sync is refused
-  ("sync and try again") and nothing is written. New logins are personal (no creating into an organization). A
-  folder that `add` or `generate` created stays when the login create then fails, as with rbw.
-- `generate <len> <name>` prints nothing: unlike rbw it does not show the new password, which the agent made and
-  kept. Read it with `dybw get <name>`, which goes through the confirmation like any other value.
-- Invoked as `rbw` (a symlink to `dybw`), the binary is the rbw 1.15 shim; its command line and help are rbw's (MIT,
-  see `crates/dybw/src/rbw_completion/LICENSE-rbw`). `RBW_PROFILE=x` picks the profile; `DYBW_PROFILE` and `-p` are
-  not read. `rbw config set|unset` edits the profile in `~/.config/dybw/config.toml` (comments and layout are kept, a
-  symlinked file stays a link) and says what changed on stderr. Changing `base_url` or `pinentry` is refused when
-  stdin is not a terminal, so a script or an AI harness cannot redirect the server or the prompt through the shim.
-  This is a guard against accidents, not a barrier: any process of the same user can still edit `config.toml`; what
-  protects the API key is that it stays bound to the identity origin it was stored for.
-- The shim prints what rbw 1.15 prints, byte for byte, and its errors with exit code 1 (`couldn't find entry for
-  'x': no entry found`, `multiple entries found: user@name, ...`, `entry does not contain a totp secret`, ...); an
-  entry without the value `get` shows says so on stderr and exits 0, as rbw. Names and values are printed as they are
-  (tabs and control characters included), as rbw does. `rbw search` matches names and users only (rbw also matches
-  notes, URIs and field values, which would decrypt values without a confirmation).
-- `rbw add` and `rbw edit` open `$VISUAL`, else `$EDITOR`, else `/usr/bin/vim`, as rbw: the first line is the
-  password, the rest the notes (`edit` of a note: the notes). The file is in a new 0700 directory under
-  `$XDG_RUNTIME_DIR`, else `$TMPDIR`, else `/tmp`; whatever happens it is overwritten with zeros, then it and the
-  directory are removed (Ctrl-C, SIGHUP, SIGTERM or SIGQUIT while the editor runs are held until then, and end the
-  command with 128 + the signal; a directory left by a killed run is wiped and removed by the next one). With stdin
-  not a terminal the text is read from stdin (for `edit`, the agent splits it by the item's type: no value is read).
-  The text goes to the agent with the write, which is still confirmed every time and refused to AI-class and unknown
-  callers. An editor that fails, or a text with neither a password nor notes, writes nothing. `edit` in a terminal
-  first reads the item's password and notes (one confirmation that says so) to fill the editor, then writes to that
-  item by its id. `rbw generate <len> <name>` prints the password, as rbw, then saves that one as a
-  new login (made by the shim and sent with the confirmed write).
-- `rbw purge` locks the profile and deletes its copy of the vault (`~/.cache/dybw/profiles/<profile>`) once you
-  confirm it in the pinentry; the API key, the device id, the policy and the KDF/security pins stay. `rbw unlock` logs
-  in first when the profile has no API key.
-- Migration from rbw: `rbw config set identity_url` is refused (dybw derives the identity URL from `base_url`; use
-  `base_url`), as are `sso_id`, `ui_url`, `notifications_url` and `client_cert_path`. `lock_timeout` (seconds) is
-  rounded up to whole minutes; `sync_interval` 0 means no periodic sync.
-- `-c` copies in the `dybw` process and clears the clipboard after `clipboard_clear_seconds` (default 30) only if it
-  still holds the copy. On macOS the copy is marked concealed and transient; on Wayland it is marked secret
-  (`wl-copy --sensitive`, wl-clipboard 2.2+); on X11 (`xclip`, `xsel`) it cannot be marked, so a clipboard manager
-  may keep it (`dybw` says so on stderr).
-- `--diceware` uses the EFF large wordlist (Electronic Frontier Foundation, CC BY 3.0 US).
-- Every file of the agent lives under its trusted home, your home in the password database: the config
-  (`~/.config/dybw/config.toml`), the state (credentials, device id, `policy.json`, `harnesses.toml`, the audit log,
-  in `~/.local/state/dybw`) and the vault cache (`~/.cache/dybw`). The agent refuses to start when `HOME` names
-  another directory, and the `XDG_*` variables of whoever started it are ignored, so a starter cannot point it at
-  another config, server or pinentry; `dybw doctor` reads the same places and flags a `HOME` that differs. Files an earlier build wrote under a custom
-  `XDG_*` directory are not found: move them, or log in again.
-- An agent started on demand inherits the environment of the first caller: `RUST_LOG`, and the session
-  variables the agent forwards to pinentry (`SESSION_ENV` of `dybw-native`: `DISPLAY`, `WAYLAND_DISPLAY`,
-  `DBUS_SESSION_BUS_ADDRESS`, `XAUTHORITY`, `LANG`, `HOME` and so on). Start the first `dybw` from the GUI
-  session, or run `dybw agent stop` after an agent was started from an ssh session.
-
-## Build and test
+## Development
 
 ```sh
 cargo build --locked
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
-cargo llvm-cov --workspace --locked --fail-under-lines 100
+cargo llvm-cov --workspace --locked --fail-under-lines 100 --ignore-filename-regex 'dybw-peer/src/keyring\.rs$'
+cargo audit
+scripts/e2e.sh               # end-to-end, in Docker, against a throwaway Vaultwarden
 ```
 
-MSRV is 1.89. CI also runs fmt, clippy (`-D warnings`) and `cargo audit`.
+CI runs all of these, and checks the build on the MSRV. Line coverage must stay at 100%. The end-to-end suite
+includes the rbw conformance run; `E2E_TESTS=<file or test id>` narrows it. See [docs/install.md](docs/install.md#tests)
+for how the tests isolate their home directory.
 
-## End-to-end tests
+## License
 
-The suite runs in Docker against a throwaway Vaultwarden:
-
-```sh
-scripts/e2e.sh
-```
-
-It builds `tests/e2e/Dockerfile`, starts Vaultwarden, and runs pytest in a container that shares its network.
-The suite writes under the test user's real home (the agent only runs on the password database's home), so it runs
-only in that container (`DYBW_E2E_CONTAINER`). The cargo tests run the agent binary on a home of their own through
-`DYBW_TEST_PASSWD_HOME`, read only by the `dybw-agent-test-home` binary of the test-only `test-home` feature (never
-in a release build, refused by CI in the normal graph); `dybw-agent` itself never reads it.
-`DOCKER_HOST` and `DOCKER_CONFIG` come from your environment. `E2E_TESTS=<file or test id>` narrows the run.
-The suite includes the rbw conformance run (`tests/e2e/test_rbw_conformance.py`, rbw 1.15.0 built in the image
-under `/opt/rbw`, never on `PATH`); its cases and results are in `docs/rbw-conformance.md`.
+MIT, see [LICENSE](LICENSE). The rbw shim's command line and help text come from rbw (MIT, see
+[`crates/dybw/src/rbw_completion/LICENSE-rbw`](crates/dybw/src/rbw_completion/LICENSE-rbw)). `--diceware` uses the
+EFF large wordlist (Electronic Frontier Foundation, CC BY 3.0 US).
